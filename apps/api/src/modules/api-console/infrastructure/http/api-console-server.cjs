@@ -1,0 +1,5492 @@
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const dns = require('dns').promises;
+const zlib = require('zlib');
+const { monitorEventLoopDelay } = require('perf_hooks');
+const { createCipheriv, createDecipheriv, randomBytes, randomUUID } = require('crypto');
+const {
+  LEGACY_CONTEXT_ENABLED,
+  attachSession,
+  attachConsoleContext,
+  canHandleSession,
+  handleSession,
+  isBootstrapSystemAdmin,
+} = require('../../../session/session-server.cjs');
+const { canHandleCde, handleCde } = require('../../../cde/cde-server.cjs');
+const { serveOpenApiDocs } = require('../../../../openapi/serve-docs.cjs');
+
+const REPOSITORY_ROOT = path.resolve(__dirname, '../../../../../../..');
+const resolveRepositoryPath = value => path.isAbsolute(value) ? value : path.join(REPOSITORY_ROOT, value);
+const PORT = Number(process.env.API_CONSOLE_PORT || 4274);
+const DATA_DIR = resolveRepositoryPath(process.env.API_CONSOLE_DATA_DIR || path.join('runtime', 'api-console'));
+const STORE_FILE = process.env.API_CONSOLE_STORE_FILE || path.join(DATA_DIR, 'api-console-store.json');
+const SECRET_VAULT_FILE = process.env.API_CONSOLE_SECRET_VAULT_FILE || path.join(DATA_DIR, 'api-console-secrets.json');
+const SECRET_KEY_FILE = process.env.API_CONSOLE_SECRET_KEY_FILE || path.join(DATA_DIR, 'api-console-secret.key');
+const DOCX_TEMPLATE_FILE = process.env.API_CONSOLE_DOCX_TEMPLATE_FILE || path.join(__dirname, '..', 'templates', 'api-console-document-template.docx');
+const PARSER_VERSION = 'api-console-curl-parser/2.0.0';
+
+const CORE_COMMAND_ENDPOINT = '/core-api/v1/data-provider/store-form-data';
+const CORE_QUERY_ENDPOINT = '/core-api/v1/data-provider/get-data-source';
+const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
+const BODY_OPTIONS = new Set(['-d', '--data', '--data-raw', '--data-binary', '--data-ascii', '--data-urlencode']);
+const FORM_OPTIONS = new Set(['-F', '--form']);
+const HEADER_OPTIONS = new Set(['-H', '--header']);
+const COOKIE_OPTIONS = new Set(['-b', '--cookie']);
+const REQUEST_OPTIONS = new Set(['-X', '--request']);
+const URL_OPTIONS = new Set(['--url']);
+const LOCATION_OPTIONS = new Set(['--location', '-L']);
+const UNSUPPORTED_OPTIONS_WITH_VALUE = new Set([
+  '--cert',
+  '--key',
+  '--cacert',
+  '--connect-timeout',
+  '--max-time',
+  '--proxy',
+  '--resolve',
+  '--user-agent',
+  '-A',
+  '-u',
+  '--user',
+]);
+const UNSUPPORTED_FLAGS = new Set([
+  '--compressed',
+  '--http1.1',
+  '--http2',
+  '--include',
+  '-i',
+  '--silent',
+  '-s',
+  '--verbose',
+  '-v',
+]);
+const BROWSER_HEADERS = new Set([
+  'sec-ch-ua',
+  'sec-ch-ua-mobile',
+  'sec-ch-ua-platform',
+  'sec-fetch-dest',
+  'sec-fetch-mode',
+  'sec-fetch-site',
+  'priority',
+  'user-agent',
+  'accept-language',
+]);
+const TRANSPORT_HEADERS = new Set(['host', 'content-length', 'connection', 'accept-encoding']);
+const AUTH_HEADERS = new Set(['authorization', 'proxy-authorization']);
+const ENVIRONMENT_HEADER_HINTS = new Set(['client-id', 'prostage', 'x-client-id', 'x-api-key', 'x-stage']);
+const SENSITIVE_NAME_PARTS = [
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'token',
+  'access_token',
+  'refresh_token',
+  'password',
+  'secret',
+  'api-key',
+  'apikey',
+  'client-secret',
+  'client-id',
+  'session',
+  'cdesc',
+  'national-code',
+  'nationalcode',
+];
+const ANALYTICS_COOKIES = new Set(['_ga', '_gid', '_gat', '_gcl_au']);
+const PRODUCTION_KINDS = new Set(['PRODUCTION']);
+const PROTECTED_HOSTS = new Set(['localhost', 'ip6-localhost', 'ip6-loopback']);
+const METADATA_HOSTS = new Set(['metadata.google.internal']);
+const METADATA_IPS = new Set(['169.254.169.254', 'fd00:ec2::254']);
+
+const DEFAULT_DOCUMENT_ORGANIZATION = 'وزارت آموزش و پرورش';
+const DEFAULT_DOCUMENT_DEPARTMENT = 'مرکز توسعه آموزش مجازی، فناوری و امنیت اطلاعات';
+const DEFAULT_RESPONSE_CODE_CATALOG = [
+  [200, 'OK', 'درخواست با موفقیت پردازش شد.'],
+  [202, 'Accepted', 'درخواست پذیرفته شده و پردازش آن در حال انجام است.'],
+  [302, 'Found', 'منبع به صورت موقت در نشانی دیگری در دسترس است.'],
+  [311, 'Redirect', 'برای ادامه پردازش، تغییر مسیر اعلام‌شده توسط سرویس باید بررسی شود.'],
+  [330, 'Request Failed', 'درخواست در لایه سرویس‌دهنده قابل تکمیل نبوده است.'],
+  [400, 'Bad Request', 'ساختار یا مقادیر درخواست نامعتبر است.'],
+  [401, 'Unauthorized', 'اطلاعات احراز هویت ارسال نشده یا معتبر نیست.'],
+  [402, 'Payment Required', 'انجام عملیات به مجوز یا شرط مالی وابسته است.'],
+  [403, 'Forbidden', 'کاربر احراز هویت شده مجوز دسترسی به این عملیات را ندارد.'],
+  [404, 'Not Found', 'منبع یا مسیر درخواست‌شده یافت نشد.'],
+  [405, 'Method Not Allowed', 'متد HTTP برای این مسیر پشتیبانی نمی‌شود.'],
+  [406, 'Not Acceptable', 'سرویس قادر به تولید پاسخ با قالب درخواستی نیست.'],
+  [408, 'Request Timeout', 'مهلت دریافت یا پردازش درخواست پایان یافته است.'],
+  [409, 'Conflict', 'درخواست با وضعیت فعلی منبع تعارض دارد.'],
+  [410, 'Gone', 'منبع درخواست‌شده دیگر در دسترس نیست.'],
+  [415, 'Unsupported Media Type', 'نوع محتوای بدنه درخواست پشتیبانی نمی‌شود.'],
+  [422, 'Unprocessable Entity', 'ساختار درخواست معتبر است اما اعتبارسنجی داده‌ها ناموفق بود.'],
+  [429, 'Too Many Requests', 'تعداد درخواست‌ها از محدودیت مجاز عبور کرده است.'],
+  [451, 'Unavailable For Legal Reasons', 'دسترسی به منبع به دلایل قانونی محدود شده است.'],
+  [499, 'Client Closed Request', 'ارتباط پیش از تکمیل پاسخ از سمت کارخواه بسته شده است.'],
+  [500, 'Internal Server Error', 'خطای پیش‌بینی‌نشده در سرویس رخ داده است.'],
+  [502, 'Bad Gateway', 'پاسخ نامعتبر از سرویس بالادستی دریافت شده است.'],
+  [503, 'Service Unavailable', 'سرویس به صورت موقت در دسترس نیست.'],
+  [504, 'Gateway Timeout', 'مهلت دریافت پاسخ از سرویس بالادستی پایان یافته است.'],
+  [521, 'Web Server Is Down', 'سرور مقصد در دسترس یا آماده پاسخ‌گویی نیست.'],
+  [599, 'Network Connect Timeout Error', 'برقراری ارتباط شبکه با سرویس مقصد با وقفه مواجه شد.'],
+  [600, 'Business Error', 'خطای کسب‌وکاری اعلام‌شده توسط سرویس رخ داده است.'],
+  [999, 'Unknown Error', 'خطای طبقه‌بندی‌نشده رخ داده و نیازمند بررسی فنی است.'],
+].map(([code, message, description], displayOrder) => ({ code, message, description, enabled: true, displayOrder }));
+
+const DEFAULT_DEPOSIT_STATUS_ALLOWED_VALUES = [
+  ['0', 'عادی (بدون تغییر)'],
+  ['1', 'عضویت/پرتفه جدید'],
+  ['2', 'عادی (افزایش سپرده)'],
+  ['3', 'انتقالی از ...'],
+  ['4', 'برقراری سپرده‌گذاری'],
+  ['5', 'عادی (کاهش سپرده)'],
+  ['6', 'توقف سپرده‌گذاری'],
+  ['7', 'بازنشسته در منطقه'],
+  ['8', 'از کارافتاده در منطقه'],
+  ['9', 'فوت در منطقه'],
+  ['10', 'بازخرید در منطقه'],
+  ['11', 'انصراف در منطقه'],
+];
+const DEFAULT_DOCUMENTATION_ALLOWED_VALUE_CATALOGS = {
+  depositstatus: DEFAULT_DEPOSIT_STATUS_ALLOWED_VALUES,
+  depositestatus: DEFAULT_DEPOSIT_STATUS_ALLOWED_VALUES,
+};
+
+const AUTHENTICATION_DOCUMENTATION_PROFILES = [
+  {
+    id: 'ministry-esb',
+    enabled: true,
+    title: 'احراز هویت ESB وزارت آموزش و پرورش',
+    introduction: 'برای فراخوانی سرویس‌های ESB ابتدا توکن دسترسی از سرویس احراز هویت دریافت و سپس در سرایند token ارسال می‌شود.',
+    baseUrl: 'https://esb.medu.ir',
+    endpoint: 'https://esb.medu.ir/user/login/GetToken',
+    method: 'POST',
+    contentType: 'multipart/form-data',
+    headerParameters: [
+      { id: 'auth-header-content-type', name: 'Content-Type', location: 'HEADER', dataType: 'multipart/form-data', required: true, description: 'نوع محتوای درخواست احراز هویت', exampleValue: 'multipart/form-data', displayOrder: 0, enabled: true, source: 'PROFILE' },
+    ],
+    inputParameters: [
+      { id: 'auth-input-username', name: 'username', location: 'BODY', dataType: 'string', required: true, description: 'نام کاربری سرویس', exampleValue: '****', displayOrder: 0, enabled: true, source: 'PROFILE' },
+      { id: 'auth-input-password', name: 'password', location: 'BODY', dataType: 'string', required: true, description: 'رمز عبور سرویس', exampleValue: '****', displayOrder: 1, enabled: true, source: 'PROFILE' },
+    ],
+    outputParameters: [
+      { id: 'auth-output-status', name: 'Status', location: 'RESPONSE', dataType: 'boolean', required: null, description: 'وضعیت اجرای درخواست', displayOrder: 0, enabled: true, source: 'PROFILE' },
+      { id: 'auth-output-message', name: 'Message', location: 'RESPONSE', dataType: 'string', required: null, description: 'پیام سرویس', displayOrder: 1, enabled: true, source: 'PROFILE' },
+      { id: 'auth-output-token', name: 'Token', location: 'RESPONSE', dataType: 'string', required: null, description: 'توکن دسترسی', exampleValue: '****', displayOrder: 2, enabled: true, source: 'PROFILE' },
+      { id: 'auth-output-expiration', name: 'ExpirationDate', location: 'RESPONSE', dataType: 'string', required: null, description: 'تاریخ انقضای توکن', displayOrder: 3, enabled: true, source: 'PROFILE' },
+      { id: 'auth-output-ip', name: 'ClientIPAddress', location: 'RESPONSE', dataType: 'string', required: null, description: 'نشانی IP کارخواه', displayOrder: 4, enabled: true, source: 'PROFILE' },
+    ],
+    curlExample: "curl --request POST \\\n  --url https://esb.medu.ir/user/login/GetToken \\\n  --header 'Content-Type: multipart/form-data' \\\n  --form 'username=****' \\\n  --form 'password=****'",
+    responseExample: '{\n  "Status": true,\n  "Message": "موفق",\n  "Token": "****",\n  "ExpirationDate": "—",\n  "ClientIPAddress": "***.***.***.***"\n}',
+  },
+];
+
+const LIMITS = {
+  requestBodyBytes: Number(process.env.API_CONSOLE_MAX_REQUEST_BODY || 2 * 1024 * 1024),
+  domainRpcRequestBodyBytes: Number(process.env.DOMAIN_RPC_MAX_REQUEST_BODY || 16 * 1024 * 1024),
+  responseBytes: Number(process.env.API_CONSOLE_MAX_RESPONSE_BODY || 1024 * 1024),
+  maxRedirects: Number(process.env.API_CONSOLE_MAX_REDIRECTS || 5),
+  connectTimeoutMs: Number(process.env.API_CONSOLE_CONNECT_TIMEOUT_MS || 30000),
+  readTimeoutMs: Number(process.env.API_CONSOLE_READ_TIMEOUT_MS || 60000),
+  totalTimeoutMs: Number(process.env.API_CONSOLE_TOTAL_TIMEOUT_MS || 90000),
+};
+
+const API_CONSOLE_POLICY = {
+  canView: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER', 'DEVELOPER'],
+  canCreate: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'TECH_LEAD', 'DEVELOPER'],
+  canEdit: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'TECH_LEAD', 'DEVELOPER'],
+  canExecute: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'SECURITY_REVIEWER', 'TECH_LEAD', 'DEVELOPER'],
+  canExecuteProduction: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
+  canExecuteCommand: ['SYSTEM_ADMIN', 'QA_LEAD', 'TECH_LEAD'],
+  canExecuteProductionCommand: ['SYSTEM_ADMIN', 'TECH_LEAD'],
+  canDelete: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER', 'DEVELOPER'],
+  canGenerateDocumentation: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER', 'DEVELOPER'],
+};
+
+const USER_ROLES = ['SYSTEM_ADMIN', 'DEVELOPER', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER'];
+const ROLE_LABELS = {
+  SYSTEM_ADMIN: 'مدیر سیستم',
+  DEVELOPER: 'توسعه‌دهنده',
+  QA_LEAD: 'سرپرست QA',
+  QA_SPECIALIST: 'متخصص QA',
+  BA: 'تحلیلگر کسب‌وکار',
+  SECURITY_REVIEWER: 'بازبین امنیت',
+  TECH_LEAD: 'سرپرست فنی',
+  PRODUCT_OWNER: 'مالک محصول',
+};
+const SHARE_STATUSES = new Set(['DRAFT', 'PENDING_REVIEW', 'RETURNED', 'APPROVED', 'DEPRECATED']);
+const USAGE_EVENT_TYPES = new Set(['ADDED_TO_CONSOLE', 'API_OPENED', 'API_EXECUTED', 'REMOVED_FROM_CONSOLE', 'NEW_VERSION_VIEWED']);
+const SEMVER_REGEX = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+const runtimeSecrets = new Map();
+let cachedSecretKey = null;
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelay.enable();
+
+class ApiConsoleError extends Error {
+  constructor(category, message, statusCode = 400) {
+    super(message);
+    this.category = category;
+    this.statusCode = statusCode;
+  }
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function performanceMetricsSnapshot() {
+  const memory = process.memoryUsage();
+  return {
+    status: 'ok',
+    service: 'utms-api',
+    checkedAt: nowIso(),
+    uptimeSeconds: Math.round(process.uptime()),
+    pid: process.pid,
+    memory: {
+      rssBytes: memory.rss,
+      heapTotalBytes: memory.heapTotal,
+      heapUsedBytes: memory.heapUsed,
+      externalBytes: memory.external,
+      arrayBuffersBytes: memory.arrayBuffers,
+    },
+    eventLoop: {
+      minMs: Math.round(eventLoopDelay.min / 1e6 * 100) / 100,
+      meanMs: Math.round(eventLoopDelay.mean / 1e6 * 100) / 100,
+      maxMs: Math.round(eventLoopDelay.max / 1e6 * 100) / 100,
+      p95Ms: Math.round(eventLoopDelay.percentile(95) / 1e6 * 100) / 100,
+      p99Ms: Math.round(eventLoopDelay.percentile(99) / 1e6 * 100) / 100,
+    },
+    activeHandles: typeof process._getActiveHandles === 'function' ? process._getActiveHandles().length : null,
+    activeRequests: typeof process._getActiveRequests === 'function' ? process._getActiveRequests().length : null,
+  };
+}
+
+function makeId(prefix) {
+  return `${prefix}-${randomUUID()}`;
+}
+
+function safeClone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function byteLength(text) {
+  return Buffer.byteLength(String(text || ''), 'utf8');
+}
+
+function roleAllowed(role, allowed) {
+  return role === 'SYSTEM_ADMIN' || allowed.includes(role);
+}
+
+function maskValue(value, visible = 4) {
+  const text = String(value || '');
+  if (!text) return '';
+  if (text.includes('{{') && text.includes('}}')) return text;
+  if (isSecretReference(text)) return '{{secret}}';
+  if (text.length <= visible * 2) return '*'.repeat(Math.max(text.length, 6));
+  return `${text.slice(0, visible)}${'*'.repeat(Math.min(16, Math.max(8, text.length - visible * 2)))}${text.slice(-visible)}`;
+}
+
+function isSensitiveName(name) {
+  const normalized = String(name || '').toLowerCase();
+  return SENSITIVE_NAME_PARTS.some(part => normalized.includes(part));
+}
+
+function sanitizeText(text) {
+  return String(text || '')
+    .replace(/(authorization\s*:\s*bearer\s+)[^\s'"\\]+/gi, '$1{{token}}')
+    .replace(/(authorization\s*:\s*basic\s+)[^\s'"\\]+/gi, '$1{{basicCredentials}}')
+    .replace(/(cookie\s*:\s*)[^'"\\\r\n]+/gi, '$1{{cookies}}')
+    .replace(/([?&](?:token|access_token|refresh_token|password|api_key|apikey|client_secret)=)[^&\s'"\\]+/gi, '$1{{secret}}')
+    .replace(/((?:token|access_token|refresh_token|password|client-secret|api-key|client-id|national-code)\s*["']?\s*[:=]\s*["'])[^"',\s}]+/gi, '$1{{secret}}');
+}
+
+function isSecretReference(value) {
+  const text = String(value || '');
+  return text.startsWith('secret://') || text.startsWith('secret/');
+}
+
+function ensureDataDirectory() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function loadOrCreateSecretKey() {
+  if (cachedSecretKey) return cachedSecretKey;
+  ensureDataDirectory();
+  if (process.env.API_CONSOLE_SECRET_KEY) {
+    cachedSecretKey = Buffer.from(process.env.API_CONSOLE_SECRET_KEY, 'base64');
+  } else if (fs.existsSync(SECRET_KEY_FILE)) {
+    cachedSecretKey = Buffer.from(fs.readFileSync(SECRET_KEY_FILE, 'utf8').trim(), 'base64');
+  } else {
+    cachedSecretKey = randomBytes(32);
+    fs.writeFileSync(SECRET_KEY_FILE, cachedSecretKey.toString('base64'), { encoding: 'utf8', mode: 0o600 });
+  }
+  if (cachedSecretKey.length !== 32) {
+    throw new ApiConsoleError('SECRET_RESOLUTION_ERROR', 'API Console secret key must be 32 bytes in base64 form.');
+  }
+  return cachedSecretKey;
+}
+
+function loadSecretVault() {
+  ensureDataDirectory();
+  if (!fs.existsSync(SECRET_VAULT_FILE)) return { version: 1, secrets: {} };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SECRET_VAULT_FILE, 'utf8'));
+    return {
+      version: 1,
+      secrets: parsed.secrets && typeof parsed.secrets === 'object' ? parsed.secrets : {},
+    };
+  } catch {
+    return { version: 1, secrets: {} };
+  }
+}
+
+function saveSecretVault(vault) {
+  ensureDataDirectory();
+  const tmp = `${SECRET_VAULT_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(vault, null, 2), { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, SECRET_VAULT_FILE);
+}
+
+function encryptSecretValue(value) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', loadOrCreateSecretKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(String(value || ''), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    algorithm: 'aes-256-gcm',
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+    createdAt: nowIso(),
+  };
+}
+
+function decryptSecretValue(record) {
+  if (!record || record.algorithm !== 'aes-256-gcm') {
+    throw new ApiConsoleError('SECRET_RESOLUTION_ERROR', 'Unsupported API Console secret record.');
+  }
+  const decipher = createDecipheriv('aes-256-gcm', loadOrCreateSecretKey(), Buffer.from(record.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(record.tag, 'base64'));
+  return Buffer.concat([
+    decipher.update(Buffer.from(record.ciphertext, 'base64')),
+    decipher.final(),
+  ]).toString('utf8');
+}
+
+function rememberSecret(value) {
+  const ref = `secret://api-console/${randomUUID()}`;
+  const normalizedValue = String(value || '');
+  runtimeSecrets.set(ref, normalizedValue);
+  const vault = loadSecretVault();
+  vault.secrets[ref] = encryptSecretValue(normalizedValue);
+  saveSecretVault(vault);
+  return ref;
+}
+
+function protectSensitiveScalar(name, value) {
+  const text = String(value ?? '');
+  if (!text || text.includes('{{') || isSecretReference(text) || !isSensitiveName(name)) return text;
+  return rememberSecret(text);
+}
+
+function protectJsonSecrets(value) {
+  if (Array.isArray(value)) return value.map(item => protectJsonSecrets(item));
+  if (value && typeof value === 'object') {
+    const next = {};
+    for (const [key, val] of Object.entries(value)) {
+      if (isSensitiveName(key) && val !== null && typeof val !== 'object') {
+        next[key] = protectSensitiveScalar(key, val);
+      } else {
+        next[key] = protectJsonSecrets(val);
+      }
+    }
+    return next;
+  }
+  return value;
+}
+
+function protectBodySecrets(bodyType, bodyTemplate) {
+  if (bodyType === 'json' && bodyTemplate) {
+    const parsed = parseJsonSafely(bodyTemplate);
+    if (parsed.ok) {
+      return JSON.stringify(protectJsonSecrets(parsed.value), null, 2);
+    }
+  }
+  if (bodyType === 'form-urlencoded' && bodyTemplate) {
+    const params = new URLSearchParams(bodyTemplate);
+    for (const key of Array.from(params.keys())) {
+      if (isSensitiveName(key)) params.set(key, protectSensitiveScalar(key, params.get(key) || ''));
+    }
+    return params.toString();
+  }
+  return bodyTemplate || '';
+}
+
+function headerCategory(name) {
+  const normalized = String(name || '').toLowerCase();
+  if (AUTH_HEADERS.has(normalized) || normalized === 'cookie') return 'AUTHENTICATION';
+  if (TRANSPORT_HEADERS.has(normalized)) return 'TRANSPORT_GENERATED';
+  if (BROWSER_HEADERS.has(normalized)) return 'BROWSER_GENERATED';
+  if (ENVIRONMENT_HEADER_HINTS.has(normalized)) return 'ENVIRONMENT';
+  return 'USER_BUSINESS';
+}
+
+function headerDescription(name, category) {
+  const normalized = String(name || '').toLowerCase();
+  if (category === 'TRANSPORT_GENERATED') return 'Managed by the selected HTTP transport and recalculated at execution time.';
+  if (category === 'BROWSER_GENERATED') return 'Browser-only compatibility header imported from a copied browser request.';
+  if (category === 'AUTHENTICATION') return 'Authentication header. Values are masked and excluded from generated documentation.';
+  if (category === 'ENVIRONMENT') return 'Environment or application routing header.';
+  if (normalized === 'content-type') return 'Declares the request body media type.';
+  if (normalized === 'accept') return 'Declares preferred response media type.';
+  return 'Application or business header.';
+}
+
+function createHeader(name, value, displayOrder, source = 'IMPORTED_CURL', executionMode = 'RECOMMENDED') {
+  const category = headerCategory(name);
+  const sensitive = isSensitiveName(name);
+  const normalized = String(name || '').toLowerCase();
+  const transportGenerated = category === 'TRANSPORT_GENERATED';
+  const browserGenerated = category === 'BROWSER_GENERATED';
+  const enabled = executionMode === 'EXACT'
+    ? !['content-length'].includes(normalized)
+    : !(transportGenerated || browserGenerated);
+  return {
+    id: makeId('hdr'),
+    name,
+    valueTemplate: value,
+    enabled,
+    sensitive,
+    source,
+    category,
+    description: headerDescription(name, category),
+    maskedValue: sensitive ? maskValue(value) : value,
+    displayOrder,
+    cannotTransmitExactly: ['content-length', 'connection'].includes(normalized),
+    replayNote: ['content-length', 'connection'].includes(normalized)
+      ? 'Recalculated or controlled by the HTTP client.'
+      : browserGenerated
+        ? 'Kept for traceability. Disabled in recommended replay.'
+        : undefined,
+  };
+}
+
+function createCookie(name, value, displayOrder, source = 'IMPORTED_CURL') {
+  const sensitive = isSensitiveName(name) || !ANALYTICS_COOKIES.has(String(name || '').toLowerCase());
+  return {
+    id: makeId('ck'),
+    name,
+    valueReference: value,
+    enabled: true,
+    sensitive,
+    maskedValue: sensitive ? maskValue(value) : value,
+    source,
+    displayOrder,
+  };
+}
+
+function parseJsonSafely(raw) {
+  try {
+    return { ok: true, value: JSON.parse(raw) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Invalid JSON';
+    const match = message.match(/position\s+(\d+)/i);
+    if (match) {
+      const position = Number(match[1]);
+      const until = String(raw || '').slice(0, position);
+      const lines = until.split(/\r?\n/);
+      return { ok: false, error: message, line: lines.length, column: lines[lines.length - 1].length + 1 };
+    }
+    return { ok: false, error: message };
+  }
+}
+
+function buildClassification(type, body, endpoint) {
+  if (type === 'CORE_COMMAND') {
+    return {
+      type,
+      serviceId: body?.serviceId || null,
+      operationPath: body?.formId || null,
+      coreOperationType: 'COMMAND',
+      endpoint,
+    };
+  }
+  if (type === 'CORE_QUERY') {
+    return {
+      type,
+      serviceId: body?.serviceId || null,
+      operationPath: body?.key || null,
+      coreOperationType: 'QUERY',
+      endpoint,
+    };
+  }
+  return {
+    type: 'GENERIC_HTTP',
+    serviceId: null,
+    operationPath: null,
+    coreOperationType: null,
+    endpoint: null,
+  };
+}
+
+function detectCoreClassification(urlText, body) {
+  let pathname = '';
+  try {
+    pathname = new URL(urlText).pathname;
+  } catch {
+    pathname = urlText;
+  }
+  const jsonBody = body && typeof body.value === 'object' && body.value !== null ? body.value : null;
+  if (pathname.endsWith(CORE_COMMAND_ENDPOINT) && jsonBody && typeof jsonBody.serviceId === 'string' && typeof jsonBody.formId === 'string' && Object.prototype.hasOwnProperty.call(jsonBody, 'data')) {
+    return buildClassification('CORE_COMMAND', jsonBody, CORE_COMMAND_ENDPOINT);
+  }
+  if (pathname.endsWith(CORE_QUERY_ENDPOINT) && jsonBody && typeof jsonBody.serviceId === 'string' && typeof jsonBody.key === 'string' && Object.prototype.hasOwnProperty.call(jsonBody, 'params')) {
+    return buildClassification('CORE_QUERY', jsonBody, CORE_QUERY_ENDPOINT);
+  }
+  return buildClassification('GENERIC_HTTP', null, null);
+}
+
+function normalizeWindowsCmdCurl(input) {
+  const withoutLineContinuation = input.replace(/\^\r?\n/g, ' ');
+  let normalized = '';
+  for (let i = 0; i < withoutLineContinuation.length; i += 1) {
+    const char = withoutLineContinuation[i];
+    if (char === '^' && i + 1 < withoutLineContinuation.length) {
+      normalized += withoutLineContinuation[i + 1];
+      i += 1;
+    } else {
+      normalized += char;
+    }
+  }
+  return normalized;
+}
+
+function normalizePowerShellCurl(input) {
+  return input
+    .replace(/`\r?\n/g, ' ')
+    .replace(/`(["'`$])/g, '$1');
+}
+
+function normalizeBashCurl(input) {
+  return input.replace(/\\\r?\n/g, ' ');
+}
+
+function stripWrappingQuote(input) {
+  const trimmed = String(input || '').trim();
+  if (trimmed.length < 2) return input;
+  const first = trimmed[0];
+  const last = trimmed[trimmed.length - 1];
+  if ((first === '"' || first === "'") && first === last && trimmed.slice(1).trimStart().toLowerCase().startsWith('curl')) {
+    return trimmed.slice(1, -1);
+  }
+  return input;
+}
+
+function detectCurlDialect(input) {
+  const normalized = stripWrappingQuote(input);
+  const lower = normalized.toLowerCase();
+  if (/\^\r?\n|(\s|^)\^\S|curl\.exe/i.test(normalized)) return 'WINDOWS_CMD';
+  if (/`\r?\n|invoke-webrequest|invoke-restmethod/i.test(normalized)) return 'POWERSHELL';
+  if (lower.includes('sec-ch-ua') || lower.includes('sec-fetch-') || lower.includes('--compressed')) return 'CHROME_EDGE';
+  if (/curl\s+'https?:\/\//i.test(normalized) || normalized.includes("\\\n")) return 'BASH';
+  if (/curl\s+https?:\/\//i.test(normalized)) return 'LINUX_MAC';
+  return 'UNKNOWN';
+}
+
+function normalizeCurlText(input, dialect) {
+  const unwrapped = stripWrappingQuote(input);
+  if (dialect === 'WINDOWS_CMD') return normalizeWindowsCmdCurl(unwrapped);
+  if (dialect === 'POWERSHELL') return normalizePowerShellCurl(unwrapped);
+  return normalizeBashCurl(unwrapped);
+}
+
+function tokenizeCurl(input) {
+  const tokens = [];
+  let current = '';
+  let quote = null;
+  let escaping = false;
+
+  for (let i = 0; i < input.length; i += 1) {
+    const char = input[i];
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+    if (char === '\\' && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if ((char === '"' || char === "'") && !quote) {
+      quote = char;
+      continue;
+    }
+    if (char === quote) {
+      quote = null;
+      continue;
+    }
+    if (!quote && /\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaping) current += '\\';
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function splitOptionToken(token) {
+  const eqIndex = token.indexOf('=');
+  if (eqIndex > 2 && token.startsWith('--')) {
+    return { option: token.slice(0, eqIndex), value: token.slice(eqIndex + 1) };
+  }
+  return { option: token };
+}
+
+function parseHeaderLine(line) {
+  const index = String(line || '').indexOf(':');
+  if (index <= 0) return null;
+  return {
+    name: line.slice(0, index).trim(),
+    value: line.slice(index + 1).trim(),
+  };
+}
+
+function parseCookieHeader(value) {
+  return String(value || '')
+    .split(';')
+    .map(part => part.trim())
+    .filter(Boolean)
+    .map(part => {
+      const eq = part.indexOf('=');
+      if (eq === -1) return { name: part, value: '' };
+      return { name: part.slice(0, eq).trim(), value: part.slice(eq + 1).trim() };
+    })
+    .filter(cookie => cookie.name.length > 0);
+}
+
+function parseSetCookie(value) {
+  const rows = Array.isArray(value) ? value : [value].filter(Boolean);
+  return rows.map((row, index) => {
+    const parts = String(row || '').split(';').map(part => part.trim());
+    const first = parts.shift() || '';
+    const eq = first.indexOf('=');
+    const cookie = createCookie(eq >= 0 ? first.slice(0, eq) : first, eq >= 0 ? first.slice(eq + 1) : '', index, 'SYSTEM');
+    parts.forEach(part => {
+      const [key, ...rest] = part.split('=');
+      const lower = key.toLowerCase();
+      const val = rest.join('=');
+      if (lower === 'domain') cookie.domain = val;
+      if (lower === 'path') cookie.path = val;
+      if (lower === 'expires') cookie.expiresAt = val;
+    });
+    return cookie;
+  });
+}
+
+function createQueryParametersFromUrl(urlText) {
+  try {
+    const parsed = new URL(urlText);
+    const params = [];
+    let order = 0;
+    parsed.searchParams.forEach((value, name) => {
+      params.push({
+        id: makeId('qp'),
+        name,
+        value,
+        enabled: true,
+        sensitive: isSensitiveName(name),
+        source: 'IMPORTED_CURL',
+        displayOrder: order,
+      });
+      order += 1;
+    });
+    parsed.search = '';
+    return { urlWithoutQuery: parsed.toString().replace(/\/$/, parsed.pathname === '/' ? '/' : ''), queryParameters: params };
+  } catch {
+    return { urlWithoutQuery: urlText, queryParameters: [] };
+  }
+}
+
+function inferBody(dataParts, formParts, headers) {
+  if (formParts.length > 0) {
+    return {
+      type: 'multipart',
+      value: formParts.map(part => {
+        const eq = part.indexOf('=');
+        return eq === -1 ? { name: part, value: '' } : { name: part.slice(0, eq), value: part.slice(eq + 1) };
+      }),
+      raw: formParts.join('\n'),
+      contentType: 'multipart/form-data',
+    };
+  }
+
+  if (dataParts.length === 0) {
+    return { type: 'none', value: null, raw: '' };
+  }
+
+  const raw = dataParts.join('&');
+  const contentType = headers.find(header => header.name.toLowerCase() === 'content-type')?.valueTemplate.toLowerCase() || '';
+  const json = parseJsonSafely(raw);
+  if (json.ok) {
+    return { type: 'json', value: json.value, raw, contentType: 'application/json' };
+  }
+  if (contentType.includes('json')) {
+    return { type: 'json', value: null, raw, contentType: 'application/json' };
+  }
+  if (contentType.includes('xml') || raw.trim().startsWith('<')) {
+    return { type: 'xml', value: raw, raw, contentType: contentType || 'application/xml' };
+  }
+  if (contentType.includes('x-www-form-urlencoded') || /^[^=&\s]+=[\s\S]*/.test(raw)) {
+    const value = Object.fromEntries(new URLSearchParams(raw));
+    return { type: 'form-urlencoded', value, raw, contentType: 'application/x-www-form-urlencoded' };
+  }
+  return { type: 'raw', value: raw, raw, contentType: contentType || 'text/plain' };
+}
+
+function normalizeMethod(method) {
+  const normalized = String(method || '').trim().toUpperCase();
+  if (!normalized) return undefined;
+  return HTTP_METHODS.includes(normalized) ? normalized : undefined;
+}
+
+function dedupeCookies(cookies) {
+  const map = new Map();
+  cookies.forEach(cookie => map.set(cookie.name, cookie));
+  return Array.from(map.values()).map((cookie, index) => ({ ...cookie, displayOrder: index }));
+}
+
+function createDefaultAssertions() {
+  return [
+    {
+      id: makeId('asrt'),
+      assertionType: 'EXPECTED_HTTP_STATUS',
+      configuration: { expectedHttpStatuses: [200] },
+      enabled: true,
+    },
+    {
+      id: makeId('asrt'),
+      assertionType: 'MAX_RESPONSE_TIME',
+      configuration: { maximumResponseTimeMs: 5000 },
+      enabled: true,
+    },
+  ];
+}
+
+function createDefaultScripts() {
+  return {
+    preRequest: [
+      '// Pre-request script امن API Console',
+      '// نمونه: setVar("page", "0")',
+      '// نمونه: setHeader("x-trace-id", "{{traceId}}")',
+    ].join('\n'),
+    postResponse: [
+      '// Post-response script برای تست API',
+      '// نمونه: testStatus(200)',
+      '// نمونه: testJsonPath("$.data")',
+      '// نمونه: testResponseTimeBelow(5000)',
+    ].join('\n'),
+    preRequestEnabled: false,
+    postResponseEnabled: false,
+  };
+}
+
+function createBlankNormalizedRequest(url = 'https://example.com/api/health') {
+  return {
+    method: 'GET',
+    url,
+    queryParameters: [],
+    headers: [createHeader('accept', 'application/json', 0, 'USER')],
+    cookies: [],
+    body: { type: 'none', value: null, raw: '' },
+    authentication: { type: 'none' },
+    tls: { verifyCertificate: true },
+    executionMode: 'RECOMMENDED',
+    classification: buildClassification('GENERIC_HTTP', null, null),
+  };
+}
+
+function parseCurlInternal(originalCurl) {
+  if (!String(originalCurl || '').trim()) {
+    throw new ApiConsoleError('CURL_PARSE_ERROR', 'Empty cURL input.');
+  }
+
+  const dialect = detectCurlDialect(originalCurl);
+  const normalizedText = normalizeCurlText(originalCurl, dialect);
+  const tokens = tokenizeCurl(normalizedText);
+  const curlIndex = tokens.findIndex(token => ['curl', 'curl.exe'].includes(token.toLowerCase()));
+  const requestTokens = curlIndex >= 0 ? tokens.slice(curlIndex + 1) : tokens;
+  const warnings = [];
+  const unsupportedOptions = [];
+  const headers = [];
+  const cookies = [];
+  const dataParts = [];
+  const formParts = [];
+  let explicitMethod;
+  let urlText = '';
+  let tlsVerifyCertificate = true;
+  let authentication = { type: 'none' };
+
+  const readValue = (index, inline) => {
+    if (inline !== undefined) return { value: inline, nextIndex: index };
+    return { value: requestTokens[index + 1] || '', nextIndex: index + 1 };
+  };
+
+  for (let i = 0; i < requestTokens.length; i += 1) {
+    const rawToken = requestTokens[i];
+    const { option, value: inlineValue } = splitOptionToken(rawToken);
+
+    if (REQUEST_OPTIONS.has(option)) {
+      const { value, nextIndex } = readValue(i, inlineValue);
+      explicitMethod = normalizeMethod(value);
+      if (!explicitMethod) warnings.push(`Unsupported HTTP method "${value}" imported as editable value.`);
+      i = nextIndex;
+      continue;
+    }
+
+    if (HEADER_OPTIONS.has(option)) {
+      const { value, nextIndex } = readValue(i, inlineValue);
+      const parsed = parseHeaderLine(value);
+      if (parsed) {
+        const header = createHeader(parsed.name, parsed.value, headers.length, 'IMPORTED_CURL');
+        if (parsed.name.toLowerCase() === 'cookie') {
+          header.enabled = false;
+          header.replayNote = 'Parsed into the cookie editor to avoid duplicate Cookie transmission in recommended replay.';
+          parseCookieHeader(parsed.value).forEach(cookie => cookies.push(createCookie(cookie.name, cookie.value, cookies.length)));
+        }
+        headers.push(header);
+      } else {
+        warnings.push(`Ignored malformed header: ${value}`);
+      }
+      i = nextIndex;
+      continue;
+    }
+
+    if (COOKIE_OPTIONS.has(option)) {
+      const { value, nextIndex } = readValue(i, inlineValue);
+      parseCookieHeader(value).forEach(cookie => cookies.push(createCookie(cookie.name, cookie.value, cookies.length)));
+      i = nextIndex;
+      continue;
+    }
+
+    if (BODY_OPTIONS.has(option)) {
+      const { value, nextIndex } = readValue(i, inlineValue);
+      dataParts.push(value);
+      i = nextIndex;
+      continue;
+    }
+
+    if (FORM_OPTIONS.has(option)) {
+      const { value, nextIndex } = readValue(i, inlineValue);
+      formParts.push(value);
+      i = nextIndex;
+      continue;
+    }
+
+    if (URL_OPTIONS.has(option)) {
+      const { value, nextIndex } = readValue(i, inlineValue);
+      urlText = value;
+      i = nextIndex;
+      continue;
+    }
+
+    if (option === '--insecure' || option === '-k') {
+      tlsVerifyCertificate = false;
+      warnings.push('TLS certificate verification is disabled by imported --insecure/-k.');
+      continue;
+    }
+
+    if (LOCATION_OPTIONS.has(option)) {
+      warnings.push('Redirect following was imported from --location/-L and is handled by the backend Runner.');
+      continue;
+    }
+
+    if (option === '-u' || option === '--user') {
+      const { value, nextIndex } = readValue(i, inlineValue);
+      const [username] = value.split(':');
+      authentication = {
+        type: 'basic',
+        basicUsername: username,
+        basicPasswordReference: '{{basicPassword}}',
+      };
+      unsupportedOptions.push(option);
+      warnings.push('Basic credentials were converted to a secret reference.');
+      i = nextIndex;
+      continue;
+    }
+
+    if (UNSUPPORTED_OPTIONS_WITH_VALUE.has(option)) {
+      const { nextIndex } = readValue(i, inlineValue);
+      unsupportedOptions.push(option);
+      i = nextIndex;
+      continue;
+    }
+
+    if (UNSUPPORTED_FLAGS.has(option)) {
+      unsupportedOptions.push(option);
+      continue;
+    }
+
+    if (option.startsWith('-')) {
+      unsupportedOptions.push(option);
+      continue;
+    }
+
+    if (!urlText) {
+      urlText = rawToken;
+    } else {
+      warnings.push(`Unrecognized positional token ignored: ${rawToken}`);
+    }
+  }
+
+  if (!urlText) {
+    throw new ApiConsoleError('INVALID_URL', 'cURL input did not contain a URL.');
+  }
+
+  const { urlWithoutQuery, queryParameters } = createQueryParametersFromUrl(urlText);
+  const body = inferBody(dataParts, formParts, headers);
+  const method = explicitMethod || ((dataParts.length || formParts.length) ? 'POST' : 'GET');
+
+  if (body.type === 'json' && !headers.some(header => header.name.toLowerCase() === 'content-type')) {
+    headers.push(createHeader('content-type', 'application/json', headers.length, 'SYSTEM'));
+  }
+
+  const classification = detectCoreClassification(urlWithoutQuery, body);
+  const jsonValidity = body.type === 'json'
+    ? (() => {
+        const result = parseJsonSafely(body.raw);
+        return result.ok ? { valid: true } : { valid: false, error: result.error, line: result.line, column: result.column };
+      })()
+    : { valid: true };
+
+  if (unsupportedOptions.length) {
+    warnings.push(`Unsupported cURL options kept as warnings: ${Array.from(new Set(unsupportedOptions)).join(', ')}`);
+  }
+
+  const normalizedRequest = {
+    method,
+    url: urlWithoutQuery,
+    queryParameters,
+    headers,
+    cookies: dedupeCookies(cookies),
+    body,
+    authentication,
+    tls: {
+      verifyCertificate: tlsVerifyCertificate,
+      importedInsecureFlag: !tlsVerifyCertificate,
+    },
+    executionMode: 'RECOMMENDED',
+    classification,
+  };
+
+  return {
+    id: makeId('curl-preview'),
+    originalCurl,
+    detectedDialect: dialect,
+    normalizedRequest,
+    effectiveMethod: method,
+    url: urlWithoutQuery,
+    headerCount: headers.length,
+    cookieCount: normalizedRequest.cookies.length,
+    bodyType: body.type,
+    jsonValidity,
+    tlsVerification: tlsVerifyCertificate,
+    warnings,
+    unsupportedOptions: Array.from(new Set(unsupportedOptions)),
+    parserVersion: PARSER_VERSION,
+    importedAt: nowIso(),
+  };
+}
+
+function requestBodyFromDefinition(request) {
+  if (request.bodyType === 'none') return { type: 'none', value: null, raw: '' };
+  if (request.bodyType === 'json') {
+    const parsed = parseJsonSafely(request.bodyTemplate || '');
+    return {
+      type: 'json',
+      value: parsed.ok ? parsed.value : null,
+      raw: request.bodyTemplate || '',
+      contentType: 'application/json',
+    };
+  }
+  if (request.bodyType === 'form-urlencoded') {
+    return {
+      type: 'form-urlencoded',
+      value: Object.fromEntries(new URLSearchParams(request.bodyTemplate || '')),
+      raw: request.bodyTemplate || '',
+      contentType: 'application/x-www-form-urlencoded',
+    };
+  }
+  if (request.bodyType === 'xml') {
+    return { type: 'xml', value: request.bodyTemplate || '', raw: request.bodyTemplate || '', contentType: 'application/xml' };
+  }
+  if (request.bodyType === 'multipart') {
+    return { type: 'multipart', value: request.bodyTemplate || '', raw: request.bodyTemplate || '', contentType: 'multipart/form-data' };
+  }
+  return { type: request.bodyType, value: request.bodyTemplate || '', raw: request.bodyTemplate || '' };
+}
+
+function normalizedFromDefinition(request) {
+  const body = requestBodyFromDefinition(request);
+  return {
+    method: request.method,
+    url: request.urlTemplate,
+    queryParameters: request.queryParameters || [],
+    headers: request.headers || [],
+    cookies: request.cookies || [],
+    body,
+    authentication: request.authentication || { type: 'none' },
+    tls: request.tls || { verifyCertificate: true },
+    executionMode: request.executionMode || 'RECOMMENDED',
+    classification: detectCoreClassification(request.urlTemplate, body),
+  };
+}
+
+function bodyTemplateFromBody(body) {
+  if (!body || body.type === 'none') return '';
+  if (body.raw) return body.raw;
+  if (body.type === 'json') return JSON.stringify(body.value ?? {}, null, 2);
+  if (typeof body.value === 'string') return body.value;
+  return JSON.stringify(body.value ?? '', null, 2);
+}
+
+function protectRequestSecrets(request) {
+  const next = safeClone(request);
+  next.headers = (next.headers || []).map((header, index) => {
+    const sensitive = header.sensitive || isSensitiveName(header.name);
+    const valueTemplate = sensitive ? protectSensitiveScalar(header.name, header.valueTemplate) : header.valueTemplate;
+    return {
+      ...header,
+      sensitive,
+      valueTemplate,
+      maskedValue: sensitive ? maskValue(valueTemplate) : valueTemplate,
+      displayOrder: header.displayOrder ?? index,
+    };
+  });
+  next.cookies = (next.cookies || []).map((cookie, index) => {
+    const sensitive = cookie.sensitive || isSensitiveName(cookie.name) || !ANALYTICS_COOKIES.has(String(cookie.name || '').toLowerCase());
+    const valueReference = sensitive ? protectSensitiveScalar(cookie.name, cookie.valueReference) : cookie.valueReference;
+    return {
+      ...cookie,
+      sensitive,
+      valueReference,
+      maskedValue: sensitive ? maskValue(valueReference) : valueReference,
+      displayOrder: cookie.displayOrder ?? index,
+    };
+  });
+  next.queryParameters = (next.queryParameters || []).map((param, index) => {
+    const sensitive = param.sensitive || isSensitiveName(param.name);
+    return {
+      ...param,
+      sensitive,
+      value: sensitive ? protectSensitiveScalar(param.name, param.value) : param.value,
+      displayOrder: param.displayOrder ?? index,
+    };
+  });
+  next.bodyTemplate = protectBodySecrets(next.bodyType, next.bodyTemplate);
+  next.bodyType = next.bodyType || 'none';
+  next.scripts = { ...createDefaultScripts(), ...(next.scripts || {}) };
+  const body = requestBodyFromDefinition(next);
+  next.classification = detectCoreClassification(next.urlTemplate, body);
+  return next;
+}
+
+function definitionFromNormalized(normalized, data) {
+  const now = nowIso();
+  const requestId = data.id || makeId('api-req');
+  const semanticVersion = data.semanticVersion || normalized.semanticVersion || data.versionLabel || '1.0.0';
+  const bodyTemplate = bodyTemplateFromBody(normalized.body);
+  const request = {
+    id: requestId,
+    collectionId: data.collectionId,
+    applicationId: data.applicationId,
+    apiId: data.apiId || requestId,
+    semanticVersion,
+    sharingStatus: data.sharingStatus || 'DRAFT',
+    sourceType: data.sourceType || 'ORIGINAL',
+    referenceId: data.referenceId,
+    sourceRequestId: data.sourceRequestId,
+    shareRequestId: data.shareRequestId,
+    name: data.name,
+    description: data.description,
+    method: normalized.method,
+    urlTemplate: normalized.url,
+    queryParameters: normalized.queryParameters || [],
+    headers: normalized.headers || [],
+    cookies: normalized.cookies || [],
+    bodyType: normalized.body?.type || 'none',
+    bodyTemplate,
+    authentication: normalized.authentication || { type: 'none' },
+    tls: normalized.tls || { verifyCertificate: true },
+    executionMode: normalized.executionMode || 'RECOMMENDED',
+    classification: detectCoreClassification(normalized.url, { ...normalized.body, raw: bodyTemplate }),
+    environmentId: data.environmentId,
+    assertions: normalized.assertions || createDefaultAssertions(),
+    scripts: data.scripts || normalized.scripts || createDefaultScripts(),
+    documentation: {
+      title: data.name,
+      description: data.description || '',
+      authenticationProfileId: data.authenticationDocumentationProfileId,
+      providerApplication: data.applicationId,
+      version: semanticVersion,
+      owner: data.userName || data.userId,
+      supportContact: 'quality-team@example.local',
+      changeHistory: [{ version: semanticVersion, changedAt: now, summary: data.changeLog || 'Initial API Console request definition.' }],
+    },
+    version: 1,
+    status: 'ACTIVE',
+    originalImportedCurl: data.originalImportedCurl ? sanitizeText(data.originalImportedCurl) : undefined,
+    importedCurlId: data.importedCurlId,
+    createdBy: data.userId,
+    createdAt: now,
+    updatedBy: data.userId,
+    updatedAt: now,
+  };
+  request.documentation = refreshDocumentationMetadata(request);
+  return protectRequestSecrets(request);
+}
+
+function buildUrlWithQuery(baseUrl, params) {
+  const enabled = (params || []).filter(param => param.enabled && param.name);
+  if (!enabled.length) return baseUrl;
+  try {
+    const url = new URL(baseUrl);
+    enabled.forEach(param => url.searchParams.set(param.name, param.value));
+    return url.toString();
+  } catch {
+    const query = enabled
+      .map(param => `${encodeURIComponent(param.name)}=${encodeURIComponent(param.value)}`)
+      .join('&');
+    return `${baseUrl}${String(baseUrl).includes('?') ? '&' : '?'}${query}`;
+  }
+}
+
+function hasBody(body) {
+  return body && body.type !== 'none' && String(body.raw || '').length > 0;
+}
+
+function requestBodyContentType(body) {
+  if (!hasBody(body)) return '';
+  return body.contentType ||
+    (body.type === 'json' ? 'application/json'
+      : body.type === 'xml' ? 'application/xml'
+        : body.type === 'form-urlencoded' ? 'application/x-www-form-urlencoded'
+          : body.type === 'multipart' ? 'multipart/form-data'
+            : 'text/plain');
+}
+
+function requestHeadersWithBodyContentType(request) {
+  const enabledHeaders = (request.headers || []).filter(header => header.enabled);
+  const body = requestBodyFromDefinition(request);
+  const hasContentType = enabledHeaders.some(header => String(header.name || '').toLowerCase() === 'content-type');
+  const contentType = requestBodyContentType(body);
+  if (contentType && !hasContentType) {
+    return [
+      ...enabledHeaders,
+      {
+        id: 'doc-content-type',
+        name: 'content-type',
+        valueTemplate: contentType,
+        enabled: true,
+        sensitive: false,
+        source: 'SYSTEM',
+        category: 'TRANSPORT_GENERATED',
+        description: 'Derived from Body type for the request payload.',
+        maskedValue: contentType,
+        displayOrder: enabledHeaders.length,
+      },
+    ];
+  }
+  return enabledHeaders;
+}
+
+function documentedRequestHeaders(request) {
+  return requestHeadersWithBodyContentType(request).filter(header => {
+    const name = String(header.name || '').trim().toLowerCase();
+    if (!name || name === 'content-length') return false;
+    if (BROWSER_HEADERS.has(name) || TRANSPORT_HEADERS.has(name)) return name === 'content-type';
+    return header.enabled !== false;
+  });
+}
+
+function cleanDocumentationUrl(value) {
+  return String(value || '').trim().replace(/\s+/g, '');
+}
+
+function documentationUrlParts(value) {
+  const endpoint = cleanDocumentationUrl(value);
+  try {
+    const parsed = new URL(endpoint);
+    return { endpoint, baseUrl: `${parsed.protocol}//${parsed.host}`, operationPath: parsed.pathname || '/' };
+  } catch {
+    return { endpoint, baseUrl: '', operationPath: endpoint || '/' };
+  }
+}
+
+function inferDocumentationDataType(value) {
+  if (value === null || value === undefined) return 'unknown';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'string') return 'string';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'Integer' : 'Number';
+  if (typeof value === 'boolean') return 'boolean';
+  if (typeof value === 'object') return 'object';
+  return 'unknown';
+}
+
+function normalizedDocumentationFieldKey(location, name) {
+  const pathValue = String(name || '').trim();
+  return `${location}:${location === 'HEADER' ? pathValue.toLowerCase() : pathValue}`;
+}
+
+function isSensitiveDocumentationSampleName(name) {
+  const normalized = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return isSensitiveName(name) ||
+    normalized.includes('nationalcode') || normalized.includes('employeecode') || normalized.includes('personnelcode') ||
+    normalized.includes('payableprice') || normalized.includes('sumprice') || normalized.includes('amount');
+}
+
+function maskPersonallyIdentifiableValue(name, value) {
+  const normalized = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const text = String(value ?? '');
+  if (!text) return '';
+  if (text.includes('*')) return text;
+  if (isSecretReference(text) || text.includes('{{')) return '****';
+  if (normalized.includes('nationalcode')) {
+    return text.length > 7 ? `${text.slice(0, 4)}***${text.slice(-3)}` : '****';
+  }
+  if (normalized.includes('employeecode') || normalized.includes('personnelcode')) {
+    return text.length > 4 ? `${text.slice(0, 2)}****${text.slice(-2)}` : '****';
+  }
+  if (normalized.includes('payableprice') || normalized.includes('sumprice') || normalized.includes('amount')) {
+    return text.length > 6 ? `${text.slice(0, Math.max(1, text.length - 5))}**${text.slice(-3)}` : '****';
+  }
+  if (isSensitiveName(name)) return maskValue(text);
+  return value;
+}
+
+function maskDocumentationSecret(value) {
+  const text = String(value || '');
+  if (!text || isSecretReference(text) || text.includes('{{')) return '****';
+  if (text.includes('*')) return text;
+  const bearer = text.match(/^Bearer\s+(.+)$/i);
+  if (bearer) return `Bearer ${maskDocumentationSecret(bearer[1])}`;
+  if (text.length <= 18) return '******';
+  return `${text.slice(0, 8)}...****...${text.slice(-6)}`;
+}
+
+function documentationExampleValue(name, value) {
+  if (value === null || value === undefined || typeof value === 'object') return undefined;
+  const masked = maskPersonallyIdentifiableValue(name, value);
+  return typeof masked === 'string' ? sanitizeText(masked) : String(masked);
+}
+
+function defaultAllowedValuesForDocumentationField(name) {
+  const fieldName = String(name || '').split('.').at(-1)?.replace(/\[\]$/g, '') || '';
+  const normalized = fieldName.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return (DEFAULT_DOCUMENTATION_ALLOWED_VALUE_CATALOGS[normalized] || []).map(([value, description], displayOrder) => ({
+    id: `doc-allowed-${normalized}-${value}`,
+    value,
+    description,
+    enabled: true,
+    displayOrder,
+  }));
+}
+
+function makeDocumentationParameter({ name, location, value, dataType, required = null, description = '', displayOrder = 0, id, source = 'AUTO', allowedValues }) {
+  return {
+    id: id || `doc-${String(location || '').toLowerCase()}-${String(name || '').replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || displayOrder}`,
+    name: String(name || ''),
+    location,
+    dataType: dataType || inferDocumentationDataType(value),
+    required: required === true ? true : required === false ? false : null,
+    description: String(description || ''),
+    ...(documentationExampleValue(name, value) === undefined ? {} : { exampleValue: documentationExampleValue(name, value) }),
+    parentPath: String(name || '').includes('.') ? String(name).replace(/\.[^.]+$/, '') : undefined,
+    displayOrder,
+    enabled: true,
+    deprecated: false,
+    source,
+    allowedValues: location === 'RESPONSE' ? (allowedValues || defaultAllowedValuesForDocumentationField(name)) : (allowedValues || []),
+    allowedValuesCustomized: false,
+  };
+}
+
+function inferStructuredDocumentationParameters(value, location) {
+  const rows = [];
+  const visitChildren = (container, prefix) => {
+    if (!container || typeof container !== 'object') return;
+    const entries = Array.isArray(container) ? Object.entries(container[0] && typeof container[0] === 'object' ? container[0] : {}) : Object.entries(container);
+    for (const [key, childValue] of entries) {
+      const pathValue = prefix ? `${prefix}.${key}` : key;
+      const documentedPath = Array.isArray(childValue) ? `${pathValue}[]` : pathValue;
+      rows.push(makeDocumentationParameter({ name: documentedPath, location, value: childValue, displayOrder: rows.length }));
+      if (Array.isArray(childValue)) {
+        const sample = childValue.find(item => item !== null && item !== undefined);
+        if (sample && typeof sample === 'object') visitChildren(sample, documentedPath);
+      } else if (childValue && typeof childValue === 'object') {
+        visitChildren(childValue, pathValue);
+      }
+    }
+  };
+  if (Array.isArray(value)) {
+    const sample = value.find(item => item !== null && item !== undefined);
+    if (sample && typeof sample === 'object') visitChildren(sample, '[]');
+  } else {
+    visitChildren(value, '');
+  }
+  return rows;
+}
+
+function inferRequestDocumentationParameters(request) {
+  const rows = [];
+  (request.queryParameters || []).filter(item => item.enabled && item.name).forEach(item => {
+    rows.push(makeDocumentationParameter({
+      name: item.name,
+      location: 'QUERY',
+      value: item.value,
+      dataType: 'string',
+      description: item.description || '',
+      displayOrder: rows.length,
+    }));
+  });
+
+  const seenPathNames = new Set();
+  const pathMatches = String(request.urlTemplate || '').matchAll(/\{\{?([^{}]+)\}\}?|:([A-Za-z_][A-Za-z0-9_]*)/g);
+  for (const match of pathMatches) {
+    const name = match[1] || match[2];
+    if (!name || seenPathNames.has(name)) continue;
+    seenPathNames.add(name);
+    rows.push(makeDocumentationParameter({ name, location: 'PATH', dataType: 'string', displayOrder: rows.length }));
+  }
+
+  if (request.bodyType === 'json' && request.bodyTemplate) {
+    const parsed = parseJsonSafely(request.bodyTemplate);
+    if (parsed.ok) {
+      inferStructuredDocumentationParameters(parsed.value, 'BODY').forEach(row => rows.push({ ...row, displayOrder: rows.length }));
+    }
+  } else if (['form-urlencoded', 'multipart'].includes(request.bodyType) && request.bodyTemplate) {
+    try {
+      const pairs = request.bodyType === 'form-urlencoded'
+        ? Array.from(new URLSearchParams(request.bodyTemplate).entries())
+        : String(request.bodyTemplate).split(/\r?\n|&/).map(line => {
+            const separator = line.indexOf('=');
+            return separator >= 0 ? [line.slice(0, separator).trim(), line.slice(separator + 1).trim()] : ['', ''];
+          });
+      pairs.filter(([name]) => name).forEach(([name, value]) => rows.push(makeDocumentationParameter({
+        name,
+        location: 'BODY',
+        value,
+        dataType: 'string',
+        displayOrder: rows.length,
+      })));
+    } catch {
+      // Raw body remains available as the request example when form parsing is unsafe.
+    }
+  }
+  return rows;
+}
+
+function meaningfulHeaderDescription(header) {
+  const description = String(header?.description || '').trim();
+  const generatedDescriptions = new Set([
+    'Application or business header.',
+    'Managed by the selected HTTP transport and recalculated at execution time.',
+    'Browser-only compatibility header imported from a copied browser request.',
+    'Authentication header. Values are masked and excluded from generated documentation.',
+    'Environment or application routing header.',
+  ]);
+  return generatedDescriptions.has(description) ? '' : description;
+}
+
+function inferHeaderDocumentationParameters(request) {
+  return documentedRequestHeaders(request).map((header, index) => makeDocumentationParameter({
+    id: header.id ? `doc-${header.id}` : undefined,
+    name: header.name,
+    location: 'HEADER',
+    value: header.sensitive || isSensitiveName(header.name)
+      ? maskDocumentationSecret(header.valueTemplate)
+      : header.valueTemplate,
+    dataType: String(header.name || '').toLowerCase() === 'content-type' ? (header.valueTemplate || 'string') : 'string',
+    description: meaningfulHeaderDescription(header),
+    displayOrder: index,
+  }));
+}
+
+function normalizeDocumentationParameter(raw, fallbackLocation, index) {
+  const location = ['HEADER', 'QUERY', 'PATH', 'BODY', 'RESPONSE'].includes(raw?.location) ? raw.location : fallbackLocation;
+  const name = String(raw?.name || '').trim();
+  const sensitive = location === 'HEADER' ? isSensitiveName(name) : isSensitiveDocumentationSampleName(name);
+  let exampleValue = raw?.exampleValue === undefined ? undefined : String(raw.exampleValue);
+  if (sensitive && exampleValue) exampleValue = String(maskPersonallyIdentifiableValue(name, exampleValue));
+  if (isSecretReference(exampleValue)) exampleValue = '****';
+  const allowedValues = Array.isArray(raw?.allowedValues)
+    ? raw.allowedValues.map((item, allowedIndex) => ({
+        id: String(item?.id || makeId('doc-allowed-value')),
+        value: sanitizeText(String(item?.value ?? '')),
+        description: sanitizeText(String(item?.description || '')),
+        enabled: item?.enabled !== false,
+        displayOrder: Number.isFinite(Number(item?.displayOrder)) ? Number(item.displayOrder) : allowedIndex,
+      })).sort((left, right) => left.displayOrder - right.displayOrder)
+    : [];
+  const inferredParentPath = name.includes('.') ? name.replace(/\.[^.]+$/, '') : undefined;
+  return {
+    id: String(raw?.id || makeId('doc-param')),
+    name,
+    location,
+    dataType: String(raw?.dataType || 'unknown'),
+    required: raw?.required === true ? true : raw?.required === false ? false : null,
+    description: sanitizeText(String(raw?.description || '')),
+    ...(exampleValue === undefined ? {} : { exampleValue: sanitizeText(exampleValue) }),
+    parentPath: raw?.parentPath ? String(raw.parentPath) : inferredParentPath,
+    displayOrder: Number.isFinite(Number(raw?.displayOrder)) ? Number(raw.displayOrder) : index,
+    enabled: raw?.enabled !== false,
+    deprecated: !!raw?.deprecated,
+    source: raw?.source || 'MANUAL',
+    allowedValues,
+    allowedValuesCustomized: !!raw?.allowedValuesCustomized,
+  };
+}
+
+function mergeDocumentationParameters(existing, discovered, fallbackLocation) {
+  const existingRows = Array.isArray(existing)
+    ? existing.map((row, index) => normalizeDocumentationParameter(row, fallbackLocation, index)).filter(row => row.name)
+    : [];
+  const byKey = new Map(existingRows.map(row => [normalizedDocumentationFieldKey(row.location, row.name), row]));
+  const discoveredKeys = new Set();
+  const merged = discovered.map((row, index) => {
+    const normalized = normalizeDocumentationParameter(row, fallbackLocation, index);
+    const key = normalizedDocumentationFieldKey(normalized.location, normalized.name);
+    discoveredKeys.add(key);
+    const previous = byKey.get(key);
+    if (!previous) return normalized;
+    return {
+      ...normalized,
+      id: previous.id,
+      dataType: previous.dataType || normalized.dataType,
+      required: previous.required,
+      description: previous.description,
+      exampleValue: previous.exampleValue ?? normalized.exampleValue,
+      allowedValues: previous.allowedValuesCustomized
+        ? previous.allowedValues
+        : previous.allowedValues?.length ? previous.allowedValues : normalized.allowedValues,
+      allowedValuesCustomized: previous.allowedValuesCustomized,
+      displayOrder: previous.displayOrder,
+      enabled: previous.enabled,
+      deprecated: false,
+      source: previous.source,
+    };
+  });
+  existingRows.filter(row => !discoveredKeys.has(normalizedDocumentationFieldKey(row.location, row.name))).forEach(row => {
+    merged.push(row.source === 'AUTO'
+      ? { ...row, enabled: false, deprecated: true }
+      : row);
+  });
+  return merged.sort((left, right) => left.displayOrder - right.displayOrder || left.name.localeCompare(right.name));
+}
+
+function defaultResponseCodes() {
+  return DEFAULT_RESPONSE_CODE_CATALOG.map(row => ({ ...row }));
+}
+
+function normalizeResponseCodes(rows) {
+  const source = Array.isArray(rows) ? rows : defaultResponseCodes();
+  return source.map((row, index) => ({
+    code: Number.isFinite(Number(row?.code)) ? Number(row.code) : 0,
+    message: sanitizeText(String(row?.message || '')),
+    description: sanitizeText(String(row?.description || '')),
+    enabled: row?.enabled !== false,
+    displayOrder: Number.isFinite(Number(row?.displayOrder)) ? Number(row.displayOrder) : index,
+  })).sort((left, right) => left.displayOrder - right.displayOrder || left.code - right.code);
+}
+
+function authenticationProfile(profileId) {
+  const profile = AUTHENTICATION_DOCUMENTATION_PROFILES.find(item => item.id === profileId);
+  return profile ? safeClone(profile) : null;
+}
+
+function authenticationApplicable(request) {
+  const hasAuthenticationHeader = (request.headers || []).some(header => ['token', 'authorization'].includes(String(header.name || '').toLowerCase()));
+  return request.authentication?.type !== 'none' || hasAuthenticationHeader;
+}
+
+function normalizeAuthenticationDocumentation(raw, request, profileId) {
+  const urlParts = documentationUrlParts(request.urlTemplate);
+  const selectedProfileId = profileId || raw?.profileId || (urlParts.baseUrl === 'https://esb.medu.ir' && authenticationApplicable(request) ? 'ministry-esb' : '');
+  const profile = authenticationProfile(selectedProfileId);
+  const source = { ...(profile || {}), ...(raw || {}) };
+  const enabled = source.enabled === true || (!raw && !!profile && authenticationApplicable(request));
+  return {
+    profileId: selectedProfileId || undefined,
+    enabled,
+    title: sanitizeText(String(source.title || 'سرویس احراز هویت')),
+    introduction: sanitizeText(String(source.introduction || '')),
+    baseUrl: cleanDocumentationUrl(source.baseUrl || ''),
+    endpoint: cleanDocumentationUrl(source.endpoint || ''),
+    method: String(source.method || 'POST').toUpperCase(),
+    contentType: String(source.contentType || 'application/json'),
+    headerParameters: (source.headerParameters || []).map((row, index) => normalizeDocumentationParameter(row, 'HEADER', index)),
+    inputParameters: (source.inputParameters || []).map((row, index) => normalizeDocumentationParameter(row, 'BODY', index)),
+    outputParameters: (source.outputParameters || []).map((row, index) => normalizeDocumentationParameter(row, 'RESPONSE', index)),
+    curlExample: sanitizeDocumentationCurl(source.curlExample || ''),
+    responseExample: sanitizeDocumentationResponseExample(source.responseExample || ''),
+  };
+}
+
+function sanitizeDocumentationJsonValue(value, pathValue = '', parameterRows = []) {
+  if (Array.isArray(value)) return value.map(item => sanitizeDocumentationJsonValue(item, `${pathValue}[]`, parameterRows));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => {
+      const childPath = pathValue ? `${pathValue}.${key}` : key;
+      return [key, sanitizeDocumentationJsonValue(child, childPath, parameterRows)];
+    }));
+  }
+  const fieldName = pathValue.split('.').at(-1)?.replace(/\[\]$/g, '') || pathValue;
+  const metadata = parameterRows.find(row => row.name === pathValue || row.name === fieldName);
+  if (isSecretReference(value) || isSensitiveDocumentationSampleName(fieldName)) {
+    return metadata?.exampleValue || maskPersonallyIdentifiableValue(fieldName, value) || '****';
+  }
+  return value;
+}
+
+function sanitizeDocumentationResponseExample(text, parameterRows = []) {
+  const value = String(text || '').trim();
+  if (!value) return '';
+  const parsed = parseJsonSafely(value);
+  if (parsed.ok) return JSON.stringify(sanitizeDocumentationJsonValue(parsed.value, '', parameterRows), null, 2);
+  return sanitizeText(value).replace(/secret:\/\/api-console\/[0-9a-f-]+/gi, '****');
+}
+
+function sanitizeDocumentationCurl(text) {
+  const withoutContentLength = String(text || '')
+    .split(/\r?\n/)
+    .filter(line => !(/^\s*(?:--header|-H)\s+/i.test(line) && /content-length\s*:/i.test(line)))
+    .join('\n')
+    .replace(/\s+(?:--header|-H)\s+(?:'Content-Length:[^']*'|"Content-Length:[^"]*")/gi, '');
+  return sanitizeText(withoutContentLength)
+    .replace(/secret:\/\/api-console\/[0-9a-f-]+/gi, '****')
+    .replace(/secret%3A%2F%2Fapi-console%2F[0-9a-f-]+/gi, '****')
+    .replace(/((?:--header|-H)\s+['"]?(?:authorization|token|access_token|refresh_token|client-secret|api-key|x-api-key)\s*:\s*)([^'"\\\r\n]+)/gi,
+      (_match, prefix, value) => `${prefix}${maskDocumentationSecret(String(value).trim())}`)
+    .replace(/((?:--form|--data-urlencode)\s+['"]?(?:password|token|access_token|client-secret|api-key)\s*=)[^'"\s]+/gi, '$1****')
+    .replace(/((?:national[_-]?code|employee[_-]?code|personnel[_-]?code|NetPayablePrice|DeductionsSumPrice)\s*["']?\s*:\s*["'])([^"',}\s]+)/gi,
+      (_match, prefix, value) => `${prefix}${maskPersonallyIdentifiableValue(prefix, value)}`);
+}
+
+function latestDocumentationEvidence(request, executions, manualExamples) {
+  const execution = (executions || [])
+    .filter(item => {
+      const statusCode = Number(item.response?.statusCode || item.statusCode || 0);
+      return item.requestId === request.id && item.transportResult === 'SUCCESS' && item.response && statusCode >= 200 && statusCode < 300;
+    })
+    .sort((left, right) => String(right.completedAt || right.startedAt || '').localeCompare(String(left.completedAt || left.startedAt || '')))[0];
+  const manual = (manualExamples || [])
+    .filter(item => item.requestId === request.id && item.reviewStatus !== 'REJECTED' && Number(item.statusCode || 0) >= 200 && Number(item.statusCode || 0) < 300)
+    .sort((left, right) => String(right.enteredAt || '').localeCompare(String(left.enteredAt || '')))[0];
+  const executionAt = new Date(execution?.completedAt || execution?.startedAt || 0).getTime();
+  const manualAt = new Date(manual?.enteredAt || 0).getTime();
+  const useManual = !!manual && (!execution || manualAt >= executionAt);
+  const responseText = useManual ? manual.body : execution?.response?.bodyPreview || manual?.body || '';
+  return { execution, manual, responseText, source: useManual ? 'MANUAL_EXAMPLE' : execution ? 'ACTUAL_EXECUTION' : null };
+}
+
+function refreshDocumentationMetadata(request, executions = [], manualExamples = []) {
+  const existing = request.documentation || {};
+  const urlParts = documentationUrlParts(request.urlTemplate);
+  const evidence = latestDocumentationEvidence(request, executions, manualExamples);
+  const responseParsed = parseJsonSafely(evidence.responseText || '');
+  const discoveredOutputs = responseParsed.ok
+    ? inferStructuredDocumentationParameters(responseParsed.value, 'RESPONSE')
+    : [];
+  const headerParameters = mergeDocumentationParameters(existing.headerParameters, inferHeaderDocumentationParameters(request), 'HEADER');
+  const inputParameters = mergeDocumentationParameters(existing.inputParameters, inferRequestDocumentationParameters(request), 'BODY');
+  const outputParameters = evidence.responseText
+    ? mergeDocumentationParameters(existing.outputParameters, discoveredOutputs, 'RESPONSE')
+    : (existing.outputParameters || []).map((row, index) => normalizeDocumentationParameter(row, 'RESPONSE', index));
+  const serviceIntroduction = String(existing.serviceIntroduction ?? existing.description ?? request.description ?? '');
+  const documentRevision = String(existing.documentRevision || existing.version || request.semanticVersion || '1.0.0');
+  const documentDate = String(existing.documentDate || nowIso().slice(0, 10));
+  const metadata = {
+    ...existing,
+    title: sanitizeText(String(existing.title || request.name || 'Untitled API Request')),
+    description: sanitizeText(String(existing.description ?? request.description ?? '')),
+    serviceIntroduction: sanitizeText(serviceIntroduction),
+    baseUrl: cleanDocumentationUrl(existing.baseUrl || urlParts.baseUrl),
+    operationPath: cleanDocumentationUrl(existing.operationPath || urlParts.operationPath),
+    endpoint: urlParts.endpoint,
+    method: request.method,
+    providerApplication: existing.providerApplication || request.applicationId,
+    version: existing.version || documentRevision,
+    documentRevision,
+    organizationName: sanitizeText(String(existing.organizationName || DEFAULT_DOCUMENT_ORGANIZATION)),
+    departmentName: sanitizeText(String(existing.departmentName || DEFAULT_DOCUMENT_DEPARTMENT)),
+    documentDate,
+    headerParameters,
+    inputParameters,
+    outputParameters,
+    authenticationProfileId: existing.authenticationProfileId || undefined,
+    authenticationDocumentation: normalizeAuthenticationDocumentation(existing.authenticationDocumentation, request, existing.authenticationProfileId),
+    responseCodes: normalizeResponseCodes(existing.responseCodes),
+    curlExample: sanitizeDocumentationCurl(existing.curlExample || ''),
+    responseExample: sanitizeDocumentationResponseExample(existing.responseExample || '', outputParameters),
+  };
+  return metadata;
+}
+
+function requiredStatusLabel(value) {
+  if (value === true) return 'بله';
+  if (value === false) return 'خیر';
+  return 'نامشخص';
+}
+
+function defaultGlobalVariables() {
+  return [
+    {
+      id: makeId('var'),
+      key: 'baseUrl',
+      currentValue: 'https://api.example.com',
+      initialValue: 'https://api.example.com',
+      sensitive: false,
+      scope: 'GLOBAL',
+      description: 'Global API base URL fallback.',
+    },
+  ];
+}
+
+function defaultEnvironments() {
+  const mkHeader = (name, value, order) => createHeader(name, value, order, 'ENVIRONMENT');
+  const makeEnv = (id, name, kind, baseUrl, stage, productionProtected) => ({
+    id,
+    name,
+    kind,
+    baseUrl,
+    variables: [
+      { id: makeId('var'), key: 'stage', currentValue: stage, initialValue: stage, sensitive: false, scope: 'ENVIRONMENT', description: `${name} stage header.` },
+      { id: makeId('var'), key: 'baseUrl', currentValue: baseUrl, initialValue: baseUrl, sensitive: false, scope: 'ENVIRONMENT', description: `${name} base URL.` },
+    ],
+    defaultHeaders: [mkHeader('prostage', '{{stage}}', 0), mkHeader('accept', 'application/json', 1)],
+    secretReferences: {},
+    productionProtected,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  });
+  return [
+    makeEnv('env-development', 'Development', 'DEVELOPMENT', 'https://dev.example.com', 'develop', false),
+    makeEnv('env-test', 'Test', 'TEST', 'https://test.example.com', 'test', false),
+    makeEnv('env-preprod', 'Pre-production', 'PRE_PRODUCTION', 'https://preprod.example.com', 'preprod', true),
+    makeEnv('env-production', 'Production', 'PRODUCTION', 'https://api.example.com', 'production', true),
+  ];
+}
+
+function defaultRunners() {
+  return [
+    { id: 'runner-public', name: 'Public Network Runner', networkZone: 'PUBLIC', enabled: true },
+    { id: 'runner-internal', name: 'Internal Network Runner', networkZone: 'INTERNAL', enabled: true },
+    { id: 'runner-restricted', name: 'Restricted Network Runner', networkZone: 'RESTRICTED', enabled: true },
+    { id: 'runner-test', name: 'Test Network Runner', networkZone: 'TEST', enabled: true },
+  ];
+}
+
+function defaultStore() {
+  return {
+    version: 1,
+    collections: [],
+    requests: [],
+    executions: [],
+    importedCurls: [],
+    manualExamples: [],
+    documentationResults: [],
+    shareRequests: [],
+    consumers: [],
+    references: [],
+    usageEvents: [],
+    readReceipts: [],
+    notifications: [],
+    directoryUsers: [],
+    directoryRoleAssignments: [],
+    environments: defaultEnvironments(),
+    runners: defaultRunners(),
+    globalVariables: defaultGlobalVariables(),
+    auditLog: [],
+  };
+}
+
+function semanticVersionOf(request) {
+  return String(request?.semanticVersion || request?.documentation?.version || '1.0.0');
+}
+
+function stableApiIdOf(request) {
+  return String(request?.apiId || request?.sourceApiId || request?.id || makeId('api'));
+}
+
+function ensureRequestApiFields(request) {
+  const apiId = stableApiIdOf(request);
+  const semanticVersion = semanticVersionOf(request);
+  const legacyDocumentation = {
+    ...(request.documentation || {}),
+    title: request.documentation?.title || request.name || 'Untitled API Request',
+    description: request.documentation?.description || request.description || '',
+    providerApplication: request.documentation?.providerApplication || request.applicationId,
+    version: semanticVersion,
+    changeHistory: request.documentation?.changeHistory?.length
+      ? request.documentation.changeHistory
+      : [{ version: semanticVersion, changedAt: request.createdAt || nowIso(), summary: 'Initial API Console request definition.' }],
+  };
+  const next = {
+    ...request,
+    apiId,
+    semanticVersion,
+    sharingStatus: SHARE_STATUSES.has(request.sharingStatus) ? request.sharingStatus : 'DRAFT',
+    sourceType: request.sourceType || 'ORIGINAL',
+    documentation: legacyDocumentation,
+  };
+  next.documentation = refreshDocumentationMetadata(next);
+  return next;
+}
+
+function normalizeStoreShape(raw) {
+  const base = defaultStore();
+  const next = {
+    ...base,
+    ...raw,
+    collections: Array.isArray(raw.collections) ? raw.collections : [],
+    requests: Array.isArray(raw.requests) ? raw.requests.map(ensureRequestApiFields) : [],
+    executions: Array.isArray(raw.executions) ? raw.executions : [],
+    importedCurls: Array.isArray(raw.importedCurls) ? raw.importedCurls : [],
+    manualExamples: Array.isArray(raw.manualExamples) ? raw.manualExamples : [],
+    documentationResults: Array.isArray(raw.documentationResults) ? raw.documentationResults : [],
+    shareRequests: Array.isArray(raw.shareRequests) ? raw.shareRequests : [],
+    consumers: Array.isArray(raw.consumers) ? raw.consumers : [],
+    references: Array.isArray(raw.references) ? raw.references : [],
+    usageEvents: Array.isArray(raw.usageEvents) ? raw.usageEvents : [],
+    readReceipts: Array.isArray(raw.readReceipts) ? raw.readReceipts : [],
+    notifications: Array.isArray(raw.notifications) ? raw.notifications : [],
+    directoryUsers: Array.isArray(raw.directoryUsers) ? raw.directoryUsers : [],
+    directoryRoleAssignments: Array.isArray(raw.directoryRoleAssignments) ? raw.directoryRoleAssignments : [],
+    environments: raw.environments?.length ? raw.environments : defaultEnvironments(),
+    runners: raw.runners?.length ? raw.runners : defaultRunners(),
+    globalVariables: raw.globalVariables?.length ? raw.globalVariables : defaultGlobalVariables(),
+    auditLog: Array.isArray(raw.auditLog) ? raw.auditLog : [],
+  };
+  const knownRequestIds = new Set(next.requests.map(request => request.id));
+  next.references = next.references.filter(reference => !reference.requestId || knownRequestIds.has(reference.requestId));
+  return next;
+}
+
+function loadStore() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(STORE_FILE)) {
+    const store = normalizeStoreShape(defaultStore());
+    saveStore(store);
+    return store;
+  }
+  const parsed = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
+  return normalizeStoreShape(parsed);
+}
+
+function saveStore(store) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = `${STORE_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8');
+  fs.renameSync(tmp, STORE_FILE);
+}
+
+let store = loadStore();
+
+function audit(eventType, actor, details = {}) {
+  store.auditLog.unshift({
+    id: makeId('audit'),
+    eventType,
+    actorUserId: actor?.userId || actor?.id || 'anonymous',
+    actorRole: actor?.role || 'UNKNOWN',
+    details: JSON.parse(JSON.stringify(details, (_, value) => typeof value === 'string' ? sanitizeText(value) : value)),
+    createdAt: nowIso(),
+  });
+  store.auditLog = store.auditLog.slice(0, 500);
+}
+
+function sanitizeObject(value) {
+  return JSON.parse(JSON.stringify(value, (_, item) => typeof item === 'string' ? sanitizeText(item) : item));
+}
+
+function trackDirectoryContext(context) {
+  if (!context?.userId) return false;
+  let changed = false;
+  const fullName = context.user?.fullName || context.userName || context.userId;
+  const userIndex = store.directoryUsers.findIndex(user => user.id === context.userId);
+  const user = {
+    id: context.userId,
+    fullName,
+    email: context.user?.email,
+    phoneNumber: context.user?.phoneNumber,
+    source: 'CDE',
+    isActive: context.user?.isActive !== false,
+  };
+  if (userIndex >= 0) {
+    const current = store.directoryUsers[userIndex];
+    const profileChanged = Object.entries(user).some(([key, value]) => current[key] !== value);
+    if (profileChanged) {
+      store.directoryUsers[userIndex] = { ...current, ...user, updatedAt: nowIso() };
+      changed = true;
+    }
+  } else {
+    store.directoryUsers.unshift({ ...user, createdAt: nowIso(), updatedAt: nowIso() });
+    changed = true;
+  }
+
+  if (context.role && context.applicationId) {
+    const appIds = context.scopeApplicationIds?.length ? context.scopeApplicationIds : [context.applicationId];
+    appIds.forEach(applicationId => {
+      const exists = store.directoryRoleAssignments.some(item =>
+        item.userId === context.userId &&
+        item.role === context.role &&
+        item.applicationId === applicationId
+      );
+      if (!exists) {
+        store.directoryRoleAssignments.unshift({
+          id: makeId('dir-role'),
+          userId: context.userId,
+          role: context.role,
+          applicationId,
+          isActive: true,
+          createdAt: nowIso(),
+        });
+        changed = true;
+      }
+    });
+  }
+  return changed;
+}
+
+function assertSystemAdministrator(context) {
+  if (context.role !== 'SYSTEM_ADMIN') {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Only System Administrators can manage users and approve shared API requests.', 403);
+  }
+}
+
+function activeRolesForDirectoryUser(userId) {
+  return Array.from(new Set(store.directoryRoleAssignments
+    .filter(assignment =>
+      assignment.userId === userId &&
+      assignment.isActive !== false &&
+      (assignment.role !== 'SYSTEM_ADMIN' || assignment.source === 'ADMIN_APPROVAL')
+    )
+    .map(assignment => assignment.role)
+    .filter(role => USER_ROLES.includes(role))));
+}
+
+function directoryUserView(user) {
+  const roles = activeRolesForDirectoryUser(user.id);
+  const bootstrapAdmin = isBootstrapSystemAdmin(user.phoneNumber);
+  if (bootstrapAdmin && !roles.includes('SYSTEM_ADMIN')) roles.unshift('SYSTEM_ADMIN');
+  return {
+    ...user,
+    source: user.source || 'CDE',
+    roles,
+    isSystemAdmin: bootstrapAdmin || roles.includes('SYSTEM_ADMIN'),
+    isBootstrapAdmin: bootstrapAdmin,
+  };
+}
+
+function systemAdministratorCount() {
+  const users = store.directoryUsers.filter(user => user.isActive !== false);
+  return users.filter(user => directoryUserView(user).isSystemAdmin).length;
+}
+
+function setManagedSystemAdministrator(userId, enabled, context) {
+  assertSystemAdministrator(context);
+  const user = store.directoryUsers.find(item => item.id === userId && item.isActive !== false);
+  if (!user) throw new ApiConsoleError('INVALID_URL', 'CDE directory user not found.', 404);
+  if (!enabled && isBootstrapSystemAdmin(user.phoneNumber)) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Bootstrap System Administrator access is controlled by API_CONSOLE_ADMIN_LOGINS.', 409);
+  }
+  if (!enabled && directoryUserView(user).isSystemAdmin && systemAdministratorCount() <= 1) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'At least one active System Administrator must remain.', 409);
+  }
+
+  const assignments = store.directoryRoleAssignments.filter(assignment =>
+    assignment.userId === user.id && assignment.role === 'SYSTEM_ADMIN'
+  );
+  const changedAt = nowIso();
+  if (enabled) {
+    const approvedActive = assignments.find(assignment =>
+      assignment.isActive !== false && assignment.source === 'ADMIN_APPROVAL'
+    );
+    if (!approvedActive) {
+      const reusable = assignments[0];
+      if (reusable) {
+        reusable.isActive = true;
+        reusable.applicationId = 'ALL';
+        reusable.scope = 'APP';
+        reusable.source = 'ADMIN_APPROVAL';
+        reusable.updatedAt = changedAt;
+        reusable.updatedBy = context.userId;
+      } else {
+        store.directoryRoleAssignments.unshift({
+          id: makeId('dir-role'),
+          userId: user.id,
+          role: 'SYSTEM_ADMIN',
+          applicationId: 'ALL',
+          scope: 'APP',
+          isActive: true,
+          source: 'ADMIN_APPROVAL',
+          createdAt: changedAt,
+          createdBy: context.userId,
+        });
+      }
+    }
+  } else {
+    assignments.forEach(assignment => {
+      assignment.isActive = false;
+      assignment.updatedAt = changedAt;
+      assignment.updatedBy = context.userId;
+    });
+  }
+  audit(enabled ? 'SYSTEM_ADMIN_GRANTED' : 'SYSTEM_ADMIN_REVOKED', context, {
+    targetUserId: user.id,
+    targetUserName: user.fullName,
+  });
+  saveStore(store);
+  return directoryUserView(user);
+}
+
+function notifyUser(userId, title, message, entityType, entityId, correlationId) {
+  if (!userId) return;
+  store.notifications.unshift({
+    id: makeId('notif'),
+    userId,
+    title,
+    message: sanitizeText(message),
+    type: 'INFO',
+    entityType,
+    entityId,
+    channels: ['IN_APP'],
+    deliveryStatus: 'QUEUED',
+    correlationId,
+    isRead: false,
+    createdAt: nowIso(),
+  });
+  store.notifications = store.notifications.slice(0, 1000);
+}
+
+function parseSemVer(value) {
+  const text = String(value || '').trim();
+  if (!SEMVER_REGEX.test(text)) return null;
+  const [main, prerelease = ''] = text.split('+')[0].split('-');
+  const [major, minor, patch] = main.split('.').map(Number);
+  return { major, minor, patch, prerelease };
+}
+
+function compareSemVer(a, b) {
+  const left = parseSemVer(a);
+  const right = parseSemVer(b);
+  if (!left || !right) return String(a || '').localeCompare(String(b || ''));
+  for (const key of ['major', 'minor', 'patch']) {
+    if (left[key] !== right[key]) return left[key] - right[key];
+  }
+  if (left.prerelease && !right.prerelease) return -1;
+  if (!left.prerelease && right.prerelease) return 1;
+  return left.prerelease.localeCompare(right.prerelease);
+}
+
+function requireSemVerGreater(nextVersion, currentVersion) {
+  if (!SEMVER_REGEX.test(String(nextVersion || '').trim())) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'فرمت نسخه معتبر نیست. نسخه باید مطابق Semantic Versioning باشد.');
+  }
+  if (compareSemVer(nextVersion, currentVersion) <= 0) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'نسخه جدید باید از نسخه فعلی بزرگ‌تر باشد.');
+  }
+}
+
+function consumersForVersion(apiId, version) {
+  return store.consumers.filter(consumer =>
+    consumer.apiId === apiId &&
+    consumer.version === version &&
+    consumer.status !== 'REVOKED'
+  );
+}
+
+function normalizeConsumers(consumers, request, context) {
+  return (consumers || [])
+    .map(item => ({
+      id: item.id || makeId('api-consumer'),
+      apiId: request.apiId,
+      version: semanticVersionOf(request),
+      consumerType: item.consumerType,
+      userId: item.consumerType === 'USER' ? item.userId : undefined,
+      roleKey: item.consumerType === 'ROLE' ? item.roleKey : undefined,
+      applicationId: item.applicationId || request.applicationId,
+      status: 'ACTIVE',
+      createdBy: item.createdBy || context.userId,
+      createdAt: item.createdAt || nowIso(),
+      updatedBy: context.userId,
+      updatedAt: nowIso(),
+    }))
+    .filter(item =>
+      (item.consumerType === 'USER' && item.userId) ||
+      (item.consumerType === 'ROLE' && item.roleKey)
+    );
+}
+
+function consumerMatchesContext(consumer, context) {
+  const scope = context.scopeApplicationIds?.length ? context.scopeApplicationIds : [context.applicationId];
+  const inScope = !consumer.applicationId || consumer.applicationId === 'ALL' || scope.includes(consumer.applicationId);
+  if (!inScope) return false;
+  if (consumer.consumerType === 'USER') return consumer.userId === context.userId;
+  if (consumer.consumerType === 'ROLE') return consumer.roleKey === context.role;
+  return false;
+}
+
+function canAccessRepositoryRequest(request, context) {
+  if (!context) return false;
+  if (context.role === 'SYSTEM_ADMIN') return true;
+  if (request.createdBy === context.userId) return true;
+  if (context.role === 'QA_LEAD' && matchesApplicationScope(request.applicationId, context.scopeApplicationIds || context.applicationId)) return true;
+  return consumersForVersion(request.apiId, semanticVersionOf(request)).some(consumer => consumerMatchesContext(consumer, context));
+}
+
+function latestApprovedVersion(apiId) {
+  return store.requests
+    .filter(request => request.apiId === apiId && request.sharingStatus === 'APPROVED' && request.sourceType !== 'REFERENCE')
+    .sort((a, b) => compareSemVer(semanticVersionOf(b), semanticVersionOf(a)))[0] || null;
+}
+
+function readReceiptFor(context, apiId, version) {
+  return store.readReceipts.find(item => item.userId === context.userId && item.apiId === apiId && item.version === version);
+}
+
+function repositoryItemFromRequest(request, context) {
+  const version = semanticVersionOf(request);
+  const latest = latestApprovedVersion(request.apiId);
+  const receipt = readReceiptFor(context, request.apiId, version);
+  const activeReference = store.references.find(reference =>
+    reference.createdBy === context.userId &&
+    reference.apiId === request.apiId &&
+    reference.version === version &&
+    reference.status === 'ACTIVE'
+  );
+  return {
+    id: `${request.apiId}:${version}`,
+    apiId: request.apiId,
+    requestId: request.id,
+    title: request.name,
+    description: request.description || request.documentation?.description || '',
+    applicationId: request.applicationId,
+    version,
+    method: request.method,
+    urlTemplate: request.urlTemplate,
+    classification: request.classification,
+    sharingStatus: request.sharingStatus,
+    ownerId: request.createdBy,
+    approvedAt: request.approvedAt,
+    consumers: consumersForVersion(request.apiId, version),
+    referenceId: activeReference?.id,
+    referenceRequestId: activeReference?.requestId,
+    hasNewerVersion: !!latest && compareSemVer(semanticVersionOf(latest), version) > 0,
+    latestVersion: latest ? semanticVersionOf(latest) : version,
+    isNewForUser: !!receipt && !receipt.viewedAt,
+    changeLog: request.documentation?.changeHistory?.slice(-1)[0]?.summary || '',
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt,
+  };
+}
+
+function logUsageEvent(eventType, context, request, extra = {}) {
+  if (!USAGE_EVENT_TYPES.has(eventType) || !request) return;
+  const event = {
+    id: makeId('api-usage'),
+    eventType,
+    userId: context.userId,
+    userDisplayName: context.user?.fullName || context.userName || context.userId,
+    activeRole: context.role,
+    applicationId: request.applicationId,
+    apiId: request.apiId,
+    apiTitle: request.name,
+    version: semanticVersionOf(request),
+    referenceId: request.referenceId || extra.referenceId,
+    eventAt: nowIso(),
+    environmentId: extra.environmentId,
+    correlationId: extra.correlationId,
+  };
+  store.usageEvents.unshift(event);
+  store.usageEvents = store.usageEvents.slice(0, 5000);
+}
+
+function buildShareSnapshot(request, context) {
+  const environment = findEnvironment(request.environmentId);
+  const resolved = resolveRequest(request, environment, request.executionMode).snapshot;
+  const documentation = generateDocumentationMarkdown(request, store.executions, store.manualExamples, context.user?.fullName || context.userId);
+  return sanitizeObject({
+    requestId: request.id,
+    apiId: request.apiId,
+    version: semanticVersionOf(request),
+    title: request.name,
+    description: request.description || '',
+    applicationId: request.applicationId,
+    method: request.method,
+    url: request.urlTemplate,
+    queryParameters: request.queryParameters,
+    headers: request.headers,
+    cookies: request.cookies,
+    requestBody: requestBodyFromDefinition(request),
+    authentication: request.authentication,
+    tls: request.tls,
+    environmentId: request.environmentId,
+    classification: request.classification,
+    effectiveRequest: resolved,
+    assertions: request.assertions,
+    scripts: request.scripts,
+    documentation: request.documentation,
+    documentationPreview: documentation.markdown,
+    generatedCurl: exportRequestAsCurl(request, 'bash'),
+    executionEvidence: store.executions.filter(execution => execution.requestId === request.id).slice(0, 5),
+    manualResponses: store.manualExamples.filter(example => example.requestId === request.id),
+    capturedAt: nowIso(),
+  });
+}
+
+function findEnvironment(id) {
+  return store.environments.find(item => item.id === id) || store.environments[0];
+}
+
+function selectRunner(environment, resolvedAddress) {
+  if (resolvedAddress && isPrivateNetworkAddress(resolvedAddress)) {
+    return store.runners.find(runner => runner.networkZone === 'INTERNAL') || store.runners[0];
+  }
+  if (environment.kind === 'PRODUCTION') return store.runners.find(runner => runner.networkZone === 'RESTRICTED') || store.runners[0];
+  if (environment.kind === 'TEST') return store.runners.find(runner => runner.networkZone === 'TEST') || store.runners[0];
+  return store.runners.find(runner => runner.networkZone === 'PUBLIC') || store.runners[0];
+}
+
+function parseApplicationScope(value) {
+  if (!value || value === 'ALL') return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed === 'ALL') return undefined;
+  } catch {}
+  if (String(value).includes(',')) return String(value).split(',').map(item => item.trim()).filter(Boolean);
+  return [String(value)];
+}
+
+function matchesApplicationScope(applicationId, scopeValue) {
+  const ids = parseApplicationScope(scopeValue);
+  if (!ids || !ids.length) return true;
+  return ids.includes(applicationId);
+}
+
+function contextApplicationIds(context) {
+  const ids = Array.isArray(context?.scopeApplicationIds)
+    ? context.scopeApplicationIds
+    : parseApplicationScope(context?.scopeApplicationIds);
+  if (ids?.length) return [...new Set(ids.map(String).filter(id => id && id !== 'ALL'))];
+  if (context?.applicationId && context.applicationId !== 'ALL') return [String(context.applicationId)];
+  return [];
+}
+
+function assertApplicationInContext(applicationId, context) {
+  const normalized = String(applicationId || '').trim();
+  if (!normalized || normalized === 'ALL' || normalized.includes(',')) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'انتخاب یک سامانه معتبر الزامی است.', 422);
+  }
+  if (!contextApplicationIds(context).includes(normalized)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'سامانه خارج از محدوده دسترسی فعال است.', 403);
+  }
+  return normalized;
+}
+
+function belongsToUser(entity, context) {
+  if (!context?.userId) return true;
+  return entity.ownerId === context.userId || entity.createdBy === context.userId;
+}
+
+function paginate(data, page = 1, limit = 30) {
+  const currentPage = Math.max(1, Number(page) || 1);
+  const pageSize = Math.max(1, Number(limit) || 30);
+  const start = (currentPage - 1) * pageSize;
+  return {
+    data: data.slice(start, start + pageSize),
+    total: data.length,
+    page: currentPage,
+    limit: pageSize,
+    totalPages: Math.max(1, Math.ceil(data.length / pageSize)),
+  };
+}
+
+function resolveSecretReference(ref, errors) {
+  if (runtimeSecrets.has(ref)) return runtimeSecrets.get(ref);
+  const vault = loadSecretVault();
+  if (vault.secrets[ref]) {
+    try {
+      const value = decryptSecretValue(vault.secrets[ref]);
+      runtimeSecrets.set(ref, value);
+      return value;
+    } catch (error) {
+      errors.push({ category: 'SECRET_RESOLUTION_ERROR', message: `Secret reference "${ref}" could not be decrypted by the API Console backend.` });
+      return ref;
+    }
+  }
+  errors.push({ category: 'SECRET_RESOLUTION_ERROR', message: `Secret reference "${ref}" could not be resolved by the API Console backend.` });
+  return ref;
+}
+
+function resolveTemplate(value, request, environment, executionVariables = {}) {
+  const collection = store.collections.find(item => item.id === request.collectionId);
+  const buckets = [
+    {
+      scope: 'EXECUTION',
+      vars: Object.fromEntries(Object.entries(executionVariables || {}).map(([key, val]) => [key, { value: String(val), sensitive: isSensitiveName(key) }])),
+    },
+    { scope: 'REQUEST', vars: {} },
+    { scope: 'COLLECTION', vars: Object.fromEntries((collection?.variables || []).map(variable => [variable.key, { value: variable.currentValue, sensitive: variable.sensitive }])) },
+    { scope: 'ENVIRONMENT', vars: Object.fromEntries((environment.variables || []).map(variable => [variable.key, { value: variable.currentValue, sensitive: variable.sensitive }])) },
+    { scope: 'GLOBAL', vars: Object.fromEntries((store.globalVariables || []).map(variable => [variable.key, { value: variable.currentValue, sensitive: variable.sensitive }])) },
+  ];
+  const resolutions = [];
+  const errors = [];
+  let transportValue = String(value || '');
+  let snapshotValue = String(value || '');
+
+  transportValue = transportValue.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (match, key) => {
+    for (const bucket of buckets) {
+      const found = bucket.vars[key];
+      if (found) {
+        resolutions.push({ key, source: bucket.scope, sensitive: found.sensitive });
+        if (found.sensitive) {
+          if (isSecretReference(found.value)) return resolveSecretReference(found.value, errors);
+          errors.push({ category: 'SECRET_RESOLUTION_ERROR', message: `Sensitive variable "${key}" must resolve through secret storage.` });
+          return found.value;
+        }
+        return found.value;
+      }
+    }
+    errors.push({ category: 'VARIABLE_RESOLUTION_ERROR', message: `Variable "${key}" could not be resolved.` });
+    return match;
+  });
+
+  snapshotValue = snapshotValue.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (match, key) => {
+    for (const bucket of buckets) {
+      const found = bucket.vars[key];
+      if (found) return found.sensitive ? `{{${key}}}` : found.value;
+    }
+    return match;
+  });
+
+  transportValue = transportValue.replace(/secret:\/\/api-console\/[0-9a-f-]+/gi, ref => resolveSecretReference(ref, errors));
+  snapshotValue = snapshotValue.replace(/secret:\/\/api-console\/[0-9a-f-]+/gi, '{{secret}}');
+  if (/secret\/[^\s'"\\]+/i.test(transportValue)) {
+    errors.push({ category: 'SECRET_RESOLUTION_ERROR', message: 'External secret reference requires the project secret-management integration.' });
+  }
+
+  return { transportValue, snapshotValue, resolutions, errors };
+}
+
+function mergeResolution(target, result) {
+  target.variableResolution.push(...result.resolutions);
+  target.errors.push(...result.errors);
+}
+
+function resolveRequest(request, environment, executionMode = request.executionMode, executionVariables = {}) {
+  const context = { variableResolution: [], errors: [] };
+  const resolve = value => {
+    const result = resolveTemplate(value, request, environment, executionVariables);
+    mergeResolution(context, result);
+    return result;
+  };
+
+  const urlResolved = resolve(request.urlTemplate);
+  const resolvedParams = (request.queryParameters || []).map(param => {
+    const result = resolve(param.value);
+    return {
+      transport: { ...param, value: result.transportValue },
+      snapshot: { ...param, value: param.sensitive ? '{{secret}}' : result.snapshotValue },
+    };
+  });
+  const transportUrl = buildUrlWithQuery(urlResolved.transportValue, resolvedParams.map(item => item.transport));
+  const snapshotUrl = buildUrlWithQuery(urlResolved.snapshotValue, resolvedParams.map(item => item.snapshot));
+
+  const envHeaders = (environment.defaultHeaders || []).map((header, index) => ({
+    ...header,
+    id: makeId('env-hdr'),
+    source: 'ENVIRONMENT',
+    displayOrder: (request.headers || []).length + index,
+  }));
+  const mergedHeaders = [...envHeaders, ...(request.headers || [])];
+  const omittedHeaders = [];
+  const transportHeaders = [];
+  const snapshotHeaders = [];
+
+  mergedHeaders.forEach((header) => {
+    const normalized = String(header.name || '').toLowerCase();
+    if (!header.enabled) {
+      omittedHeaders.push({ name: header.name, reason: 'Header is disabled in the request editor.' });
+      return;
+    }
+    if (normalized === 'content-length') {
+      omittedHeaders.push({ name: header.name, reason: 'Content-Length is recalculated by the runner.' });
+      return;
+    }
+    if (normalized === 'connection') {
+      omittedHeaders.push({ name: header.name, reason: 'Connection is controlled by the HTTP transport.' });
+      return;
+    }
+    if (header.category === 'BROWSER_GENERATED' && executionMode === 'RECOMMENDED') {
+      omittedHeaders.push({ name: header.name, reason: 'Browser-generated header disabled in recommended replay.' });
+      return;
+    }
+    const resolved = resolve(header.valueTemplate);
+    const sensitive = header.sensitive || isSensitiveName(header.name);
+    transportHeaders.push({
+      ...header,
+      valueTemplate: resolved.transportValue,
+      maskedValue: sensitive ? maskValue(resolved.snapshotValue) : resolved.snapshotValue,
+    });
+    snapshotHeaders.push({
+      ...header,
+      valueTemplate: sensitive ? maskValue(resolved.snapshotValue) : resolved.snapshotValue,
+      maskedValue: sensitive ? maskValue(resolved.snapshotValue) : resolved.snapshotValue,
+      sensitive,
+    });
+  });
+
+  const body = requestBodyFromDefinition(request);
+  const resolvedBody = resolve(body.raw || '');
+  const transportBody = { ...body, raw: resolvedBody.transportValue };
+  const snapshotBody = { ...body, raw: sanitizeText(resolvedBody.snapshotValue) };
+  if (body.type === 'json') {
+    const transportParsed = parseJsonSafely(transportBody.raw);
+    const snapshotParsed = parseJsonSafely(snapshotBody.raw);
+    transportBody.value = transportParsed.ok ? transportParsed.value : null;
+    snapshotBody.value = snapshotParsed.ok ? snapshotParsed.value : null;
+  }
+
+  if (hasBody(transportBody) && !transportHeaders.some(header => header.name.toLowerCase() === 'content-type')) {
+    const contentType = body.contentType || (body.type === 'json' ? 'application/json' : body.type === 'xml' ? 'application/xml' : body.type === 'form-urlencoded' ? 'application/x-www-form-urlencoded' : 'text/plain');
+    const header = createHeader('content-type', contentType, transportHeaders.length, 'SYSTEM', executionMode);
+    header.enabled = true;
+    transportHeaders.push(header);
+    snapshotHeaders.push(header);
+  }
+  if (hasBody(transportBody)) {
+    omittedHeaders.push({ name: 'content-length', reason: 'Runner recalculates Content-Length immediately before sending.' });
+  }
+
+  const transportCookies = [];
+  const snapshotCookies = [];
+  (request.cookies || []).filter(cookie => cookie.enabled).forEach(cookie => {
+    const resolved = resolve(cookie.valueReference);
+    transportCookies.push({
+      ...cookie,
+      valueReference: resolved.transportValue,
+      maskedValue: cookie.sensitive ? maskValue(resolved.snapshotValue) : resolved.snapshotValue,
+    });
+    snapshotCookies.push({
+      ...cookie,
+      valueReference: cookie.sensitive ? maskValue(resolved.snapshotValue) : resolved.snapshotValue,
+      maskedValue: cookie.sensitive ? maskValue(resolved.snapshotValue) : resolved.snapshotValue,
+    });
+  });
+
+  return {
+    snapshot: {
+      method: request.method,
+      url: snapshotUrl,
+      headers: snapshotHeaders.map((header, index) => ({ ...header, displayOrder: index })),
+      cookies: snapshotCookies,
+      body: snapshotBody,
+      tls: request.tls,
+      omittedHeaders,
+      variableResolution: context.variableResolution,
+    },
+    transport: {
+      method: request.method,
+      url: transportUrl,
+      headers: transportHeaders.map((header, index) => ({ ...header, displayOrder: index })),
+      cookies: transportCookies,
+      body: transportBody,
+      tls: request.tls,
+    },
+    errors: context.errors,
+  };
+}
+
+function ipv4ToNumber(ip) {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(part => Number.isNaN(part) || part < 0 || part > 255)) return null;
+  return (((parts[0] * 256 + parts[1]) * 256 + parts[2]) * 256 + parts[3]) >>> 0;
+}
+
+function isAllowlistEligiblePrivateIPv4(host) {
+  const value = ipv4ToNumber(host);
+  if (value === null) return false;
+  const a = Number(host.split('.')[0]);
+  const b = Number(host.split('.')[1]);
+  return a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168);
+}
+
+function isHardBlockedIPv4(host) {
+  const value = ipv4ToNumber(host);
+  if (value === null) return false;
+  const a = Number(host.split('.')[0]);
+  const b = Number(host.split('.')[1]);
+  return a === 127 ||
+    a === 0 ||
+    a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254);
+}
+
+function normalizedIPv6(host) {
+  return String(host || '').replace(/^\[|\]$/g, '').toLowerCase();
+}
+
+function isAllowlistEligiblePrivateIPv6(host) {
+  const lower = normalizedIPv6(host);
+  return lower.startsWith('fc') || lower.startsWith('fd');
+}
+
+function isHardBlockedIPv6(host) {
+  const lower = normalizedIPv6(host);
+  return lower === '::1' ||
+    lower === '::' ||
+    lower.startsWith('fe80:') ||
+    lower.startsWith('ff') ||
+    lower.startsWith('::ffff:') ||
+    lower.startsWith('0:0:0:0:0:ffff:');
+}
+
+function configuredPrivateDestinationOrigins() {
+  const origins = new Set();
+  for (const value of String(process.env.API_CONSOLE_PRIVATE_DESTINATION_ALLOWLIST || '').split(',')) {
+    const candidate = value.trim();
+    if (!candidate) continue;
+    try {
+      const parsed = new URL(candidate);
+      const isOriginOnly = (parsed.pathname === '/' || parsed.pathname === '') && !parsed.search && !parsed.hash;
+      if (['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password && isOriginOnly) {
+        origins.add(parsed.origin.toLowerCase());
+      }
+    } catch {
+      // Invalid entries never grant network access.
+    }
+  }
+  return origins;
+}
+
+function allowAllPrivateDestinationsInDevelopment() {
+  return process.env.NODE_ENV !== 'production' && process.env.API_CONSOLE_ALLOW_PRIVATE_DESTINATIONS === 'true';
+}
+
+function isPrivateNetworkAddress(host) {
+  return isAllowlistEligiblePrivateIPv4(host) || isAllowlistEligiblePrivateIPv6(host);
+}
+
+function assertDestinationAddressAllowed(address, privateDestinationAllowed, resolvedByDns = false) {
+  const normalized = normalizedIPv6(address);
+  if (METADATA_IPS.has(normalized) || isHardBlockedIPv4(normalized) || isHardBlockedIPv6(normalized)) {
+    throw new ApiConsoleError(
+      'DESTINATION_NOT_ALLOWED',
+      `${resolvedByDns ? 'DNS resolved to' : 'The destination is'} a blocked loopback, link-local, carrier-grade, multicast, or metadata address.`,
+    );
+  }
+  if (isPrivateNetworkAddress(normalized) && !privateDestinationAllowed) {
+    throw new ApiConsoleError(
+      'DESTINATION_NOT_ALLOWED',
+      `${resolvedByDns ? 'DNS resolved to a private network address' : 'Private network destinations'} require an exact approved origin in API_CONSOLE_PRIVATE_DESTINATION_ALLOWLIST.`,
+    );
+  }
+}
+
+async function validateDestination(urlText) {
+  let parsed;
+  try {
+    parsed = new URL(urlText);
+  } catch {
+    throw new ApiConsoleError('INVALID_URL', 'The effective request URL is invalid.');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', 'Only HTTP and HTTPS destinations are allowed.');
+  }
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  const privateDestinationAllowed = allowAllPrivateDestinationsInDevelopment() ||
+    configuredPrivateDestinationOrigins().has(parsed.origin.toLowerCase());
+  if (PROTECTED_HOSTS.has(host) || host.endsWith('.local') || host.endsWith('.localhost')) {
+    throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', 'Localhost and local-network hostnames are blocked by policy.');
+  }
+  if (METADATA_HOSTS.has(host)) {
+    throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', 'Cloud metadata destinations are blocked by policy.');
+  }
+  assertDestinationAddressAllowed(host, privateDestinationAllowed);
+
+  const records = /^[0-9.]+$/.test(host) || host.includes(':')
+    ? [{ address: host.includes(':') ? normalizedIPv6(host) : host, family: host.includes(':') ? 6 : 4 }]
+    : await dns.lookup(host, { all: true, verbatim: false });
+
+  if (!records.length) {
+    throw new ApiConsoleError('DNS_ERROR', 'DNS lookup returned no records.');
+  }
+
+  for (const record of records) {
+    assertDestinationAddressAllowed(record.address, privateDestinationAllowed, true);
+  }
+
+  return { parsed, address: records[0].address, family: records[0].family };
+}
+
+function responsePreviewMode(contentType) {
+  const normalized = String(contentType || '').toLowerCase();
+  if (normalized.includes('json')) return 'JSON';
+  if (normalized.includes('html')) return 'SANDBOXED_HTML';
+  if (normalized.includes('text') || normalized.includes('xml')) return 'TEXT';
+  return 'DOWNLOAD_ONLY';
+}
+
+function normalizeResponseHeaders(headers) {
+  const result = [];
+  let index = 0;
+  for (const [name, raw] of Object.entries(headers || {})) {
+    if (name.toLowerCase() === 'set-cookie') continue;
+    const value = Array.isArray(raw) ? raw.join(', ') : String(raw ?? '');
+    result.push(createHeader(name, value, index, 'SYSTEM'));
+    index += 1;
+  }
+  return result;
+}
+
+function decompressBody(buffer, headers) {
+  const encoding = String(headers['content-encoding'] || '').toLowerCase();
+  if (encoding.includes('gzip')) return zlib.gunzipSync(buffer);
+  if (encoding.includes('br')) return zlib.brotliDecompressSync(buffer);
+  if (encoding.includes('deflate')) return zlib.inflateSync(buffer);
+  return buffer;
+}
+
+function isTlsTransportError(error) {
+  const tlsCodes = new Set([
+    'CERT_CHAIN_TOO_LONG',
+    'CERT_COMMON_NAME_INVALID',
+    'CERT_DATE_INVALID',
+    'CERT_HAS_EXPIRED',
+    'CERT_NOT_YET_VALID',
+    'CERT_REVOKED',
+    'CERT_UNTRUSTED',
+    'DEPTH_ZERO_SELF_SIGNED_CERT',
+    'ERR_TLS_CERT_ALTNAME_INVALID',
+    'HOSTNAME_MISMATCH',
+    'SELF_SIGNED_CERT_IN_CHAIN',
+    'UNABLE_TO_GET_ISSUER_CERT',
+    'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+    'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  ]);
+  return tlsCodes.has(error?.code) || /certificate|cert|tls|hostname\/ip does not match/i.test(error?.message || '');
+}
+
+function tlsErrorMessage(error) {
+  const message = sanitizeText(error?.message || 'TLS certificate validation failed.');
+  if (error?.code === 'ERR_TLS_CERT_ALTNAME_INVALID' || /hostname\/ip does not match/i.test(message)) {
+    return `${message} The target certificate does not match the requested hostname. Use --insecure or disable Verify TLS certificate only when policy allows it.`;
+  }
+  return message;
+}
+
+async function performHttpRequest(transport, validation, redirectHistory, signalState) {
+  const url = validation.parsed;
+  const isHttps = url.protocol === 'https:';
+  const client = isHttps ? https : http;
+  const headers = {};
+  transport.headers.forEach(header => {
+    if (!header.enabled) return;
+    headers[header.name] = header.valueTemplate;
+  });
+  if (transport.cookies.length) {
+    const cookieValue = transport.cookies.map(cookie => `${cookie.name}=${cookie.valueReference}`).join('; ');
+    headers.Cookie = headers.Cookie ? `${headers.Cookie}; ${cookieValue}` : cookieValue;
+  }
+  const bodyBuffer = hasBody(transport.body) ? Buffer.from(transport.body.raw || '', 'utf8') : null;
+  if (bodyBuffer) headers['Content-Length'] = String(bodyBuffer.length);
+
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const req = client.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: `${url.pathname}${url.search}`,
+      method: transport.method,
+      headers,
+      rejectUnauthorized: transport.tls.verifyCertificate,
+      servername: url.hostname,
+      lookup: (_hostname, options, callback) => {
+        const cb = typeof options === 'function' ? options : callback;
+        const lookupOptions = typeof options === 'function' ? {} : (options || {});
+        if (lookupOptions.all) {
+          cb(null, [{ address: validation.address, family: validation.family }]);
+          return;
+        }
+        cb(null, validation.address, validation.family);
+      },
+    }, res => {
+      const chunks = [];
+      let total = 0;
+      res.on('data', chunk => {
+        total += chunk.length;
+        if (total > LIMITS.responseBytes) {
+          req.destroy(new ApiConsoleError('RESPONSE_TOO_LARGE', `Response exceeded ${LIMITS.responseBytes} bytes.`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        try {
+          const rawBuffer = Buffer.concat(chunks);
+          const decoded = decompressBody(rawBuffer, res.headers);
+          if (decoded.length > LIMITS.responseBytes) {
+            reject(new ApiConsoleError('RESPONSE_TOO_LARGE', `Decoded response exceeded ${LIMITS.responseBytes} bytes.`));
+            return;
+          }
+          const contentType = String(res.headers['content-type'] || '');
+          const bodyPreview = decoded.toString('utf8');
+          resolve({
+            statusCode: res.statusCode,
+            statusText: res.statusMessage,
+            headers: normalizeResponseHeaders(res.headers),
+            cookies: parseSetCookie(res.headers['set-cookie']),
+            bodyPreview: sanitizeText(bodyPreview),
+            bodyReference: decoded.length > 64 * 1024 ? `/object-storage/api-console/${makeId('body')}` : undefined,
+            contentType,
+            responseSize: decoded.length,
+            durationMs: Date.now() - start,
+            resolvedIpAddress: validation.address,
+            redirectHistory,
+            tlsVerified: transport.tls.verifyCertificate,
+            safePreviewMode: responsePreviewMode(contentType),
+            rawLocation: res.headers.location,
+          });
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    req.on('socket', socket => {
+      socket.setTimeout(LIMITS.readTimeoutMs, () => {
+        req.destroy(new ApiConsoleError('READ_TIMEOUT', 'The target API did not finish reading within the configured timeout.'));
+      });
+    });
+    req.setTimeout(LIMITS.connectTimeoutMs, () => {
+      req.destroy(new ApiConsoleError('CONNECTION_TIMEOUT', 'The target API connection timed out.'));
+    });
+    req.on('error', error => {
+      if (signalState.timedOut) {
+        reject(new ApiConsoleError('READ_TIMEOUT', 'The API Console total execution timeout was reached.'));
+      } else if (error instanceof ApiConsoleError) {
+        reject(error);
+      } else if (isTlsTransportError(error)) {
+        reject(new ApiConsoleError('TLS_ERROR', tlsErrorMessage(error)));
+      } else {
+        reject(new ApiConsoleError('HTTP_ERROR', sanitizeText(error.message || 'HTTP request failed.')));
+      }
+    });
+    if (bodyBuffer) req.write(bodyBuffer);
+    req.end();
+  });
+}
+
+async function executeWithRedirects(transport) {
+  const started = Date.now();
+  const redirectHistory = [];
+  let current = safeClone(transport);
+  let validation = await validateDestination(current.url);
+  const signalState = { timedOut: false };
+  const totalTimer = setTimeout(() => {
+    signalState.timedOut = true;
+  }, LIMITS.totalTimeoutMs);
+
+  try {
+    for (let i = 0; i <= LIMITS.maxRedirects; i += 1) {
+      if (Date.now() - started > LIMITS.totalTimeoutMs || signalState.timedOut) {
+        throw new ApiConsoleError('READ_TIMEOUT', 'The API Console total execution timeout was reached.');
+      }
+      const response = await performHttpRequest(current, validation, redirectHistory, signalState);
+      const isRedirect = response.statusCode >= 300 && response.statusCode < 400 && response.rawLocation;
+      if (!isRedirect) {
+        delete response.rawLocation;
+        response.durationMs = Date.now() - started;
+        return response;
+      }
+      if (redirectHistory.length >= LIMITS.maxRedirects) {
+        throw new ApiConsoleError('REDIRECT_BLOCKED', 'Maximum redirect count was exceeded.');
+      }
+      const from = current.url;
+      const to = new URL(response.rawLocation, current.url).toString();
+      const nextValidation = await validateDestination(to);
+      redirectHistory.push({ from, to, statusCode: response.statusCode, allowed: true });
+      current.url = to;
+      if (response.statusCode === 303) {
+        current.method = 'GET';
+        current.body = { type: 'none', value: null, raw: '' };
+      }
+      validation = nextValidation;
+    }
+    throw new ApiConsoleError('REDIRECT_BLOCKED', 'Maximum redirect count was exceeded.');
+  } finally {
+    clearTimeout(totalTimer);
+  }
+}
+
+function validateCoreRequest(requestOrNormalized) {
+  const normalized = requestOrNormalized.urlTemplate ? normalizedFromDefinition(requestOrNormalized) : requestOrNormalized;
+  const errors = [];
+  const warnings = [];
+  const classification = detectCoreClassification(normalized.url, normalized.body);
+
+  if (classification.type === 'GENERIC_HTTP') {
+    return { valid: true, errors, warnings: ['Request is generic HTTP. Core-specific validation is not applied.'] };
+  }
+
+  if (normalized.method !== 'POST') errors.push('Core requests must remain HTTP POST.');
+  const body = normalized.body.value;
+  if (!body || typeof body !== 'object') errors.push('Core request body must be a JSON object.');
+  if (!body?.serviceId || typeof body.serviceId !== 'string') errors.push('serviceId must be a non-empty string.');
+
+  if (classification.type === 'CORE_COMMAND') {
+    if (!body?.formId || typeof body.formId !== 'string') errors.push('formId must be a non-empty string.');
+    if (!Object.prototype.hasOwnProperty.call(body || {}, 'data') || typeof body?.data !== 'object' || body?.data === null || Array.isArray(body?.data)) {
+      errors.push('data must exist and be an object.');
+    }
+  }
+
+  if (classification.type === 'CORE_QUERY') {
+    if (!body?.key || typeof body.key !== 'string') errors.push('key must be a non-empty string.');
+    if (!Object.prototype.hasOwnProperty.call(body || {}, 'params') || typeof body?.params !== 'object' || body?.params === null || Array.isArray(body?.params)) {
+      errors.push('params must exist and be an object.');
+    }
+  }
+
+  if (!normalized.tls.verifyCertificate) warnings.push('TLS certificate verification is disabled.');
+  return { valid: errors.length === 0, errors, warnings };
+}
+
+function evaluateAssertions(request, response) {
+  return (request.assertions || []).filter(assertion => assertion.enabled).map(assertion => {
+    switch (assertion.assertionType) {
+      case 'EXPECTED_HTTP_STATUS': {
+        const expected = assertion.configuration.expectedHttpStatuses || [200];
+        const passed = response.statusCode && expected.includes(response.statusCode);
+        return {
+          assertionId: assertion.id,
+          assertionType: assertion.assertionType,
+          result: passed ? 'PASSED' : 'FAILED',
+          message: passed ? 'HTTP status matched.' : `Expected ${expected.join(', ')}, got ${response.statusCode || 'none'}.`,
+        };
+      }
+      case 'MAX_RESPONSE_TIME': {
+        const max = Number(assertion.configuration.maximumResponseTimeMs || 5000);
+        const passed = response.durationMs <= max;
+        return {
+          assertionId: assertion.id,
+          assertionType: assertion.assertionType,
+          result: passed ? 'PASSED' : 'FAILED',
+          message: passed ? 'Response time is within threshold.' : `Response time ${response.durationMs}ms exceeded ${max}ms.`,
+        };
+      }
+      case 'EXPECTED_CONTENT_TYPE': {
+        const expected = String(assertion.configuration.expectedContentType || '').toLowerCase();
+        const actual = String(response.contentType || '').toLowerCase();
+        const passed = expected ? actual.includes(expected) : true;
+        return {
+          assertionId: assertion.id,
+          assertionType: assertion.assertionType,
+          result: passed ? 'PASSED' : 'FAILED',
+          message: passed ? 'Content-Type matched.' : `Expected Content-Type containing ${expected}, got ${actual}.`,
+        };
+      }
+      case 'REQUIRED_JSON_PATH': {
+        const pathValue = String(assertion.configuration.jsonPath || assertion.configuration.path || '');
+        const passed = pathValue ? simpleJsonPathExists(response.bodyPreview, pathValue) : true;
+        return {
+          assertionId: assertion.id,
+          assertionType: assertion.assertionType,
+          result: passed ? 'PASSED' : 'FAILED',
+          message: passed ? `${pathValue} exists.` : `${pathValue} was not found.`,
+        };
+      }
+      default:
+        return {
+          assertionId: assertion.id,
+          assertionType: assertion.assertionType,
+          result: 'NOT_EVALUATED',
+          message: 'Assertion type is saved but not evaluated by this runner.',
+        };
+    }
+  });
+}
+
+function simpleJsonPathExists(body, pathValue) {
+  const parsed = parseJsonSafely(body);
+  if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null) return false;
+  const parts = pathValue.replace(/^\$\./, '').split('.').filter(Boolean);
+  let cursor = parsed.value;
+  for (const part of parts) {
+    if (cursor && typeof cursor === 'object' && Object.prototype.hasOwnProperty.call(cursor, part)) {
+      cursor = cursor[part];
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+function splitScriptArgs(raw) {
+  const args = [];
+  let current = '';
+  let quote = null;
+  let escaped = false;
+  for (const char of String(raw || '')) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === ',') {
+      args.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  if (quote) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Script contains an unclosed string literal.');
+  if (current.trim() || raw.trim()) args.push(current.trim());
+  return args.map(value => {
+    if (/^-?\d+(\.\d+)?$/.test(value)) return Number(value);
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    if (value === 'null') return null;
+    return value;
+  });
+}
+
+function parseScriptLines(source) {
+  const lines = String(source || '').slice(0, 20000).split(/\r?\n/);
+  if (lines.length > 150) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Script is too long. Maximum 150 lines are allowed.');
+  return lines
+    .map((raw, index) => ({ raw: raw.trim(), line: index + 1 }))
+    .filter(item => item.raw && !item.raw.startsWith('//') && !item.raw.startsWith('#'));
+}
+
+function parseScriptCommand(raw) {
+  const match = raw.match(/^([a-zA-Z][\w]*)\s*\(([\s\S]*)\)\s*;?$/);
+  if (!match) throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Unsupported script syntax: ${raw}`);
+  return { name: match[1], args: splitScriptArgs(match[2]) };
+}
+
+function scriptResult(phase, line, command, result, message) {
+  return { phase, line, command, result, message: sanitizeText(message) };
+}
+
+function upsertScriptHeader(request, name, value) {
+  const normalized = String(name || '').toLowerCase();
+  const headers = request.headers || [];
+  const index = headers.findIndex(header => String(header.name || '').toLowerCase() === normalized);
+  if (index >= 0) {
+    headers[index] = {
+      ...headers[index],
+      valueTemplate: String(value ?? ''),
+      enabled: true,
+      source: 'USER',
+    };
+  } else {
+    const header = createHeader(String(name), String(value ?? ''), headers.length, 'USER', request.executionMode || 'RECOMMENDED');
+    header.enabled = true;
+    headers.push(header);
+  }
+  request.headers = headers;
+}
+
+function upsertScriptQuery(request, name, value) {
+  const params = request.queryParameters || [];
+  const index = params.findIndex(param => param.name === name);
+  const next = {
+    id: makeId('param'),
+    name: String(name),
+    value: String(value ?? ''),
+    enabled: true,
+    sensitive: isSensitiveName(name),
+    source: 'USER',
+    displayOrder: params.length,
+  };
+  if (index >= 0) params[index] = { ...params[index], ...next, id: params[index].id, displayOrder: params[index].displayOrder ?? index };
+  else params.push(next);
+  request.queryParameters = params;
+}
+
+function setJsonBodyPath(request, pathValue, value) {
+  const body = requestBodyFromDefinition(request);
+  const parsed = body.type === 'json' ? parseJsonSafely(body.raw || '{}') : { ok: true, value: {} };
+  const root = parsed.ok && parsed.value && typeof parsed.value === 'object' && !Array.isArray(parsed.value) ? parsed.value : {};
+  const parts = String(pathValue || '').replace(/^\$\./, '').split('.').filter(Boolean);
+  if (!parts.length) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'setJsonBody requires a JSON path such as $.data.id.');
+  let cursor = root;
+  parts.slice(0, -1).forEach(part => {
+    if (!cursor[part] || typeof cursor[part] !== 'object' || Array.isArray(cursor[part])) cursor[part] = {};
+    cursor = cursor[part];
+  });
+  cursor[parts[parts.length - 1]] = value;
+  request.bodyType = 'json';
+  request.bodyTemplate = JSON.stringify(root, null, 2);
+}
+
+function runPreRequestScript(request, scripts, executionVariables = {}) {
+  const results = [];
+  const variables = { ...(executionVariables || {}) };
+  if (!scripts?.preRequestEnabled || !String(scripts.preRequest || '').trim()) return { request, variables, results };
+  let lines;
+  try {
+    lines = parseScriptLines(scripts.preRequest);
+  } catch (error) {
+    results.push(scriptResult('PRE_REQUEST', 0, 'script', 'FAILED', error.message || 'Pre-request script is invalid.'));
+    return { request, variables, results };
+  }
+  for (const item of lines) {
+    try {
+      const command = parseScriptCommand(item.raw);
+      if (command.name === 'setVar') {
+        const [key, value] = command.args;
+        if (!key) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'setVar requires key and value.');
+        variables[String(key)] = String(value ?? '');
+        results.push(scriptResult('PRE_REQUEST', item.line, command.name, 'PASSED', `Variable "${key}" set for this execution.`));
+      } else if (command.name === 'setHeader') {
+        const [name, value] = command.args;
+        if (!name) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'setHeader requires name and value.');
+        upsertScriptHeader(request, name, value);
+        results.push(scriptResult('PRE_REQUEST', item.line, command.name, 'PASSED', `Header "${name}" updated.`));
+      } else if (command.name === 'setQuery') {
+        const [name, value] = command.args;
+        if (!name) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'setQuery requires name and value.');
+        upsertScriptQuery(request, name, value);
+        results.push(scriptResult('PRE_REQUEST', item.line, command.name, 'PASSED', `Query parameter "${name}" updated.`));
+      } else if (command.name === 'setJsonBody') {
+        const [pathValue, value] = command.args;
+        setJsonBodyPath(request, pathValue, value);
+        results.push(scriptResult('PRE_REQUEST', item.line, command.name, 'PASSED', `JSON body path "${pathValue}" updated.`));
+      } else {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Unsupported pre-request command "${command.name}".`);
+      }
+    } catch (error) {
+      results.push(scriptResult('PRE_REQUEST', item.line, 'script', 'FAILED', error.message || 'Pre-request script failed.'));
+      break;
+    }
+  }
+  return { request, variables, results };
+}
+
+function responseHeaderValue(response, name) {
+  const header = (response.headers || []).find(item => String(item.name || '').toLowerCase() === String(name || '').toLowerCase());
+  return header ? String(header.valueTemplate || '') : '';
+}
+
+function runPostResponseScript(scripts, response) {
+  const results = [];
+  if (!scripts?.postResponseEnabled || !String(scripts.postResponse || '').trim()) return results;
+  let lines;
+  try {
+    lines = parseScriptLines(scripts.postResponse);
+  } catch (error) {
+    return [scriptResult('POST_RESPONSE', 0, 'script', 'FAILED', error.message || 'Post-response script is invalid.')];
+  }
+  for (const item of lines) {
+    try {
+      const command = parseScriptCommand(item.raw);
+      let passed = true;
+      let message = 'Script test passed.';
+      if (command.name === 'testStatus') {
+        const expected = command.args.map(Number).filter(value => !Number.isNaN(value));
+        passed = expected.length ? expected.includes(Number(response.statusCode)) : true;
+        message = passed ? `HTTP status ${response.statusCode} matched.` : `Expected status ${expected.join(', ')}, got ${response.statusCode || 'none'}.`;
+      } else if (command.name === 'testResponseTimeBelow') {
+        const max = Number(command.args[0] || 5000);
+        passed = response.durationMs <= max;
+        message = passed ? `Response time ${response.durationMs}ms is below ${max}ms.` : `Response time ${response.durationMs}ms exceeded ${max}ms.`;
+      } else if (command.name === 'testHeaderContains') {
+        const [name, expected] = command.args;
+        const actual = responseHeaderValue(response, name).toLowerCase();
+        passed = actual.includes(String(expected || '').toLowerCase());
+        message = passed ? `Header "${name}" contains expected value.` : `Header "${name}" did not contain "${expected}".`;
+      } else if (command.name === 'testJsonPath') {
+        const [pathValue] = command.args;
+        passed = simpleJsonPathExists(response.bodyPreview, String(pathValue || ''));
+        message = passed ? `${pathValue} exists.` : `${pathValue} was not found.`;
+      } else if (command.name === 'testBodyContains') {
+        const [expected] = command.args;
+        passed = String(response.bodyPreview || '').includes(String(expected || ''));
+        message = passed ? 'Body contains expected text.' : `Body did not contain "${expected}".`;
+      } else {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Unsupported post-response command "${command.name}".`);
+      }
+      results.push(scriptResult('POST_RESPONSE', item.line, command.name, passed ? 'PASSED' : 'FAILED', message));
+    } catch (error) {
+      results.push(scriptResult('POST_RESPONSE', item.line, 'script', 'FAILED', error.message || 'Post-response script failed.'));
+    }
+  }
+  return results;
+}
+
+function businessResultFromAssertions(results) {
+  if (!results.length) return 'NOT_EVALUATED';
+  if (results.some(result => result.result === 'FAILED')) return 'FAILED';
+  if (results.some(result => result.result === 'WARNING')) return 'WARNING';
+  return 'PASSED';
+}
+
+function createBlockedExecution(request, snapshot, environment, userId, category, message, businessJustification, scriptResults = []) {
+  const now = nowIso();
+  return {
+    id: makeId('api-exec'),
+    requestId: request.id,
+    collectionId: request.collectionId,
+    environmentId: environment.id,
+    runnerId: selectRunner(environment).id,
+    executedBy: userId,
+    startedAt: now,
+    completedAt: now,
+    durationMs: 0,
+    status: 'BLOCKED',
+    requestSnapshot: snapshot,
+    tlsVerification: snapshot.tls.verifyCertificate,
+    transportResult: 'BLOCKED',
+    businessResult: 'NOT_EVALUATED',
+    assertionResults: [],
+    scriptResults,
+    correlationId: makeId('api-corr'),
+    errorCategory: category,
+    sanitizedError: sanitizeText(message),
+    environmentName: environment.name,
+    evidenceType: 'ACTUAL_EXECUTION',
+    businessJustification,
+  };
+}
+
+function validateProductionPolicy(request, environment, context, options) {
+  const isProduction = PRODUCTION_KINDS.has(environment.kind);
+  if (!isProduction) return { allowed: true };
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteProduction)) {
+    return { allowed: false, category: 'AUTHENTICATION_ERROR', message: 'Production execution requires elevated permission.' };
+  }
+  if (request.classification.type === 'CORE_COMMAND') {
+    if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteProductionCommand)) {
+      return { allowed: false, category: 'AUTHENTICATION_ERROR', message: 'Production Core Command execution requires elevated permission.' };
+    }
+    if (!options?.productionCommandConfirmed || !options.businessJustification?.trim()) {
+      return { allowed: false, category: 'CORE_VALIDATION_ERROR', message: 'Production Core Command requires confirmation and business justification.' };
+    }
+  }
+  if (!request.tls.verifyCertificate) {
+    return { allowed: false, category: 'TLS_ERROR', message: 'Insecure TLS is prohibited in production environments.' };
+  }
+  return { allowed: true };
+}
+
+function bashQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function cmdQuote(value) {
+  const escaped = String(value).replace(/([&|<>^%!])/g, '^$1').replace(/"/g, '^"');
+  return `"${escaped}"`;
+}
+
+function psQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function formatCurlValue(value, dialect) {
+  if (dialect === 'windows-cmd') return cmdQuote(value);
+  if (dialect === 'powershell') return psQuote(value);
+  return bashQuote(value);
+}
+
+function lineContinuation(dialect) {
+  if (dialect === 'windows-cmd') return ' ^\n  ';
+  if (dialect === 'powershell') return ' `\n  ';
+  return ' \\\n  ';
+}
+
+function sensitiveExportValue(name, value, exposeSecrets) {
+  if (exposeSecrets || !isSensitiveName(name)) return value;
+  const normalized = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return `{{${normalized || 'secret'}}}`;
+}
+
+function exportRequestAsCurl(request, dialect, exposeSecrets = false) {
+  const continuation = lineContinuation(dialect);
+  const curl = dialect === 'windows-cmd' ? 'curl.exe' : 'curl';
+  const parts = [curl, '-X', request.method, formatCurlValue(buildUrlWithQuery(request.urlTemplate, request.queryParameters || []), dialect)];
+  requestHeadersWithBodyContentType(request)
+    .forEach(header => {
+      const value = sensitiveExportValue(header.name, header.valueTemplate, exposeSecrets);
+      parts.push('-H', formatCurlValue(`${header.name}: ${value}`, dialect));
+    });
+  const enabledCookies = (request.cookies || []).filter(cookie => cookie.enabled);
+  if (enabledCookies.length) {
+    const cookieValue = enabledCookies
+      .map(cookie => `${cookie.name}=${sensitiveExportValue(cookie.name, cookie.valueReference, exposeSecrets)}`)
+      .join('; ');
+    parts.push('-b', formatCurlValue(cookieValue, dialect));
+  }
+  if (request.bodyType !== 'none' && request.bodyTemplate) {
+    parts.push('--data-raw', formatCurlValue(sanitizeText(request.bodyTemplate), dialect));
+  }
+  if (!request.tls.verifyCertificate) parts.push('--insecure');
+
+  const grouped = [];
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (part === '-X' || part === '-H' || part === '-b' || part === '--data-raw') {
+      grouped.push(`${part} ${parts[i + 1]}`);
+      i += 1;
+    } else {
+      grouped.push(part);
+    }
+  }
+  return grouped.join(continuation);
+}
+
+function postmanSafeValue(name, value) {
+  const text = String(value ?? '');
+  if (!text) return '';
+  if (isSecretReference(text)) return '{{secret}}';
+  if (isSensitiveName(name)) return maskValue(text);
+  return sanitizeText(text).replace(/secret:\/\/api-console\/[0-9a-f-]+/gi, '{{secret}}');
+}
+
+function postmanSafeJsonValue(value, key = '') {
+  if (Array.isArray(value)) return value.map(item => postmanSafeJsonValue(item, key));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [childKey, postmanSafeJsonValue(childValue, childKey)]));
+  }
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return postmanSafeValue(key, value);
+  return isSensitiveName(key) ? postmanSafeValue(key, value) : value;
+}
+
+function postmanSafeBodyRaw(request) {
+  const raw = String(request.bodyTemplate || '');
+  if (!raw) return '';
+  if (request.bodyType === 'json') {
+    const parsed = parseJsonSafely(raw);
+    if (parsed.ok) return JSON.stringify(postmanSafeJsonValue(parsed.value), null, 2);
+  }
+  if (request.bodyType === 'form-urlencoded') {
+    const params = new URLSearchParams(raw);
+    const safe = new URLSearchParams();
+    for (const [key, value] of params.entries()) safe.append(key, postmanSafeValue(key, value));
+    return safe.toString();
+  }
+  return sanitizeText(raw).replace(/secret:\/\/api-console\/[0-9a-f-]+/gi, '{{secret}}');
+}
+
+function parsePostmanBodyPairs(raw) {
+  return String(raw || '')
+    .split(/\r?\n|&/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => {
+      const eq = line.indexOf('=');
+      const key = eq >= 0 ? line.slice(0, eq) : line;
+      const value = eq >= 0 ? line.slice(eq + 1) : '';
+      return { key, value: postmanSafeValue(key, value), type: 'text' };
+    });
+}
+
+function postmanBodyFromRequest(request) {
+  if (request.bodyType === 'none' || !request.bodyTemplate) return undefined;
+  if (request.bodyType === 'multipart') {
+    return {
+      mode: 'formdata',
+      formdata: parsePostmanBodyPairs(request.bodyTemplate),
+    };
+  }
+  if (request.bodyType === 'form-urlencoded') {
+    const params = new URLSearchParams(request.bodyTemplate || '');
+    return {
+      mode: 'urlencoded',
+      urlencoded: Array.from(params.entries()).map(([key, value]) => ({
+        key,
+        value: postmanSafeValue(key, value),
+        type: 'text',
+      })),
+    };
+  }
+  const language = request.bodyType === 'json' ? 'json' : request.bodyType === 'xml' ? 'xml' : 'text';
+  return {
+    mode: 'raw',
+    raw: postmanSafeBodyRaw(request),
+    options: {
+      raw: { language },
+    },
+  };
+}
+
+function safeQueryParametersForPostman(request) {
+  return (request.queryParameters || [])
+    .filter(param => param.enabled && param.name)
+    .map(param => ({
+      key: param.name,
+      value: param.sensitive ? postmanSafeValue(param.name, param.value) : postmanSafeValue('', param.value),
+    }));
+}
+
+function postmanUrlFromRequest(request) {
+  const queryParams = safeQueryParametersForPostman(request);
+  const rawUrl = buildUrlWithQuery(request.urlTemplate, queryParams.map(param => ({
+    name: param.key,
+    value: param.value,
+    enabled: true,
+  })));
+  try {
+    const parsed = new URL(rawUrl);
+    const url = {
+      raw: rawUrl,
+      protocol: parsed.protocol.replace(':', ''),
+      host: parsed.hostname.split('.'),
+      path: parsed.pathname.split('/').filter(Boolean).map(decodeURIComponent),
+    };
+    if (queryParams.length) url.query = queryParams;
+    return url;
+  } catch {
+    return queryParams.length ? { raw: rawUrl, query: queryParams } : { raw: rawUrl };
+  }
+}
+
+function postmanHeadersFromRequest(request) {
+  const headers = requestHeadersWithBodyContentType(request)
+    .filter(header => header.enabled !== false)
+    .map(header => ({
+      key: header.name,
+      value: header.sensitive ? (header.maskedValue || postmanSafeValue(header.name, header.valueTemplate)) : postmanSafeValue('', header.valueTemplate),
+    }));
+  const cookies = (request.cookies || []).filter(cookie => cookie.enabled);
+  if (cookies.length) {
+    headers.push({
+      key: 'Cookie',
+      value: cookies.map(cookie => `${cookie.name}=${cookie.sensitive ? (cookie.maskedValue || postmanSafeValue(cookie.name, cookie.valueReference)) : postmanSafeValue('', cookie.valueReference)}`).join('; '),
+    });
+  }
+  return headers;
+}
+
+function postmanItemFromRequest(request) {
+  const postmanRequest = {
+    method: request.method,
+    header: postmanHeadersFromRequest(request),
+    url: postmanUrlFromRequest(request),
+  };
+  const body = postmanBodyFromRequest(request);
+  if (body) postmanRequest.body = body;
+  return {
+    name: request.name || `${request.method} ${request.urlTemplate}`,
+    request: postmanRequest,
+    response: [],
+  };
+}
+
+function postmanIdFromCollection(collection) {
+  const match = String(collection.id || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  return match ? match[0] : randomUUID();
+}
+
+function postmanFileName(collection) {
+  return `${String(collection.name || 'api-console-collection').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim() || 'api-console-collection'}.postman_collection.json`;
+}
+
+function buildPostmanCollectionExport(collection, requests) {
+  const postmanId = postmanIdFromCollection(collection);
+  return {
+    fileName: postmanFileName(collection),
+    requestCount: requests.length,
+    collection: {
+      info: {
+        _postman_id: postmanId,
+        name: collection.name || 'API Console Collection',
+        schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
+        _exporter_id: 'UTMS-Online-API-Console',
+        _collection_link: `utms://api-console/collections/${collection.id}`,
+      },
+      item: requests.map(postmanItemFromRequest),
+    },
+  };
+}
+
+function enabledDocumentationRows(rows) {
+  return (rows || []).filter(row => row.enabled !== false && !row.deprecated).sort((left, right) => left.displayOrder - right.displayOrder || left.name.localeCompare(right.name));
+}
+
+function documentationRequestExample(request, inputParameters) {
+  const raw = String(request.bodyTemplate || '');
+  if (!raw) return '';
+  if (request.bodyType === 'json') {
+    const parsed = parseJsonSafely(raw);
+    if (parsed.ok) return JSON.stringify(sanitizeDocumentationJsonValue(parsed.value, '', inputParameters), null, 2);
+  }
+  if (request.bodyType === 'form-urlencoded') {
+    const params = new URLSearchParams(raw);
+    for (const key of Array.from(params.keys())) {
+      const metadata = inputParameters.find(row => row.name === key);
+      if (isSensitiveName(key) || isSecretReference(params.get(key))) params.set(key, metadata?.exampleValue || '****');
+    }
+    return params.toString();
+  }
+  return sanitizeText(raw).replace(/secret:\/\/api-console\/[0-9a-f-]+/gi, '****');
+}
+
+function documentationCurlExample(request, metadata, inputParameters) {
+  if (metadata.curlExample) return sanitizeDocumentationCurl(metadata.curlExample);
+  const safeQueryParameters = (request.queryParameters || []).map(parameter => {
+    const row = inputParameters.find(item => item.location === 'QUERY' && item.name === parameter.name);
+    return {
+      ...parameter,
+      value: parameter.sensitive || isSensitiveName(parameter.name) || isSecretReference(parameter.value)
+        ? (row?.exampleValue || '****')
+        : parameter.value,
+    };
+  });
+  const url = cleanDocumentationUrl(buildUrlWithQuery(request.urlTemplate, safeQueryParameters));
+  const parts = [`curl --request ${request.method}`, `--url ${url}`];
+  enabledDocumentationRows(metadata.headerParameters).forEach(header => {
+    if (String(header.name).toLowerCase() === 'content-length') return;
+    const sourceHeader = documentedRequestHeaders(request).find(item => String(item.name).toLowerCase() === String(header.name).toLowerCase());
+    const sensitive = isSensitiveName(header.name) || sourceHeader?.sensitive;
+    const value = sensitive
+      ? (header.exampleValue || sourceHeader?.maskedValue || '****')
+      : (header.exampleValue || sourceHeader?.valueTemplate || header.dataType || '—');
+    parts.push(`--header ${bashQuote(`${header.name}: ${value}`)}`);
+  });
+  const body = documentationRequestExample(request, inputParameters);
+  if (body) parts.push(`--data ${bashQuote(body)}`);
+  return sanitizeDocumentationCurl(parts.join(' \\\n  '));
+}
+
+function buildDocumentationViewModel(request, executions, manualExamples, generatedAt = nowIso()) {
+  const metadata = refreshDocumentationMetadata(request, executions, manualExamples);
+  const evidence = latestDocumentationEvidence(request, executions, manualExamples);
+  const headers = enabledDocumentationRows(metadata.headerParameters);
+  const inputs = enabledDocumentationRows(metadata.inputParameters);
+  const outputs = enabledDocumentationRows(metadata.outputParameters);
+  const responseExample = metadata.responseExample || sanitizeDocumentationResponseExample(evidence.responseText, outputs);
+  const curlExample = documentationCurlExample(request, metadata, inputs);
+  return {
+    requestId: request.id,
+    generatedAt,
+    title: metadata.title,
+    serviceIntroduction: metadata.serviceIntroduction || 'ثبت نشده است',
+    baseUrl: metadata.baseUrl,
+    endpoint: cleanDocumentationUrl(request.urlTemplate),
+    operationPath: metadata.operationPath,
+    method: request.method,
+    organizationName: metadata.organizationName,
+    departmentName: metadata.departmentName,
+    documentRevision: metadata.documentRevision,
+    documentDate: metadata.documentDate,
+    generationDate: new Date(generatedAt).toLocaleDateString('fa-IR'),
+    headers,
+    inputs,
+    outputs,
+    authentication: metadata.authenticationDocumentation,
+    responseCodes: normalizeResponseCodes(metadata.responseCodes).filter(row => row.enabled),
+    curlExample,
+    responseExample,
+    rawRequestExample: request.bodyType !== 'none' ? documentationRequestExample(request, inputs) : '',
+    requestBodyType: request.bodyType,
+    requestContentType: requestBodyContentType(requestBodyFromDefinition(request)),
+    hasResponseEvidence: !!evidence.responseText,
+  };
+}
+
+function markdownCell(value) {
+  const text = String(value ?? '').trim() || '—';
+  return text.replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>');
+}
+
+function markdownTable(headers, rows) {
+  const normalizedRows = rows.length ? rows : [headers.map((_, index) => index === headers.length - 1 ? 'ثبت نشده است' : '—')];
+  return [
+    `| ${headers.map(markdownCell).join(' | ')} |`,
+    `| ${headers.map(() => '---').join(' | ')} |`,
+    ...normalizedRows.map(row => `| ${row.map(markdownCell).join(' | ')} |`),
+  ].join('\n');
+}
+
+function addressRows(view) {
+  return [
+    ['۱', 'URL', view.endpoint || '—'],
+    ['۲', 'Method', view.method || '—'],
+  ];
+}
+
+function headerRows(rows) {
+  return enabledDocumentationRows(rows).map((row, index) => [
+    String(index + 1), row.name, row.exampleValue || row.dataType || '—', row.description || '—',
+  ]);
+}
+
+function inputRows(rows) {
+  return enabledDocumentationRows(rows).map((row, index) => [
+    String(index + 1), row.name, row.dataType || 'unknown', requiredStatusLabel(row.required), row.description || '—',
+  ]);
+}
+
+function outputParameterGroups(rows) {
+  const groups = new Map();
+  enabledDocumentationRows(rows).forEach(row => {
+    const parentPath = row.parentPath || '';
+    if (!groups.has(parentPath)) groups.set(parentPath, []);
+    groups.get(parentPath).push(row);
+  });
+  return Array.from(groups.entries())
+    .map(([parentPath, parameters]) => ({
+      parentPath,
+      titlePath: parentPath.replace(/\[\]/g, ''),
+      parameters,
+      displayOrder: Math.min(...parameters.map(row => row.displayOrder)),
+    }))
+    .sort((left, right) => {
+      if (!left.parentPath) return -1;
+      if (!right.parentPath) return 1;
+      return left.displayOrder - right.displayOrder || left.parentPath.localeCompare(right.parentPath);
+    });
+}
+
+function relativeOutputParameterName(name, parentPath) {
+  if (!parentPath) return name;
+  const prefix = `${parentPath}.`;
+  return String(name).startsWith(prefix) ? String(name).slice(prefix.length) : name;
+}
+
+function outputRows(rows, parentPath = '') {
+  return enabledDocumentationRows(rows).map((row, index) => [
+    String(index + 1), relativeOutputParameterName(row.name, parentPath), row.dataType || 'unknown', row.description || '—',
+  ]);
+}
+
+function allowedValueRows(parameter) {
+  return (parameter.allowedValues || [])
+    .filter(item => item.enabled !== false)
+    .sort((left, right) => left.displayOrder - right.displayOrder)
+    .map(item => [item.value || '—', item.description || '—']);
+}
+
+function outputAllowedValueTitle(parameter) {
+  return String(parameter.name || '').split('.').at(-1)?.replace(/\[\]$/g, '') || parameter.name;
+}
+
+function markdownOutputParameterSections(rows) {
+  const sections = [];
+  const groups = outputParameterGroups(rows);
+  if (!groups.length) {
+    return [
+      '### پارامترهای خروجی', '',
+      markdownTable(['ردیف', 'نام پارامتر', 'نوع', 'توضیحات'], []), '',
+    ];
+  }
+  groups.forEach(group => {
+    sections.push(
+      group.parentPath ? `### پارامترهای خروجی ${group.titlePath}:` : '### پارامترهای خروجی', '',
+      markdownTable(['ردیف', 'نام پارامتر', 'نوع', 'توضیحات'], outputRows(group.parameters, group.parentPath)), ''
+    );
+    group.parameters.forEach(parameter => {
+      const values = allowedValueRows(parameter);
+      if (!values.length) return;
+      sections.push(
+        `#### مقادیر مجاز برای فیلد ${outputAllowedValueTitle(parameter)}:`, '',
+        markdownTable(['کد', 'توضیحات'], values), ''
+      );
+    });
+  });
+  return sections;
+}
+
+function generateDocumentationMarkdown(request, executions, manualExamples, generatedBy) {
+  const generatedAt = nowIso();
+  const view = buildDocumentationViewModel(request, executions, manualExamples, generatedAt);
+  const warnings = [];
+  if (!view.hasResponseEvidence && !request.documentation?.responseExample) warnings.push('نمونه پاسخ موفق ثبت نشده است.');
+  if ((request.cookies || []).some(cookie => cookie.sensitive)) warnings.push('Cookieهای نشست از مستندات حذف شده‌اند.');
+  const docs = [
+    '# مستندات بهره برداری',
+    '',
+    `## «${view.title}»`,
+    '',
+    `- سازمان: ${view.organizationName}`,
+    `- واحد سازمانی: ${view.departmentName}`,
+    `- ویرایش سند: ${view.documentRevision}`,
+    `- تاریخ سند: ${view.documentDate}`,
+    `- تاریخ تولید: ${view.generationDate}`,
+    '',
+  ];
+
+  if (view.authentication?.enabled) {
+    const auth = view.authentication;
+    docs.push(
+      '# مقدمه سرویس احراز هویت', '',
+      `Base url: ${auth.baseUrl || '—'}`, '',
+      auth.introduction || 'ثبت نشده است', '',
+      '# سرویس احراز هویت', '',
+      '## ورودی ها', '',
+      '### ادرس و متد درخواست', '',
+      markdownTable(['ردیف', 'نام پارامتر', 'توضیحات'], [
+        ['۱', 'URL', auth.endpoint || '—'], ['۲', 'Method', auth.method || '—'],
+      ]), '',
+      '### پارامتر های سرایند', '',
+      markdownTable(['ردیف', 'نام پارامتر', 'نوع یا مقدار نمونه', 'توضیحات'], headerRows(auth.headerParameters)), '',
+      '### پارامتر های ورودی', '',
+      markdownTable(['ردیف', 'نام پارامتر', 'نوع', 'الزامی', 'توضیحات'], inputRows(auth.inputParameters)), '',
+      '## خروجی ها', '',
+      ...markdownOutputParameterSections(auth.outputParameters),
+      '## نمونه فراخوانی سرویس احراز هویت', '', '```bash', auth.curlExample || 'ثبت نشده است', '```', '',
+      '## نمونه تست سرویس احراز هویت', '', '```json', auth.responseExample || 'ثبت نشده است', '```', ''
+    );
+  }
+
+  docs.push(
+    `# مقدمه دسترسی به استعلام جزئیات وب سرویس ${view.title}`, '',
+    `Base url: ${view.baseUrl || '—'}`, '',
+    view.serviceIntroduction, '',
+    `# جزئیات وب سرویس ${view.title}`, '',
+    '## ورودی ها', '',
+    '### ادرس و متد درخواست', '',
+    markdownTable(['ردیف', 'نام پارامتر', 'توضیحات'], addressRows(view)), '',
+    '### پارامتر های سرایند', '',
+    markdownTable(['ردیف', 'نام پارامتر', 'نوع یا مقدار نمونه', 'توضیحات'], headerRows(view.headers)), '',
+    '### پارامتر های ورودی', '',
+    markdownTable(['ردیف', 'نام پارامتر', 'نوع', 'الزامی', 'توضیحات'], inputRows(view.inputs)), ''
+  );
+  if (view.rawRequestExample && view.requestBodyType !== 'json') {
+    docs.push('### نمونه بدنه درخواست', '', '```text', view.rawRequestExample, '```', '');
+  }
+  docs.push(
+    '## خروجی ها', '',
+    ...markdownOutputParameterSections(view.outputs),
+    `## نمونه فراخوانی دریافت جزئیات وب سرویس ${view.title}`, '',
+    '```bash', view.curlExample || 'ثبت نشده است', '```', '',
+    `## نمونه تست موفق دریافت جزئیات وب سرویس ${view.title}`, '',
+    '```json', view.responseExample || 'ثبت نشده است', '```', '',
+    `# پیوست – مرجع کدهای پاسخ و خطا وب سرویس ${view.title}`, '',
+    `## کدهای پاسخ HTTPS وب سرویس ${view.title}`, '',
+    markdownTable(['Code', 'Message', 'توضیحات'], view.responseCodes.map(row => [String(row.code), row.message, row.description])), '',
+    `تولیدکننده سند: ${generatedBy}`,
+    `زمان تولید: ${generatedAt}`,
+    ''
+  );
+  return {
+    requestId: request.id,
+    generatedAt,
+    generatedBy,
+    approved: false,
+    markdown: docs.join('\n'),
+    warnings,
+  };
+}
+
+function xmlEscape(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+const crcTable = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let j = 0; j < 8; j += 1) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer) {
+  let crc = 0xFFFFFFFF;
+  for (const byte of buffer) crc = crcTable[(crc ^ byte) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function findEndOfCentralDirectory(buffer) {
+  for (let i = buffer.length - 22; i >= Math.max(0, buffer.length - 66000); i -= 1) {
+    if (buffer.readUInt32LE(i) === 0x06054b50) return i;
+  }
+  throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', 'DOCX template central directory was not found.');
+}
+
+function readZipEntries(buffer) {
+  const eocd = findEndOfCentralDirectory(buffer);
+  const total = buffer.readUInt16LE(eocd + 10);
+  const centralOffset = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  let offset = centralOffset;
+  for (let i = 0; i < total; i += 1) {
+    if (buffer.readUInt32LE(offset) !== 0x02014b50) throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', 'Invalid DOCX central directory.');
+    const flags = buffer.readUInt16LE(offset + 8);
+    const method = buffer.readUInt16LE(offset + 10);
+    const modTime = buffer.readUInt16LE(offset + 12);
+    const modDate = buffer.readUInt16LE(offset + 14);
+    const crc = buffer.readUInt32LE(offset + 16);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const uncompressedSize = buffer.readUInt32LE(offset + 24);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const externalAttrs = buffer.readUInt32LE(offset + 38);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name = buffer.slice(offset + 46, offset + 46 + nameLength).toString('utf8');
+    if (buffer.readUInt32LE(localOffset) !== 0x04034b50) throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', `Invalid DOCX local header for ${name}.`);
+    const localNameLength = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    const compressedData = buffer.slice(dataStart, dataStart + compressedSize);
+    entries.push({ name, flags, method, modTime, modDate, crc, compressedSize, uncompressedSize, externalAttrs, compressedData });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+function inflateZipEntry(entry) {
+  if (entry.method === 0) return entry.compressedData;
+  if (entry.method === 8) return zlib.inflateRawSync(entry.compressedData);
+  throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', `Unsupported DOCX compression method ${entry.method}.`);
+}
+
+function makeZipEntry(name, data, templateEntry) {
+  const raw = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8');
+  const compressedData = zlib.deflateRawSync(raw);
+  return {
+    name,
+    flags: 0x0800,
+    method: 8,
+    modTime: templateEntry?.modTime || 0,
+    modDate: templateEntry?.modDate || 0,
+    crc: crc32(raw),
+    compressedSize: compressedData.length,
+    uncompressedSize: raw.length,
+    externalAttrs: templateEntry?.externalAttrs || 0,
+    compressedData,
+  };
+}
+
+function writeZip(entries) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const nameBuffer = Buffer.from(entry.name, 'utf8');
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(entry.flags || 0, 6);
+    local.writeUInt16LE(entry.method, 8);
+    local.writeUInt16LE(entry.modTime || 0, 10);
+    local.writeUInt16LE(entry.modDate || 0, 12);
+    local.writeUInt32LE(entry.crc >>> 0, 14);
+    local.writeUInt32LE(entry.compressedSize >>> 0, 18);
+    local.writeUInt32LE(entry.uncompressedSize >>> 0, 22);
+    local.writeUInt16LE(nameBuffer.length, 26);
+    local.writeUInt16LE(0, 28);
+    localParts.push(local, nameBuffer, entry.compressedData);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(entry.flags || 0, 8);
+    central.writeUInt16LE(entry.method, 10);
+    central.writeUInt16LE(entry.modTime || 0, 12);
+    central.writeUInt16LE(entry.modDate || 0, 14);
+    central.writeUInt32LE(entry.crc >>> 0, 16);
+    central.writeUInt32LE(entry.compressedSize >>> 0, 20);
+    central.writeUInt32LE(entry.uncompressedSize >>> 0, 24);
+    central.writeUInt16LE(nameBuffer.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(entry.externalAttrs || 0, 38);
+    central.writeUInt32LE(offset >>> 0, 42);
+    centralParts.push(central, nameBuffer);
+    offset += local.length + nameBuffer.length + entry.compressedData.length;
+  }
+  const centralOffset = offset;
+  const centralBuffer = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralBuffer.length >>> 0, 12);
+  eocd.writeUInt32LE(centralOffset >>> 0, 16);
+  eocd.writeUInt16LE(0, 20);
+  return Buffer.concat([...localParts, centralBuffer, eocd]);
+}
+
+function docxRun(text, options = {}) {
+  const font = options.font || (options.ltr ? 'Consolas' : 'B Nazanin');
+  const size = options.size || 24;
+  const bold = options.bold ? '<w:b/><w:bCs/>' : '';
+  const direction = options.ltr ? '<w:rtl w:val="0"/>' : '<w:rtl/>';
+  return `<w:r><w:rPr><w:rFonts w:ascii="${xmlEscape(font)}" w:hAnsi="${xmlEscape(font)}" w:cs="${xmlEscape(font)}"/><w:sz w:val="${size}"/><w:szCs w:val="${size}"/>${direction}${bold}</w:rPr><w:t xml:space="preserve">${xmlEscape(text)}</w:t></w:r>`;
+}
+
+function docxParagraph(text, options = {}) {
+  const style = options.style ? `<w:pStyle w:val="${xmlEscape(options.style)}"/>` : '';
+  const align = options.align ? `<w:jc w:val="${options.align}"/>` : `<w:jc w:val="${options.ltr ? 'left' : 'right'}"/>`;
+  const spacing = options.after === undefined ? '<w:spacing w:after="120"/>' : `<w:spacing w:after="${options.after}"/>`;
+  const direction = options.ltr ? '<w:bidi w:val="0"/>' : '<w:bidi/>';
+  const keepNext = options.keepNext ? '<w:keepNext/>' : '';
+  const pageBreakBefore = options.pageBreakBefore ? '<w:pageBreakBefore/>' : '';
+  return `<w:p><w:pPr>${direction}${style}${spacing}${align}${keepNext}${pageBreakBefore}</w:pPr>${docxRun(text, options)}</w:p>`;
+}
+
+function docxPageBreak() {
+  return '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+}
+
+function docxCodeBlock(value) {
+  const lines = String(value || '-').split(/\r?\n/);
+  const runs = [];
+  lines.forEach((line, index) => {
+    if (index) runs.push('<w:br/>');
+    runs.push(`<w:t xml:space="preserve">${xmlEscape(line)}</w:t>`);
+  });
+  return `<w:p><w:pPr><w:bidi w:val="0"/><w:spacing w:before="80" w:after="180"/><w:jc w:val="left"/><w:keepLines/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="18"/><w:szCs w:val="18"/><w:rtl w:val="0"/><w:noProof/></w:rPr>${runs.join('')}</w:r></w:p>`;
+}
+
+function docxCell(content, options = {}) {
+  const fill = options.header ? '<w:shd w:fill="D9EAF7"/>' : '';
+  const text = Array.isArray(content) ? content.join('\n') : String(content ?? '-');
+  const ltr = options.ltr ?? (/^(?:https?:\/\/|[A-Za-z0-9_.\[\]{}:/?&=+*'-]+)$/u.test(text) && !/[\u0600-\u06FF]/u.test(text));
+  return `<w:tc><w:tcPr><w:tcW w:w="${options.width || 2400}" w:type="dxa"/>${fill}<w:vAlign w:val="center"/><w:tcMar><w:top w:w="80" w:type="dxa"/><w:left w:w="80" w:type="dxa"/><w:bottom w:w="80" w:type="dxa"/><w:right w:w="80" w:type="dxa"/></w:tcMar></w:tcPr>${docxParagraph(text || '—', { bold: options.header, size: options.header ? 21 : 20, after: 0, ltr, align: ltr ? 'left' : 'right', font: ltr ? 'Arial' : 'B Nazanin' })}</w:tc>`;
+}
+
+function docxTable(rows, options = {}) {
+  const border = '<w:tblBorders><w:top w:val="single" w:sz="6" w:color="8EAADB"/><w:left w:val="single" w:sz="6" w:color="8EAADB"/><w:bottom w:val="single" w:sz="6" w:color="8EAADB"/><w:right w:val="single" w:sz="6" w:color="8EAADB"/><w:insideH w:val="single" w:sz="4" w:color="D9E2F3"/><w:insideV w:val="single" w:sz="4" w:color="D9E2F3"/></w:tblBorders>';
+  const widths = options.widths || [];
+  const body = rows.map((row, rowIndex) => {
+    const rowProperties = rowIndex === 0 ? '<w:trPr><w:tblHeader/><w:cantSplit/></w:trPr>' : '<w:trPr><w:cantSplit/></w:trPr>';
+    return `<w:tr>${rowProperties}${row.map((cell, columnIndex) => docxCell(cell, { header: rowIndex === 0, width: widths[columnIndex] })).join('')}</w:tr>`;
+  }).join('');
+  return `<w:tbl><w:tblPr><w:bidiVisual/><w:tblW w:w="0" w:type="auto"/><w:tblLayout w:type="autofit"/>${border}<w:tblLook w:firstRow="1" w:noHBand="0" w:noVBand="1"/></w:tblPr>${body}</w:tbl><w:p><w:pPr><w:spacing w:after="80"/></w:pPr></w:p>`;
+}
+
+function prettyJsonText(text) {
+  const parsed = parseJsonSafely(text || '');
+  return parsed.ok ? JSON.stringify(parsed.value, null, 2) : String(text || '-');
+}
+
+function requestDocxRows(view) {
+  return [
+    ['ردیف', 'نام پارامتر', 'توضیحات'],
+    ...addressRows(view),
+  ];
+}
+
+function headerRowsForDocx(rows) {
+  const values = headerRows(rows);
+  return [
+    ['ردیف', 'نام پارامتر', 'نوع یا مقدار نمونه', 'توضیحات'],
+    ...(values.length ? values : [['—', '—', '—', 'ثبت نشده است']]),
+  ];
+}
+
+function inputRowsForDocx(rows) {
+  const values = inputRows(rows);
+  return [
+    ['ردیف', 'نام پارامتر', 'نوع', 'الزامی', 'توضیحات'],
+    ...(values.length ? values : [['—', '—', '—', 'نامشخص', 'ثبت نشده است']]),
+  ];
+}
+
+function outputRowsForDocx(rows, parentPath = '') {
+  const values = outputRows(rows, parentPath);
+  return [
+    ['ردیف', 'نام پارامتر', 'نوع', 'توضیحات'],
+    ...(values.length ? values : [['—', '—', '—', 'ثبت نشده است']]),
+  ];
+}
+
+function allowedValueRowsForDocx(parameter) {
+  const values = allowedValueRows(parameter);
+  return [
+    ['کد', 'توضیحات'],
+    ...(values.length ? values : [['—', 'ثبت نشده است']]),
+  ];
+}
+
+function responseCodeRowsForDocx(rows) {
+  return [
+    ['Code', 'Message', 'توضیحات'],
+    ...rows.map(row => [String(row.code), row.message || '—', row.description || '—']),
+  ];
+}
+
+function docxHeading(text, level = 1, options = {}) {
+  const size = level === 1 ? 30 : level === 2 ? 27 : level === 3 ? 24 : 22;
+  return docxParagraph(text, { style: `Heading${level}`, bold: true, size, font: 'B Titr', keepNext: true, ...options });
+}
+
+function docxOutputParameterSections(rows) {
+  const groups = outputParameterGroups(rows);
+  if (!groups.length) {
+    return `${docxHeading('پارامترهای خروجی', 3)}${docxTable(outputRowsForDocx([]), { widths: [650, 2200, 1500, 4200] })}`;
+  }
+  return groups.map(group => {
+    const section = [
+      docxHeading(group.parentPath ? `پارامترهای خروجی ${group.titlePath}:` : 'پارامترهای خروجی', 3),
+      docxTable(outputRowsForDocx(group.parameters, group.parentPath), { widths: [650, 2200, 1500, 4200] }),
+    ];
+    group.parameters.forEach(parameter => {
+      if (!allowedValueRows(parameter).length) return;
+      section.push(
+        docxHeading(`مقادیر مجاز برای فیلد ${outputAllowedValueTitle(parameter)}:`, 4),
+        docxTable(allowedValueRowsForDocx(parameter), { widths: [1800, 6500] })
+      );
+    });
+    return section.join('');
+  }).join('');
+}
+
+function docxTableOfContents() {
+  return [
+    docxParagraph('فهرست مطالب', { style: 'TOCHeading', bold: true, size: 30, font: 'B Titr', keepNext: true }),
+    '<w:p><w:pPr><w:bidi/><w:jc w:val="right"/></w:pPr>',
+    '<w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r>',
+    '<w:r><w:instrText xml:space="preserve"> TOC \\o &quot;1-3&quot; \\h \\z \\u </w:instrText></w:r>',
+    '<w:r><w:fldChar w:fldCharType="separate"/></w:r>',
+    docxRun('برای نمایش شماره صفحات، فهرست را در Microsoft Word به‌روزرسانی کنید.'),
+    '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>',
+  ].join('');
+}
+
+function forceA4SectionProperties(sectPr) {
+  let next = String(sectPr || '');
+  if (/<w:pgSz\b[^>]*\/>/.test(next)) {
+    next = next.replace(/<w:pgSz\b[^>]*\/>/, '<w:pgSz w:w="11906" w:h="16838"/>');
+  } else {
+    next = next.replace(/<w:sectPr([^>]*)>/, '<w:sectPr$1><w:pgSz w:w="11906" w:h="16838"/>');
+  }
+  if (/<w:pgMar\b[^>]*\/>/.test(next)) {
+    next = next.replace(/<w:pgMar\b[^>]*\/>/, '<w:pgMar w:top="1440" w:right="1134" w:bottom="1134" w:left="1134" w:header="720" w:footer="720" w:gutter="0"/>');
+  }
+  return next;
+}
+
+function docxAuthenticationSection(authentication) {
+  if (!authentication?.enabled) return '';
+  const address = {
+    endpoint: authentication.endpoint,
+    method: authentication.method,
+  };
+  return [
+    docxHeading('مقدمه سرویس احراز هویت', 1),
+    docxParagraph(`Base url: ${authentication.baseUrl || '—'}`, { ltr: true, font: 'Arial' }),
+    docxParagraph(authentication.introduction || 'ثبت نشده است'),
+    docxHeading('سرویس احراز هویت', 1),
+    docxHeading('ورودی ها', 2),
+    docxHeading('ادرس و متد درخواست', 3),
+    docxTable(requestDocxRows(address), { widths: [700, 1800, 6500] }),
+    docxHeading('پارامتر های سرایند', 3),
+    docxTable(headerRowsForDocx(authentication.headerParameters), { widths: [650, 1800, 2500, 4000] }),
+    docxHeading('پارامتر های ورودی', 3),
+    docxTable(inputRowsForDocx(authentication.inputParameters), { widths: [600, 1700, 1300, 1100, 3800] }),
+    docxHeading('خروجی ها', 2),
+    docxOutputParameterSections(authentication.outputParameters),
+    docxHeading('نمونه فراخوانی سرویس احراز هویت', 2),
+    docxCodeBlock(authentication.curlExample || 'ثبت نشده است'),
+    docxHeading('نمونه تست سرویس احراز هویت', 2),
+    docxCodeBlock(authentication.responseExample || 'ثبت نشده است'),
+  ].join('');
+}
+
+function templateCoverArtwork(templateXml) {
+  const bodyMatch = String(templateXml || '').match(/<w:body>([\s\S]*?)<w:sectPr\b/);
+  if (!bodyMatch) return '';
+  const paragraphs = bodyMatch[1].match(/<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g) || [];
+  return paragraphs.find(paragraph => paragraph.includes('<w:drawing>') && /r:embed="[^"]+"/.test(paragraph)) || '';
+}
+
+function buildDocxDocumentXml(templateXml, request, markdownResult, executions, manualExamples) {
+  const bodyOpen = templateXml.indexOf('<w:body>');
+  const start = bodyOpen >= 0
+    ? templateXml.slice(0, bodyOpen + '<w:body>'.length)
+    : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>';
+  const sectMatch = templateXml.match(/<w:sectPr[\s\S]*?<\/w:sectPr>/);
+  const sectPr = forceA4SectionProperties(sectMatch ? sectMatch[0] : '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1620" w:right="1016" w:bottom="720" w:left="1080" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr>');
+  const view = buildDocumentationViewModel(request, executions, manualExamples, markdownResult.generatedAt);
+  const coverArtwork = templateCoverArtwork(templateXml);
+
+  const content = [
+    coverArtwork,
+    docxParagraph('مستندات بهره برداری', { align: 'center', bold: true, size: 36, font: 'B Titr', after: 0 }),
+    docxParagraph(`«${view.title}»`, { align: 'center', bold: true, size: 32, font: 'B Titr', after: 0 }),
+    docxParagraph(view.organizationName, { align: 'center', bold: true, size: 27, font: 'B Titr', after: 0 }),
+    docxParagraph(view.departmentName, { align: 'center', bold: true, size: 24, font: 'B Titr', after: 0 }),
+    docxParagraph(`ویرایش سند: ${view.documentRevision}`, { align: 'center', size: 24, font: 'B Nazanin' }),
+    docxParagraph(`تاریخ سند: ${view.documentDate}`, { align: 'center', size: 22 }),
+    docxParagraph(`تاریخ تولید: ${view.generationDate}`, { align: 'center', size: 22 }),
+    docxPageBreak(),
+    docxTableOfContents(),
+    docxPageBreak(),
+    docxAuthenticationSection(view.authentication),
+    docxHeading(`مقدمه دسترسی به استعلام جزئیات وب سرویس ${view.title}`, 1),
+    docxParagraph(`Base url: ${view.baseUrl || '—'}`, { ltr: true, font: 'Arial' }),
+    docxParagraph(view.serviceIntroduction),
+    docxHeading(`جزئیات وب سرویس ${view.title}`, 1),
+    docxHeading('ورودی ها', 2),
+    docxHeading('ادرس و متد درخواست', 3),
+    docxTable(requestDocxRows(view), { widths: [700, 1800, 6500] }),
+    docxHeading('پارامتر های سرایند', 3),
+    docxTable(headerRowsForDocx(view.headers), { widths: [650, 1800, 2500, 4000] }),
+    docxHeading('پارامتر های ورودی', 3),
+    docxTable(inputRowsForDocx(view.inputs), { widths: [600, 1700, 1300, 1100, 3800] }),
+    view.rawRequestExample && view.requestBodyType !== 'json'
+      ? `${docxHeading('نمونه بدنه درخواست', 3)}${docxCodeBlock(view.rawRequestExample)}`
+      : '',
+    docxHeading('خروجی ها', 2),
+    docxOutputParameterSections(view.outputs),
+    docxHeading(`نمونه فراخوانی دریافت جزئیات وب سرویس ${view.title}`, 2),
+    docxCodeBlock(view.curlExample || 'ثبت نشده است'),
+    docxHeading(`نمونه تست موفق دریافت جزئیات وب سرویس ${view.title}`, 2),
+    docxCodeBlock(view.responseExample || 'ثبت نشده است'),
+    docxHeading(`پیوست – مرجع کدهای پاسخ و خطا وب سرویس ${view.title}`, 1),
+    docxHeading(`کدهای پاسخ HTTPS وب سرویس ${view.title}`, 2),
+    docxTable(responseCodeRowsForDocx(view.responseCodes), { widths: [1000, 2500, 5000] }),
+  ].join('');
+
+  return `${start}${content}${sectPr}</w:body></w:document>`;
+}
+
+function buildDocxFromTemplate(request, markdownResult, executions, manualExamples) {
+  if (!fs.existsSync(DOCX_TEMPLATE_FILE)) {
+    throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', `DOCX template not found: ${DOCX_TEMPLATE_FILE}`);
+  }
+  const templateBuffer = fs.readFileSync(DOCX_TEMPLATE_FILE);
+  const entries = readZipEntries(templateBuffer);
+  const documentEntry = entries.find(entry => entry.name === 'word/document.xml');
+  if (!documentEntry) throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', 'DOCX template does not contain word/document.xml.');
+  const templateXml = inflateZipEntry(documentEntry).toString('utf8');
+  const documentXml = buildDocxDocumentXml(templateXml, request, markdownResult, executions, manualExamples);
+  const updatedEntries = entries.map(entry => {
+    if (entry.name === 'word/document.xml') return makeZipEntry(entry.name, documentXml, entry);
+    if (entry.name === 'word/settings.xml') {
+      const settingsXml = inflateZipEntry(entry).toString('utf8');
+      const nextSettings = /<w:updateFields\b/.test(settingsXml)
+        ? settingsXml.replace(/<w:updateFields\b[^>]*\/>/, '<w:updateFields w:val="true"/>')
+        : settingsXml.replace('</w:settings>', '<w:updateFields w:val="true"/></w:settings>');
+      return makeZipEntry(entry.name, nextSettings, entry);
+    }
+    return entry;
+  });
+  return writeZip(updatedEntries);
+}
+
+function docxFileName(request) {
+  const raw = `${request.name || 'api-document'} ${request.documentation?.version || '1.0.0'}`.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
+  return `${raw || 'api-document'}.docx`;
+}
+
+function createExecutionFromError(request, resolved, environment, context, error, businessJustification, scriptResults = []) {
+  const category = error.category || 'INTERNAL_EXECUTION_ERROR';
+  return createBlockedExecution(request, resolved.snapshot, environment, context.userId, category, error.message || 'Execution failed.', businessJustification, scriptResults);
+}
+
+async function executeRequest(requestId, context, options = {}) {
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecute)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to execute API requests.', 403);
+  }
+  const request = store.requests.find(item => item.id === requestId);
+  if (!request) throw new ApiConsoleError('INVALID_URL', 'Request not found.', 404);
+  if (request.classification.type === 'CORE_COMMAND' && !roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteCommand)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Core Command execution requires elevated permission.', 403);
+  }
+
+  const environment = findEnvironment(options.environmentId || request.environmentId);
+  const executionRequest = safeClone({
+    ...request,
+    scripts: { ...createDefaultScripts(), ...(request.scripts || {}) },
+    executionMode: options.executionMode || request.executionMode,
+  });
+  const preScript = runPreRequestScript(executionRequest, executionRequest.scripts, options.executionVariables);
+  const resolved = resolveRequest(
+    preScript.request,
+    environment,
+    options.executionMode || request.executionMode,
+    preScript.variables
+  );
+  if (preScript.results.some(result => result.result === 'FAILED')) {
+    const execution = createBlockedExecution(request, resolved.snapshot, environment, context.userId, 'CORE_VALIDATION_ERROR', 'Pre-request script failed.', options.businessJustification, preScript.results);
+    store.executions.unshift(execution);
+    audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: 'CORE_VALIDATION_ERROR', reason: 'PRE_REQUEST_SCRIPT' });
+    saveStore(store);
+    return safeClone(execution);
+  }
+  if (resolved.errors.length) {
+    const first = resolved.errors[0];
+    const execution = createBlockedExecution(request, resolved.snapshot, environment, context.userId, first.category, resolved.errors.map(item => item.message).join(' '), options.businessJustification, preScript.results);
+    store.executions.unshift(execution);
+    audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: first.category });
+    saveStore(store);
+    return safeClone(execution);
+  }
+
+  const productionPolicy = validateProductionPolicy(request, environment, context, options);
+  if (!productionPolicy.allowed) {
+    const execution = createBlockedExecution(request, resolved.snapshot, environment, context.userId, productionPolicy.category, productionPolicy.message, options.businessJustification, preScript.results);
+    store.executions.unshift(execution);
+    audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: productionPolicy.category });
+    saveStore(store);
+    return safeClone(execution);
+  }
+
+  const startedAt = nowIso();
+  try {
+    const response = await executeWithRedirects(resolved.transport);
+    const runner = selectRunner(environment, response.resolvedIpAddress);
+    const assertionResults = evaluateAssertions(request, response);
+    const postScriptResults = runPostResponseScript(executionRequest.scripts, response);
+    const scriptAssertionResults = postScriptResults.map(result => ({
+      assertionId: `script-${result.phase}-${result.line}`,
+      assertionType: 'SCRIPT_TEST',
+      result: result.result,
+      message: `line ${result.line}: ${result.message}`,
+    }));
+    const scriptResults = [...preScript.results, ...postScriptResults];
+    const businessResult = businessResultFromAssertions([...assertionResults, ...scriptAssertionResults]);
+    const execution = {
+      id: makeId('api-exec'),
+      requestId: request.id,
+      collectionId: request.collectionId,
+      environmentId: environment.id,
+      runnerId: runner.id,
+      executedBy: context.userId,
+      startedAt,
+      completedAt: nowIso(),
+      durationMs: response.durationMs,
+      status: 'COMPLETED',
+      statusCode: response.statusCode,
+      responseSize: response.responseSize,
+      responseContentType: response.contentType,
+      requestSnapshot: resolved.snapshot,
+      response,
+      tlsVerification: resolved.snapshot.tls.verifyCertificate,
+      transportResult: response.statusCode && response.statusCode < 400 ? 'SUCCESS' : 'FAILED',
+      businessResult,
+      assertionResults,
+      scriptResults,
+      correlationId: makeId('api-corr'),
+      errorCategory: response.statusCode && response.statusCode >= 400 ? 'HTTP_ERROR' : undefined,
+      sanitizedError: response.statusCode && response.statusCode >= 400 ? `HTTP ${response.statusCode} ${response.statusText}` : undefined,
+      environmentName: environment.name,
+      evidenceType: 'ACTUAL_EXECUTION',
+      businessJustification: options.businessJustification,
+    };
+    store.executions.unshift(execution);
+    logUsageEvent('API_EXECUTED', context, request, {
+      environmentId: environment.id,
+      correlationId: execution.correlationId,
+      referenceId: request.referenceId,
+    });
+    audit('API_REQUEST_EXECUTED', context, { requestId, statusCode: execution.statusCode, runnerId: runner.id });
+    saveStore(store);
+    return safeClone(execution);
+  } catch (error) {
+    const execution = createExecutionFromError(request, resolved, environment, context, error, options.businessJustification, preScript.results);
+    store.executions.unshift(execution);
+    audit('API_REQUEST_EXECUTION_FAILED', context, { requestId, category: execution.errorCategory });
+    saveStore(store);
+    return safeClone(execution);
+  }
+}
+
+function contextFromRequest(req, body) {
+  if (req.utmsContext) return req.utmsContext;
+  if (req.consoleContext) return req.consoleContext;
+  if (!LEGACY_CONTEXT_ENABLED) return null;
+  if (body?.context) return body.context;
+  const encoded = req.headers['x-api-console-context'] || req.headers['x-utms-context'];
+  if (!encoded) return null;
+  try {
+    return JSON.parse(Buffer.from(String(encoded), 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function requireContext(req, body) {
+  const context = contextFromRequest(req, body);
+  if (!context?.userId || !context?.role) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'ActiveContext is required.', 401);
+  }
+  if (trackDirectoryContext(context)) saveStore(store);
+  return context;
+}
+
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(statusCode, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+  });
+  res.end(body);
+}
+
+function sendError(res, error) {
+  const statusCode = error.statusCode || 500;
+  const details = error.details && typeof error.details === 'object'
+    ? JSON.parse(JSON.stringify(error.details, (key, value) => {
+      if (/password|cookie|token|secret/i.test(key)) return '[REDACTED]';
+      return typeof value === 'string' ? sanitizeText(value) : value;
+    }))
+    : undefined;
+  sendJson(res, statusCode, {
+    error: {
+      category: error.category || 'INTERNAL_EXECUTION_ERROR',
+      message: sanitizeText(error.message || 'Internal API Console error.'),
+      ...(details ? { details } : {}),
+    },
+  });
+}
+
+async function readJsonBody(req, maxBytes = LIMITS.requestBodyBytes) {
+  if (req.method === 'GET' || req.method === 'HEAD') return {};
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      throw new ApiConsoleError('REQUEST_TOO_LARGE', `Request body exceeded ${maxBytes} bytes.`, 413);
+    }
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (!text.trim()) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ApiConsoleError('CURL_PARSE_ERROR', 'Invalid JSON request body.');
+  }
+}
+
+function getPathParts(pathname) {
+  if (pathname.startsWith('/api/reports')) {
+    return pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean);
+  }
+  return pathname.replace(/^\/api\/api-console\/?/, '').split('/').filter(Boolean);
+}
+
+function upsertRequestWithPatch(existing, data, context) {
+  const merged = {
+    ...existing,
+    ...data,
+    id: existing.id,
+    version: (existing.version || 1) + 1,
+    updatedBy: context.userId,
+    updatedAt: nowIso(),
+  };
+  merged.documentation = refreshDocumentationMetadata(merged);
+  return protectRequestSecrets(merged);
+}
+
+function consumerCandidates(context) {
+  const scope = context.scopeApplicationIds?.length ? context.scopeApplicationIds : [context.applicationId];
+  const developerUserIds = new Set(store.directoryRoleAssignments
+    .filter(assignment =>
+      assignment.role === 'DEVELOPER' &&
+      assignment.isActive !== false &&
+      (assignment.applicationId === 'ALL' || scope.includes(assignment.applicationId))
+    )
+    .map(assignment => assignment.userId));
+  const users = store.directoryUsers
+    .filter(user => user.isActive !== false && developerUserIds.has(user.id))
+    .map(user => ({
+      id: `USER:${user.id}`,
+      consumerType: 'USER',
+      userId: user.id,
+      label: user.fullName || user.id,
+      description: [user.phoneNumber, user.source === 'CDE' ? 'کاربر CDE' : ''].filter(Boolean).join(' — ') || user.id,
+    }));
+  const roles = USER_ROLES.map(role => ({
+    id: `ROLE:${role}`,
+    consumerType: 'ROLE',
+    roleKey: role,
+    applicationId: scope[0] || context.applicationId,
+    label: ROLE_LABELS[role] || role,
+    description: `همه کاربران دارای نقش ${ROLE_LABELS[role] || role}`,
+  }));
+  return [...users, ...roles];
+}
+
+function filterUsageEvents(context, parsedUrl) {
+  if (!roleAllowed(context.role, ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'])) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'API usage report requires System Admin, Tech Lead or QA Lead role.', 403);
+  }
+  const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
+  const filters = {
+    page: Number(parsedUrl.searchParams.get('page') || 1),
+    limit: Number(parsedUrl.searchParams.get('limit') || 30),
+    apiId: parsedUrl.searchParams.get('apiId') || '',
+    version: parsedUrl.searchParams.get('version') || '',
+    userId: parsedUrl.searchParams.get('userId') || '',
+    role: parsedUrl.searchParams.get('role') || '',
+    eventType: parsedUrl.searchParams.get('eventType') || '',
+    dateFrom: parsedUrl.searchParams.get('dateFrom') || '',
+    dateTo: parsedUrl.searchParams.get('dateTo') || '',
+  };
+  let rows = store.usageEvents.filter(event => matchesApplicationScope(event.applicationId, scope));
+  if (filters.apiId) rows = rows.filter(event => event.apiId === filters.apiId);
+  if (filters.version) rows = rows.filter(event => event.version === filters.version);
+  if (filters.userId) rows = rows.filter(event => event.userId === filters.userId);
+  if (filters.role) rows = rows.filter(event => event.activeRole === filters.role);
+  if (filters.eventType) rows = rows.filter(event => event.eventType === filters.eventType);
+  if (filters.dateFrom) rows = rows.filter(event => new Date(event.eventAt) >= new Date(filters.dateFrom));
+  if (filters.dateTo) rows = rows.filter(event => new Date(event.eventAt) <= new Date(`${filters.dateTo}T23:59:59`));
+  rows = rows.sort((a, b) => b.eventAt.localeCompare(a.eventAt));
+  const byType = {};
+  rows.forEach(row => {
+    byType[row.eventType] = (byType[row.eventType] || 0) + 1;
+  });
+  const uniqueApis = new Set(rows.map(row => row.apiId)).size;
+  const uniqueUsers = new Set(rows.map(row => row.userId)).size;
+  return {
+    summary: {
+      total: rows.length,
+      uniqueApis,
+      uniqueUsers,
+      byType,
+    },
+    ...paginate(rows, filters.page, filters.limit),
+  };
+}
+
+async function routeRequest(req, parsedUrl, body) {
+  const parts = getPathParts(parsedUrl.pathname);
+  const [first, second, third, fourth, fifth] = parts;
+
+  if (!parts.length || first === 'health') {
+    return { ok: true, service: 'api-console', parserVersion: PARSER_VERSION, now: nowIso() };
+  }
+
+  if (first === '__test' && second === 'reset' && req.method === 'POST') {
+    if (process.env.NODE_ENV !== 'test') {
+      throw new ApiConsoleError('INVALID_URL', 'Endpoint not found.', 404);
+    }
+    store = normalizeStoreShape(defaultStore());
+    runtimeSecrets.clear();
+    [SECRET_VAULT_FILE, SECRET_KEY_FILE].forEach(file => {
+      if (fs.existsSync(file)) fs.rmSync(file, { force: true });
+    });
+    cachedSecretKey = null;
+    saveStore(store);
+    return { reset: true, storeVersion: store.version };
+  }
+
+  if (first === 'policy' && req.method === 'GET') return API_CONSOLE_POLICY;
+
+  if (first === 'admin' && second === 'users') {
+    const context = requireContext(req, body);
+    assertSystemAdministrator(context);
+    if (!third && req.method === 'GET') {
+      return safeClone(store.directoryUsers
+        .filter(user => user.isActive !== false)
+        .map(directoryUserView)
+        .sort((left, right) => Number(right.isSystemAdmin) - Number(left.isSystemAdmin) ||
+          String(left.fullName || left.id).localeCompare(String(right.fullName || right.id), 'fa')));
+    }
+    if (third && fourth === 'system-admin' && req.method === 'PUT') {
+      return safeClone(setManagedSystemAdministrator(decodeURIComponent(third), body.enabled === true, context));
+    }
+    throw new ApiConsoleError('INVALID_URL', 'User management endpoint not found.', 404);
+  }
+
+  if (first === 'documentation' && second === 'authentication-profiles' && req.method === 'GET') {
+    return safeClone(AUTHENTICATION_DOCUMENTATION_PROFILES);
+  }
+
+  if (first === 'environments' && req.method === 'GET') return safeClone(store.environments);
+  if (first === 'runners' && req.method === 'GET') return safeClone(store.runners);
+
+  if (first === 'self-check' && req.method === 'GET') return runSelfCheck();
+
+  if (first === 'validate-core' && req.method === 'POST') {
+    if (!body.request) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Request payload is required.');
+    return validateCoreRequest(body.request);
+  }
+
+  if (first === 'consumer-candidates' && req.method === 'GET') {
+    const context = requireContext(req, body);
+    return safeClone(consumerCandidates(context));
+  }
+
+  if (first === 'reports' && second === 'api-usage' && req.method === 'GET') {
+    const context = requireContext(req, body);
+    return safeClone(filterUsageEvents(context, parsedUrl));
+  }
+
+  if (first === 'share-reviews') {
+    const context = requireContext(req, body);
+    assertSystemAdministrator(context);
+    if (!second && req.method === 'GET') {
+      const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
+      const filters = {
+        page: Number(parsedUrl.searchParams.get('page') || 1),
+        limit: Number(parsedUrl.searchParams.get('limit') || 30),
+        search: parsedUrl.searchParams.get('search') || '',
+        status: parsedUrl.searchParams.get('status') || '',
+        submittedBy: parsedUrl.searchParams.get('submittedBy') || '',
+        version: parsedUrl.searchParams.get('version') || '',
+      };
+      let rows = store.shareRequests.filter(share =>
+        matchesApplicationScope(share.applicationId, scope) &&
+        matchesApplicationScope(share.applicationId, context.scopeApplicationIds || context.applicationId)
+      );
+      if (filters.status) rows = rows.filter(share => share.status === filters.status);
+      if (filters.submittedBy) rows = rows.filter(share => share.submittedBy === filters.submittedBy);
+      if (filters.version) rows = rows.filter(share => share.version === filters.version);
+      if (filters.search.trim()) {
+        const search = filters.search.toLowerCase();
+        rows = rows.filter(share => [share.apiTitle, share.apiId, share.version, share.applicationId, share.submittedByName]
+          .filter(Boolean)
+          .some(value => String(value).toLowerCase().includes(search)));
+      }
+      rows = rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      return safeClone(paginate(rows, filters.page, filters.limit));
+    }
+
+    const share = store.shareRequests.find(item => item.id === second);
+    if (!share) throw new ApiConsoleError('INVALID_URL', 'Share review request not found.', 404);
+    if (!matchesApplicationScope(share.applicationId, context.scopeApplicationIds || context.applicationId)) {
+      throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Share request is outside active application scope.', 403);
+    }
+    const sourceRequest = store.requests.find(request => request.id === share.requestId);
+
+    if (!third && req.method === 'GET') {
+      return safeClone({
+        ...share,
+        request: sourceRequest,
+        consumers: consumersForVersion(share.apiId, share.version),
+      });
+    }
+
+    if (third === 'approve' && req.method === 'POST') {
+      if (share.status !== 'PENDING_REVIEW') {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این درخواست قبلاً بررسی شده است.', 409);
+      }
+      if (body.rowVersion && body.rowVersion !== share.rowVersion) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این درخواست قبلاً توسط کاربر دیگری تغییر کرده است.', 409);
+      }
+      if (!sourceRequest) throw new ApiConsoleError('INVALID_URL', 'Source request not found.', 404);
+      const consumers = normalizeConsumers(body.consumers || body.data?.consumers || [], sourceRequest, context);
+      if (!consumers.length) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'انتخاب حداقل یک مصرف‌کننده الزامی است.');
+      }
+      const revision = share.revisions.find(item => item.revisionNumber === share.currentRevisionNumber) || share.revisions[share.revisions.length - 1];
+      if (revision) {
+        revision.status = 'APPROVED';
+        revision.reviewedBy = context.userId;
+        revision.reviewedAt = nowIso();
+        revision.reviewAction = 'APPROVED';
+        revision.rowVersion = makeId('row');
+      }
+      store.consumers = store.consumers.filter(consumer => !(consumer.apiId === share.apiId && consumer.version === share.version));
+      store.consumers.unshift(...consumers);
+      share.status = 'APPROVED';
+      share.reviewedBy = context.userId;
+      share.reviewedAt = nowIso();
+      share.rowVersion = makeId('row');
+      share.updatedAt = nowIso();
+      sourceRequest.sharingStatus = 'APPROVED';
+      sourceRequest.approvedAt = nowIso();
+      sourceRequest.approvedBy = context.userId;
+      sourceRequest.shareRequestId = share.id;
+      sourceRequest.updatedAt = nowIso();
+      const correlationId = makeId('api-corr');
+      notifyUser(sourceRequest.createdBy, 'API تأیید شد', `${sourceRequest.name} نسخه ${share.version} در Repository منتشر شد.`, 'API_REQUEST', sourceRequest.id, correlationId);
+      consumers.filter(consumer => consumer.consumerType === 'USER').forEach(consumer => {
+        store.readReceipts.unshift({
+          id: makeId('read'),
+          userId: consumer.userId,
+          apiId: share.apiId,
+          version: share.version,
+          notifiedAt: nowIso(),
+        });
+        notifyUser(consumer.userId, 'نسخه جدید API منتشر شد', `${sourceRequest.name} نسخه ${share.version} برای شما قابل استفاده است.`, 'API_REQUEST', sourceRequest.id, correlationId);
+      });
+      audit('API_SHARE_APPROVED', context, { shareRequestId: share.id, apiId: share.apiId, version: share.version, consumers });
+      saveStore(store);
+      return safeClone({ ...share, consumers });
+    }
+
+    if (third === 'return' && req.method === 'POST') {
+      const reason = String(body.reason || body.data?.reason || '').trim();
+      if (!reason) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'دلیل بازگردانی الزامی است.');
+      if (share.status !== 'PENDING_REVIEW') {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این درخواست قبلاً بررسی شده است.', 409);
+      }
+      if (body.rowVersion && body.rowVersion !== share.rowVersion) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این درخواست قبلاً توسط کاربر دیگری تغییر کرده است.', 409);
+      }
+      const revision = share.revisions.find(item => item.revisionNumber === share.currentRevisionNumber) || share.revisions[share.revisions.length - 1];
+      if (revision) {
+        revision.status = 'RETURNED';
+        revision.reviewedBy = context.userId;
+        revision.reviewedAt = nowIso();
+        revision.reviewAction = 'RETURNED';
+        revision.returnReason = reason;
+        revision.rowVersion = makeId('row');
+      }
+      share.status = 'RETURNED';
+      share.returnReason = reason;
+      share.reviewedBy = context.userId;
+      share.reviewedAt = nowIso();
+      share.rowVersion = makeId('row');
+      share.updatedAt = nowIso();
+      if (sourceRequest) {
+        sourceRequest.sharingStatus = 'RETURNED';
+        sourceRequest.latestReturnReason = reason;
+        sourceRequest.updatedAt = nowIso();
+      }
+      notifyUser(share.submittedBy, 'درخواست اشتراک API بازگردانده شد', reason, 'API_REQUEST', share.requestId, makeId('api-corr'));
+      audit('API_SHARE_RETURNED', context, { shareRequestId: share.id, apiId: share.apiId, version: share.version, reason });
+      saveStore(store);
+      return safeClone(share);
+    }
+  }
+
+  if (first === 'repository') {
+    const context = requireContext(req, body);
+    if (req.method === 'GET' && !second) {
+      const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
+      const search = (parsedUrl.searchParams.get('search') || '').toLowerCase();
+      let rows = store.requests
+        .filter(request =>
+          request.sourceType !== 'REFERENCE' &&
+          request.sharingStatus === 'APPROVED' &&
+          request.status !== 'ARCHIVED' &&
+          matchesApplicationScope(request.applicationId, scope) &&
+          canAccessRepositoryRequest(request, context)
+        )
+        .map(request => repositoryItemFromRequest(request, context));
+      if (search) {
+        rows = rows.filter(item => [item.title, item.description, item.apiId, item.version, item.classification?.serviceId, item.classification?.operationPath]
+          .filter(Boolean)
+          .some(value => String(value).toLowerCase().includes(search)));
+      }
+      rows = rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      return safeClone(paginate(rows, Number(parsedUrl.searchParams.get('page') || 1), Number(parsedUrl.searchParams.get('limit') || 30)));
+    }
+
+    const apiId = decodeURIComponent(second || '');
+    if (apiId && third === 'versions' && req.method === 'GET' && !fourth) {
+      const rows = store.requests
+        .filter(request =>
+          request.apiId === apiId &&
+          request.sourceType !== 'REFERENCE' &&
+          request.sharingStatus === 'APPROVED' &&
+          request.status !== 'ARCHIVED' &&
+          canAccessRepositoryRequest(request, context)
+        )
+        .sort((a, b) => compareSemVer(semanticVersionOf(b), semanticVersionOf(a)))
+        .map(request => repositoryItemFromRequest(request, context));
+      return safeClone(rows);
+    }
+
+    if (apiId && third === 'versions' && fourth) {
+      const version = decodeURIComponent(fourth);
+      const sourceRequest = store.requests.find(request =>
+        request.apiId === apiId &&
+        semanticVersionOf(request) === version &&
+        request.sourceType !== 'REFERENCE' &&
+        request.sharingStatus === 'APPROVED' &&
+        request.status !== 'ARCHIVED'
+      );
+      if (!sourceRequest || !canAccessRepositoryRequest(sourceRequest, context)) {
+        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'شما مجوز استفاده از این API را ندارید.', 403);
+      }
+      if (!fifth && req.method === 'GET') {
+        return safeClone({
+          ...repositoryItemFromRequest(sourceRequest, context),
+          request: sourceRequest,
+          shareRequest: store.shareRequests.find(share => share.id === sourceRequest.shareRequestId),
+          executions: store.executions.filter(execution => execution.requestId === sourceRequest.id).slice(0, 5),
+          manualResponses: store.manualExamples.filter(example => example.requestId === sourceRequest.id),
+        });
+      }
+      if (fifth === 'add-to-console' && req.method === 'POST') {
+        const existing = store.references.find(reference =>
+          reference.createdBy === context.userId &&
+          reference.apiId === apiId &&
+          reference.version === version &&
+          reference.status === 'ACTIVE'
+        );
+        if (existing) {
+          throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این نسخه از API قبلاً به Online API Console شما اضافه شده است.', 409);
+        }
+        const requestedCollectionId = body.collectionId || body.data?.collectionId;
+        let collection = requestedCollectionId ? store.collections.find(item => item.id === requestedCollectionId && belongsToUser(item, context)) : null;
+        if (!collection) {
+          collection = store.collections.find(item => item.ownerId === context.userId && item.applicationId === sourceRequest.applicationId && item.status === 'ACTIVE');
+        }
+        if (!collection) {
+          collection = {
+            id: makeId('api-col'),
+            applicationId: sourceRequest.applicationId,
+            workspaceName: 'UTMS API Workspace',
+            name: 'Repository References',
+            ownerId: context.userId,
+            status: 'ACTIVE',
+            variables: [],
+            createdAt: nowIso(),
+            updatedAt: nowIso(),
+          };
+          store.collections.unshift(collection);
+        }
+        const reference = {
+          id: makeId('api-ref'),
+          apiId,
+          version,
+          sourceRequestId: sourceRequest.id,
+          requestId: undefined,
+          collectionId: collection.id,
+          applicationId: sourceRequest.applicationId,
+          createdBy: context.userId,
+          createdAt: nowIso(),
+          status: 'ACTIVE',
+        };
+        const referenceRequest = safeClone(sourceRequest);
+        referenceRequest.id = makeId('api-req');
+        referenceRequest.collectionId = collection.id;
+        referenceRequest.createdBy = context.userId;
+        referenceRequest.createdAt = nowIso();
+        referenceRequest.updatedBy = context.userId;
+        referenceRequest.updatedAt = nowIso();
+        referenceRequest.sourceType = 'REFERENCE';
+        referenceRequest.sourceRequestId = sourceRequest.id;
+        referenceRequest.referenceId = reference.id;
+        referenceRequest.status = 'ACTIVE';
+        referenceRequest.sharingStatus = 'APPROVED';
+        referenceRequest.name = `${sourceRequest.name} (${version})`;
+        reference.requestId = referenceRequest.id;
+        store.references.unshift(reference);
+        store.requests.unshift(referenceRequest);
+        logUsageEvent('ADDED_TO_CONSOLE', context, referenceRequest, { referenceId: reference.id });
+        audit('API_REFERENCE_ADDED', context, { referenceId: reference.id, apiId, version, sourceRequestId: sourceRequest.id });
+        saveStore(store);
+        return safeClone({ reference, request: referenceRequest });
+      }
+      if (fifth === 'mark-viewed' && req.method === 'POST') {
+        let receipt = readReceiptFor(context, apiId, version);
+        if (!receipt) {
+          receipt = { id: makeId('read'), userId: context.userId, apiId, version, notifiedAt: nowIso() };
+          store.readReceipts.unshift(receipt);
+        }
+        receipt.viewedAt = nowIso();
+        logUsageEvent('NEW_VERSION_VIEWED', context, sourceRequest);
+        audit('API_NEW_VERSION_VIEWED', context, { apiId, version });
+        saveStore(store);
+        return safeClone(receipt);
+      }
+    }
+  }
+
+  if (first === 'references') {
+    const context = requireContext(req, body);
+    if (!second && req.method === 'GET') {
+      const rows = store.references
+        .filter(reference => reference.createdBy === context.userId && reference.status === 'ACTIVE')
+        .map(reference => ({
+          ...reference,
+          request: store.requests.find(request => request.id === reference.requestId),
+          sourceRequest: store.requests.find(request => request.id === reference.sourceRequestId),
+        }));
+      return safeClone(rows);
+    }
+    if (second && req.method === 'DELETE') {
+      const reference = store.references.find(item => item.id === second);
+      if (!reference || reference.createdBy !== context.userId) {
+        throw new ApiConsoleError('INVALID_URL', 'Reference not found.', 404);
+      }
+      reference.status = 'REMOVED';
+      reference.removedAt = nowIso();
+      const request = store.requests.find(item => item.id === reference.requestId);
+      if (request) {
+        request.status = 'ARCHIVED';
+        request.updatedBy = context.userId;
+        request.updatedAt = nowIso();
+      }
+      logUsageEvent('REMOVED_FROM_CONSOLE', context, request || { ...reference, name: reference.apiId, apiId: reference.apiId, semanticVersion: reference.version }, { referenceId: reference.id });
+      audit('API_REFERENCE_REMOVED', context, { referenceId: reference.id, apiId: reference.apiId, version: reference.version });
+      saveStore(store);
+      return safeClone(reference);
+    }
+  }
+
+  if (first === 'shared-apis' && second && third === 'versions' && fourth && fifth === 'consumers' && req.method === 'PUT') {
+    const context = requireContext(req, body);
+    const apiId = decodeURIComponent(second);
+    const version = decodeURIComponent(fourth);
+    const sourceRequest = store.requests.find(request =>
+      request.apiId === apiId &&
+      semanticVersionOf(request) === version &&
+      request.sourceType !== 'REFERENCE' &&
+      request.sharingStatus === 'APPROVED'
+    );
+    if (!sourceRequest) throw new ApiConsoleError('INVALID_URL', 'Shared API version not found.', 404);
+    if (context.role !== 'SYSTEM_ADMIN') {
+      throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to update API consumers.', 403);
+    }
+    const consumers = normalizeConsumers(body.consumers || body.data?.consumers || [], sourceRequest, context);
+    if (!consumers.length) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'انتخاب حداقل یک مصرف‌کننده الزامی است.');
+    store.consumers = store.consumers.filter(consumer => !(consumer.apiId === apiId && consumer.version === version));
+    store.consumers.unshift(...consumers);
+    audit('API_CONSUMERS_UPDATED', context, { apiId, version, consumers });
+    saveStore(store);
+    return safeClone(consumers);
+  }
+
+  if (first === 'collections') {
+    if (second && third === 'export-postman' && req.method === 'GET') {
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canView)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to export API collections.', 403);
+      const collection = store.collections.find(item => item.id === second && item.status === 'ACTIVE');
+      if (!collection || !belongsToUser(collection, context)) {
+        throw new ApiConsoleError('INVALID_URL', 'Collection not found.', 404);
+      }
+      assertApplicationInContext(collection.applicationId, context);
+      const rows = store.requests
+        .filter(request =>
+          request.collectionId === collection.id &&
+          request.status !== 'ARCHIVED' &&
+          belongsToUser(request, context)
+        )
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const result = buildPostmanCollectionExport(collection, rows);
+      audit('API_COLLECTION_EXPORTED_POSTMAN', context, { collectionId: collection.id, requestCount: rows.length });
+      saveStore(store);
+      return safeClone(result);
+    }
+    if (req.method === 'GET' && !second) {
+      const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canView)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to view API collections.', 403);
+      return safeClone(store.collections.filter(collection =>
+        collection.status === 'ACTIVE' &&
+        matchesApplicationScope(collection.applicationId, scope) &&
+        contextApplicationIds(context).includes(collection.applicationId) &&
+        belongsToUser(collection, context)
+      ));
+    }
+    if (req.method === 'POST') {
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canCreate)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to create API collections.', 403);
+      const data = body.data || body;
+      const applicationId = assertApplicationInContext(data.applicationId, context);
+      const collection = {
+        id: makeId('api-col'),
+        applicationId,
+        workspaceName: data.workspaceName || 'UTMS API Workspace',
+        name: data.name || 'New Collection',
+        description: data.description,
+        ownerId: context.userId,
+        status: 'ACTIVE',
+        variables: data.variables || [],
+        authenticationDocumentationProfileId: data.authenticationDocumentationProfileId,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+      store.collections.unshift(collection);
+      audit('API_COLLECTION_CREATED', context, { collectionId: collection.id });
+      saveStore(store);
+      return safeClone(collection);
+    }
+  }
+
+  if (first === 'curl' && second === 'parse' && req.method === 'POST') {
+    const context = contextFromRequest(req, body) || { userId: body.userId || 'anonymous', role: 'UNKNOWN' };
+    const preview = parseCurlInternal(body.curlText || body.originalCurl || '');
+    store.importedCurls.unshift({
+      id: preview.id,
+      requestId: undefined,
+      originalTextReference: `server://api-console/imported-curl/${preview.id}`,
+      sanitizedPreview: sanitizeText(preview.originalCurl),
+      detectedDialect: preview.detectedDialect,
+      parserVersion: preview.parserVersion,
+      importedBy: context.userId,
+      importedAt: preview.importedAt,
+    });
+    audit('API_CURL_IMPORTED', context, { importedCurlId: preview.id, detectedDialect: preview.detectedDialect });
+    saveStore(store);
+    return safeClone(preview);
+  }
+
+  if (first === 'requests' && !second) {
+    if (req.method === 'GET') {
+      const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canView)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to view API requests.', 403);
+      const filters = {
+        page: Number(parsedUrl.searchParams.get('page') || 1),
+        limit: Number(parsedUrl.searchParams.get('limit') || 30),
+        search: parsedUrl.searchParams.get('search') || '',
+        collectionId: parsedUrl.searchParams.get('collectionId') || '',
+        classificationType: parsedUrl.searchParams.get('classificationType') || '',
+        status: parsedUrl.searchParams.get('status') || '',
+      };
+      let rows = store.requests.filter(request =>
+        matchesApplicationScope(request.applicationId, scope) &&
+        contextApplicationIds(context).includes(request.applicationId) &&
+        request.status !== 'ARCHIVED' &&
+        belongsToUser(request, context)
+      );
+      if (filters.collectionId) rows = rows.filter(request => request.collectionId === filters.collectionId);
+      if (filters.classificationType) rows = rows.filter(request => request.classification.type === filters.classificationType);
+      if (filters.status) rows = rows.filter(request => request.status === filters.status);
+      if (filters.search.trim()) {
+        const search = filters.search.toLowerCase();
+        rows = rows.filter(request =>
+          [request.name, request.description, request.urlTemplate, request.classification.serviceId, request.classification.operationPath]
+            .filter(Boolean)
+            .some(value => String(value).toLowerCase().includes(search))
+        );
+      }
+      rows = rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      return safeClone(paginate(rows, filters.page, filters.limit));
+    }
+    if (req.method === 'POST') {
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canCreate)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to create API requests.', 403);
+      const data = body.data || body;
+      const collection = store.collections.find(item => item.id === data.collectionId);
+      if (!collection || !belongsToUser(collection, context)) {
+        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Target API collection does not belong to the active user.', 403);
+      }
+      assertApplicationInContext(collection.applicationId, context);
+      if (data.applicationId && data.applicationId !== collection.applicationId) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'سامانه Request باید با سامانه Collection یکسان باشد.', 422);
+      }
+      const request = definitionFromNormalized(data.normalizedRequest || createBlankNormalizedRequest(), {
+        id: makeId('api-req'),
+        applicationId: collection.applicationId,
+        collectionId: data.collectionId,
+        environmentId: data.environmentId,
+        name: data.name || 'Untitled API Request',
+        description: data.description,
+        userId: context.userId,
+        userName: context.user?.fullName || context.userName,
+        originalImportedCurl: data.originalImportedCurl,
+        importedCurlId: data.importedCurlId,
+        authenticationDocumentationProfileId: data.authenticationDocumentationProfileId ||
+          collection.authenticationDocumentationProfileId ||
+          findEnvironment(data.environmentId)?.authenticationDocumentationProfileId,
+      });
+      store.requests.unshift(request);
+      store.importedCurls = store.importedCurls.map(record => record.id === data.importedCurlId ? { ...record, requestId: request.id } : record);
+      audit('API_REQUEST_CREATED', context, { requestId: request.id, classification: request.classification.type });
+      saveStore(store);
+      return safeClone(request);
+    }
+  }
+
+  if (first === 'requests' && second === 'blank' && req.method === 'POST') {
+    const context = requireContext(req, body);
+    const data = body.data || body;
+    return routeRequest(req, new URL('/api/api-console/requests', 'http://localhost'), {
+      ...body,
+      data: {
+        name: 'Untitled API Request',
+        collectionId: data.collectionId,
+        applicationId: data.applicationId,
+        environmentId: data.environmentId,
+        normalizedRequest: createBlankNormalizedRequest(),
+      },
+      context,
+    });
+  }
+
+  if (first === 'requests' && second) {
+    const request = store.requests.find(item => item.id === second);
+    if (!request) throw new ApiConsoleError('INVALID_URL', 'Request not found.', 404);
+    const viewContext = requireContext(req, body);
+    if (!roleAllowed(viewContext.role, API_CONSOLE_POLICY.canView)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to view API requests.', 403);
+    if (!belongsToUser(request, viewContext)) {
+      throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Request does not belong to the active user.', 403);
+    }
+    assertApplicationInContext(request.applicationId, viewContext);
+
+    if (!third && req.method === 'GET') {
+      logUsageEvent('API_OPENED', viewContext, request, { referenceId: request.referenceId });
+      saveStore(store);
+      return safeClone(request);
+    }
+    if (!third && req.method === 'PUT') {
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canEdit)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to edit API requests.', 403);
+      const patch = body.data || body;
+      if (patch.collectionId) {
+        const collection = store.collections.find(item => item.id === patch.collectionId);
+        if (!collection || !belongsToUser(collection, context)) {
+          throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Target API collection does not belong to the active user.', 403);
+        }
+        assertApplicationInContext(collection.applicationId, context);
+        if (collection.applicationId !== request.applicationId) {
+          throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'انتقال Request بین سامانه‌ها مجاز نیست.', 422);
+        }
+      }
+      if (patch.applicationId && patch.applicationId !== request.applicationId) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'سامانه Request پس از ایجاد قابل تغییر نیست.', 422);
+      }
+      const index = store.requests.findIndex(item => item.id === second);
+      store.requests[index] = upsertRequestWithPatch(request, patch, context);
+      audit('API_REQUEST_EDITED', context, { requestId: second });
+      saveStore(store);
+      return safeClone(store.requests[index]);
+    }
+    if (!third && req.method === 'DELETE') {
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canDelete)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to archive API requests.', 403);
+      request.status = 'ARCHIVED';
+      request.updatedBy = context.userId;
+      request.updatedAt = nowIso();
+      audit('API_REQUEST_ARCHIVED', context, { requestId: second });
+      saveStore(store);
+      return safeClone(request);
+    }
+    if (third === 'share' && req.method === 'POST') {
+      const context = requireContext(req, body);
+      if (request.sourceType === 'REFERENCE') {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Reference دریافتی از Repository قابل اشتراک‌گذاری مجدد نیست.');
+      }
+      if (request.createdBy !== context.userId && context.role !== 'SYSTEM_ADMIN') {
+        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'فقط مالک API می‌تواند درخواست اشتراک ارسال کند.', 403);
+      }
+      if (request.sharingStatus === 'PENDING_REVIEW') {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'ارسال دوباره در وضعیت PENDING_REVIEW مجاز نیست.', 409);
+      }
+      const data = body.data || body;
+      const purpose = String(data.purpose || '').trim();
+      const introduction = String(data.introduction || '').trim();
+      const description = String(data.description || '').trim();
+      if (!purpose || !introduction || !description) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'هدف، مقدمه و توضیحات برای اشتراک API الزامی هستند.');
+      }
+      if (description.length > 700) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'توضیحات اشتراک API نمی‌تواند بیشتر از ۷۰۰ کاراکتر باشد.');
+      }
+      let share = store.shareRequests.find(item => item.requestId === request.id && item.status === 'RETURNED');
+      if (!share) {
+        share = {
+          id: makeId('api-share'),
+          requestId: request.id,
+          apiId: request.apiId,
+          apiTitle: request.name,
+          applicationId: request.applicationId,
+          version: semanticVersionOf(request),
+          submittedBy: context.userId,
+          submittedByName: context.user?.fullName || context.userId,
+          status: 'DRAFT',
+          currentRevisionNumber: 0,
+          revisions: [],
+          rowVersion: makeId('row'),
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        };
+        store.shareRequests.unshift(share);
+      }
+      const revisionNumber = (share.revisions || []).length + 1;
+      const revision = {
+        id: makeId('api-share-rev'),
+        shareRequestId: share.id,
+        revisionNumber,
+        purpose: sanitizeText(purpose),
+        introduction: sanitizeText(introduction),
+        description: sanitizeText(description),
+        snapshot: buildShareSnapshot(request, context),
+        submittedBy: context.userId,
+        submittedAt: nowIso(),
+        status: 'PENDING_REVIEW',
+        documentationReference: `server://api-console/share/${share.id}/revision/${revisionNumber}`,
+        rowVersion: makeId('row'),
+      };
+      share.apiTitle = request.name;
+      share.version = semanticVersionOf(request);
+      share.status = 'PENDING_REVIEW';
+      share.currentRevisionNumber = revisionNumber;
+      share.purpose = revision.purpose;
+      share.introduction = revision.introduction;
+      share.description = revision.description;
+      share.returnReason = undefined;
+      share.rowVersion = makeId('row');
+      share.updatedAt = nowIso();
+      share.revisions = [...(share.revisions || []), revision];
+      request.sharingStatus = 'PENDING_REVIEW';
+      request.shareRequestId = share.id;
+      request.latestReturnReason = undefined;
+      request.updatedAt = nowIso();
+      audit(revisionNumber > 1 ? 'API_SHARE_RESUBMITTED' : 'API_SHARE_SUBMITTED', context, {
+        shareRequestId: share.id,
+        requestId: request.id,
+        apiId: request.apiId,
+        version: semanticVersionOf(request),
+        revisionNumber,
+      });
+      saveStore(store);
+      return safeClone(share);
+    }
+    if (third === 'versions' && req.method === 'POST') {
+      const context = requireContext(req, body);
+      if (request.sourceType === 'REFERENCE') {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'برای Reference دریافتی نمی‌توان Version جدید ساخت.');
+      }
+      if (request.createdBy !== context.userId && context.role !== 'SYSTEM_ADMIN') {
+        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'فقط مالک API می‌تواند Version جدید بسازد.', 403);
+      }
+      const data = body.data || body;
+      const nextVersion = String(data.version || '').trim();
+      const changeLog = String(data.changeLog || '').trim();
+      requireSemVerGreater(nextVersion, semanticVersionOf(request));
+      if (!changeLog) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Change Log برای Version جدید الزامی است.');
+      const duplicate = store.requests.some(item =>
+        item.apiId === request.apiId &&
+        semanticVersionOf(item) === nextVersion &&
+        item.sourceType !== 'REFERENCE' &&
+        item.status !== 'ARCHIVED'
+      );
+      if (duplicate) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این Version برای API قبلاً وجود دارد.', 409);
+      }
+      const next = safeClone(request);
+      next.id = makeId('api-req');
+      next.semanticVersion = nextVersion;
+      next.sharingStatus = 'DRAFT';
+      next.shareRequestId = undefined;
+      next.latestReturnReason = undefined;
+      next.approvedAt = undefined;
+      next.approvedBy = undefined;
+      next.sourceType = 'ORIGINAL';
+      next.referenceId = undefined;
+      next.sourceRequestId = undefined;
+      next.createdBy = context.userId;
+      next.createdAt = nowIso();
+      next.updatedBy = context.userId;
+      next.updatedAt = nowIso();
+      next.version = 1;
+      next.documentation = {
+        ...(next.documentation || {}),
+        version: nextVersion,
+        changeHistory: [
+          ...(next.documentation?.changeHistory || []),
+          { version: nextVersion, changedAt: nowIso(), summary: sanitizeText(changeLog) },
+        ],
+      };
+      store.requests.unshift(protectRequestSecrets(next));
+      audit('API_VERSION_CREATED', context, { requestId: next.id, apiId: next.apiId, version: nextVersion, changeLog });
+      saveStore(store);
+      return safeClone(next);
+    }
+    if (third === 'execute' && req.method === 'POST') {
+      const context = requireContext(req, body);
+      return executeRequest(second, context, body.options || body);
+    }
+    if (third === 'executions' && req.method === 'GET') {
+      return safeClone(store.executions.filter(execution => execution.requestId === second));
+    }
+    if (third === 'export-curl' && req.method === 'POST') {
+      const context = contextFromRequest(req, body);
+      const dialect = body.dialect || 'bash';
+      const exposeSecrets = !!body.exposeSecrets && context && roleAllowed(context.role, ['SYSTEM_ADMIN']);
+      return { value: exportRequestAsCurl(request, dialect, exposeSecrets) };
+    }
+    if (third === 'validate-core') {
+      return validateCoreRequest(request);
+    }
+    if (third === 'effective-request' && req.method === 'GET') {
+      const environment = findEnvironment(parsedUrl.searchParams.get('environmentId') || request.environmentId);
+      const executionMode = parsedUrl.searchParams.get('executionMode') || request.executionMode;
+      return safeClone(resolveRequest(request, environment, executionMode).snapshot);
+    }
+    if (third === 'manual-responses') {
+      if (req.method === 'GET') return safeClone(store.manualExamples.filter(example => example.requestId === second));
+      if (req.method === 'POST') {
+        const context = requireContext(req, body);
+        const data = body.data || body;
+        const headers = String(data.headersText || '')
+          .split(/\r?\n/)
+          .map(line => parseHeaderLine(line))
+          .filter(Boolean)
+          .map((header, index) => createHeader(header.name, header.value, index, 'USER'));
+        const example = {
+          id: makeId('manual-response'),
+          requestId: second,
+          statusCode: Number(data.statusCode || 200),
+          headers,
+          body: sanitizeText(data.body || ''),
+          claimedEnvironmentId: data.claimedEnvironmentId,
+          source: data.source,
+          reason: data.reason,
+          enteredBy: context.userId,
+          enteredAt: nowIso(),
+          reviewStatus: 'PENDING',
+        };
+        store.manualExamples.unshift(example);
+        audit('API_MANUAL_RESPONSE_ADDED', context, { requestId: second, manualResponseId: example.id });
+        saveStore(store);
+        return safeClone(example);
+      }
+    }
+    if (third === 'documentation' && fourth === 'refresh' && req.method === 'POST') {
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canEdit)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to edit API documentation.', 403);
+      request.documentation = refreshDocumentationMetadata(request, store.executions, store.manualExamples);
+      request.updatedBy = context.userId;
+      request.updatedAt = nowIso();
+      request.version = (request.version || 1) + 1;
+      audit('API_DOCUMENTATION_METADATA_REFRESHED', context, { requestId: second });
+      saveStore(store);
+      return safeClone(request);
+    }
+    if (third === 'documentation' && fourth === 'preview' && req.method === 'POST') {
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canGenerateDocumentation)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to generate documentation.', 403);
+      const result = generateDocumentationMarkdown(request, store.executions, store.manualExamples, context.user?.fullName || context.userId);
+      audit('API_DOCUMENTATION_PREVIEWED', context, { requestId: second });
+      saveStore(store);
+      return safeClone(result);
+    }
+    if (third === 'documentation' && fourth === 'final' && req.method === 'POST') {
+      const context = requireContext(req, body);
+      if (!roleAllowed(context.role, API_CONSOLE_POLICY.canGenerateDocumentation)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to generate documentation.', 403);
+      const result = generateDocumentationMarkdown(request, store.executions, store.manualExamples, context.user?.fullName || context.userId);
+      const docxBuffer = buildDocxFromTemplate(request, result, store.executions, store.manualExamples);
+      const finalResult = { ...result, approved: roleAllowed(context.role, ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD']) };
+      finalResult.wordDocumentBase64 = docxBuffer.toString('base64');
+      finalResult.wordFileName = docxFileName(request);
+      finalResult.wordMimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      store.documentationResults.unshift(finalResult);
+      audit('API_DOCUMENTATION_GENERATED', context, { requestId: second, approved: finalResult.approved });
+      saveStore(store);
+      return safeClone(finalResult);
+    }
+  }
+
+  if (first === 'executions' && second) {
+    const execution = store.executions.find(item => item.id === second);
+    if (!execution) throw new ApiConsoleError('INVALID_URL', 'Execution not found.', 404);
+    if (!third && req.method === 'GET') return safeClone(execution);
+    if (third === 'cancel' && req.method === 'POST') {
+      const context = requireContext(req, body);
+      if (!['PENDING', 'RUNNING'].includes(execution.status)) return safeClone(execution);
+      execution.status = 'CANCELLED';
+      execution.transportResult = 'CANCELLED';
+      execution.businessResult = 'NOT_EVALUATED';
+      execution.completedAt = nowIso();
+      execution.errorCategory = 'EXECUTION_CANCELLED';
+      execution.sanitizedError = `Execution cancelled by ${context.user?.fullName || context.userId}.`;
+      audit('API_REQUEST_EXECUTION_CANCELLED', context, { executionId: second });
+      saveStore(store);
+      return safeClone(execution);
+    }
+  }
+
+  throw new ApiConsoleError('INVALID_URL', 'API Console endpoint not found.', 404);
+}
+
+function createDocumentationAcceptanceFixture() {
+  const normalized = createBlankNormalizedRequest();
+  normalized.method = 'POST';
+  normalized.url = 'https://esb.medu.ir/TeacherUniversityFunds/GetTeacherUniversityFundData';
+  normalized.headers = [
+    createHeader('Content-Type', 'application/json', 0, 'USER'),
+    createHeader('token', 'gBLon4YS-real-secret-token-jpMQ==', 1, 'USER'),
+    createHeader('Content-Length', '1234', 2, 'IMPORTED_CURL'),
+  ];
+  normalized.body = {
+    type: 'json',
+    value: { nationalCode: '3651113262' },
+    raw: '{"nationalCode":"3651113262"}',
+    contentType: 'application/json',
+  };
+  const request = definitionFromNormalized(normalized, {
+    applicationId: 'app',
+    collectionId: 'col',
+    environmentId: 'env-test',
+    name: 'وب سرویس استعلام کسورات دانشجو معلم',
+    description: 'این سرویس جزئیات کسورات دانشجو معلم را استعلام می‌کند.',
+    userId: 'u',
+  });
+  const nationalCode = request.documentation.inputParameters.find(row => row.name === 'nationalCode');
+  nationalCode.required = true;
+  nationalCode.description = 'کدملی فرد مورد نظر';
+  const manualExamples = [{
+    id: 'manual-doc',
+    requestId: request.id,
+    statusCode: 200,
+    reviewStatus: 'APPROVED',
+    body: JSON.stringify({
+      EmployeeCode: '82123484',
+      WorkPlaceCode: 4911,
+      WorkPlaceTitle: 'زرآباد',
+      NetPayablePrice: '304156763',
+      DeductionsSumPrice: '13745265',
+    }),
+  }];
+  request.documentation = refreshDocumentationMetadata(request, [], manualExamples);
+  const descriptions = {
+    WorkPlaceCode: ['Integer', 'کد منطقه'],
+    EmployeeCode: ['Integer', 'کد پرسنلی'],
+    WorkPlaceTitle: ['string', 'نام منطقه'],
+    NetPayablePrice: ['Integer', 'مجموع استعلامی'],
+    DeductionsSumPrice: ['Integer', 'مجموع کسورات'],
+  };
+  request.documentation.outputParameters = request.documentation.outputParameters.map(row => descriptions[row.name]
+    ? { ...row, dataType: descriptions[row.name][0], description: descriptions[row.name][1] }
+    : row);
+  return { request, manualExamples };
+}
+
+function runSelfCheck() {
+  const cases = [
+    { name: 'Bash GET cURL import', run: () => parseCurlInternal('curl https://example.com').effectiveMethod === 'GET' },
+    { name: 'Wrapped Bash cURL import', run: () => parseCurlInternal(`"curl --location 'https://example.com/api' --header 'Cookie: sid=abc; _ga=GA1' --data '{"ok":true}'"`).normalizedRequest.cookies.length === 2 },
+    { name: 'Bash POST JSON import', run: () => parseCurlInternal(`curl https://example.com -H 'content-type: application/json' --data-raw '{"id":1}'`).normalizedRequest.body.type === 'json' },
+    { name: 'Windows CMD caret escaping', run: () => parseCurlInternal('curl "https://example.com" -H ^"client-id: abc^" --data-raw ^"{^\\^"id^\\^":1^}"').effectiveMethod === 'POST' },
+    { name: 'PowerShell import', run: () => parseCurlInternal("curl 'https://example.com' -H 'accept: application/json'").detectedDialect !== 'WINDOWS_CMD' },
+    { name: '--data-raw method inference', run: () => parseCurlInternal(`curl https://example.com --data-raw '{"id":1}'`).effectiveMethod === 'POST' },
+    { name: 'Explicit -X method priority', run: () => parseCurlInternal(`curl -X GET https://example.com --data-raw '{"id":1}'`).effectiveMethod === 'GET' },
+    { name: '--insecure parsing', run: () => parseCurlInternal('curl -k https://example.com').normalizedRequest.tls.verifyCertificate === false },
+    { name: '--location parsing', run: () => parseCurlInternal('curl --location https://example.com').unsupportedOptions.length === 0 },
+    { name: 'Core Command detection', run: () => parseCurlInternal(`curl https://host/core-api/v1/data-provider/store-form-data --data-raw '{"serviceId":"svc","formId":"path/delete","data":{}}'`).normalizedRequest.classification.type === 'CORE_COMMAND' },
+    { name: 'Core Query detection', run: () => parseCurlInternal(`curl https://host/core-api/v1/data-provider/get-data-source --data-raw '{"serviceId":"svc","key":"path/load","params":{}}'`).normalizedRequest.classification.type === 'CORE_QUERY' },
+    { name: 'Generic POST remains generic', run: () => parseCurlInternal(`curl https://example.com/users --data-raw '{"name":"Example"}'`).normalizedRequest.classification.type === 'GENERIC_HTTP' },
+    { name: 'Generic GET remains generic', run: () => parseCurlInternal('curl https://example.com/users').normalizedRequest.classification.type === 'GENERIC_HTTP' },
+    { name: 'Secret masking', run: () => createHeader('authorization', 'Bearer abcdefgh', 0).maskedValue.includes('*') },
+    { name: 'Secret vault persistence', run: () => {
+      const ref = rememberSecret('persisted-secret-value');
+      runtimeSecrets.delete(ref);
+      const errors = [];
+      return resolveSecretReference(ref, errors) === 'persisted-secret-value' && errors.length === 0;
+    } },
+    { name: 'TLS hostname mismatch categorization', run: () => isTlsTransportError({ code: 'ERR_TLS_CERT_ALTNAME_INVALID', message: "Hostname/IP does not match certificate's altnames" }) },
+    { name: 'Pre-request script mutation', run: () => {
+      const request = definitionFromNormalized(createBlankNormalizedRequest(), { applicationId: 'app', collectionId: 'col', environmentId: 'env-development', name: 'script', userId: 'u' });
+      const result = runPreRequestScript(request, { preRequestEnabled: true, preRequest: 'setQuery("page", "2")\nsetHeader("x-test", "ok")' }, {});
+      return result.results.every(item => item.result === 'PASSED') &&
+        result.request.queryParameters.some(param => param.name === 'page' && param.value === '2') &&
+        result.request.headers.some(header => header.name === 'x-test' && header.valueTemplate === 'ok');
+    } },
+    { name: 'Post-response script tests', run: () => {
+      const response = { statusCode: 200, durationMs: 42, contentType: 'application/json', bodyPreview: '{"data":{"id":1}}', headers: [createHeader('content-type', 'application/json', 0, 'SYSTEM')] };
+      const results = runPostResponseScript({ postResponseEnabled: true, postResponse: 'testStatus(200)\ntestJsonPath("$.data.id")\ntestHeaderContains("content-type", "json")' }, response);
+      return results.length === 3 && results.every(item => item.result === 'PASSED');
+    } },
+    { name: 'Template DOCX generation', run: () => {
+      const request = definitionFromNormalized(createBlankNormalizedRequest(), { applicationId: 'app', collectionId: 'col', environmentId: 'env-development', name: 'docx', userId: 'u' });
+      const result = generateDocumentationMarkdown(request, [], [], 'self-check');
+      const buffer = buildDocxFromTemplate(request, result, [], []);
+      return buffer.slice(0, 2).toString('utf8') === 'PK' && buffer.length > 10000;
+    } },
+    { name: 'Documentation includes Body Content-Type header', run: () => {
+      const normalized = createBlankNormalizedRequest();
+      normalized.method = 'POST';
+      normalized.body = { type: 'json', value: { id: 1 }, raw: '{"id":1}', contentType: 'application/json' };
+      normalized.headers = [];
+      const request = definitionFromNormalized(normalized, { applicationId: 'app', collectionId: 'col', environmentId: 'env-development', name: 'doc', userId: 'u' });
+      const markdown = generateDocumentationMarkdown(request, [], [], 'self-check').markdown;
+      return markdown.includes('پارامتر های سرایند') &&
+        markdown.toLowerCase().includes('content-type') &&
+        markdown.includes('application/json');
+    } },
+    { name: 'Documentation JSON field extraction and type inference', run: () => {
+      const rows = inferStructuredDocumentationParameters({ student: { nationalCode: '1234567890', active: true }, items: [{ amount: 12.5 }], count: 2, empty: null }, 'BODY');
+      const byName = Object.fromEntries(rows.map(row => [row.name, row]));
+      return byName.student.dataType === 'object' &&
+        byName['student.nationalCode'].dataType === 'string' &&
+        byName['student.active'].dataType === 'boolean' &&
+        byName['items[]'].dataType === 'array' &&
+        byName['items[].amount'].dataType === 'Number' &&
+        byName.count.dataType === 'Integer' &&
+        byName.empty.dataType === 'unknown' &&
+        rows.every(row => row.required === null);
+    } },
+    { name: 'Documentation refresh preserves manual descriptions and required status', run: () => {
+      const normalized = createBlankNormalizedRequest();
+      normalized.method = 'POST';
+      normalized.body = { type: 'json', value: { student: { id: 1 } }, raw: '{"student":{"id":1}}', contentType: 'application/json' };
+      const request = definitionFromNormalized(normalized, { applicationId: 'app', collectionId: 'col', environmentId: 'env-test', name: 'refresh', userId: 'u' });
+      request.documentation.inputParameters = request.documentation.inputParameters.map(row => row.name === 'student.id'
+        ? { ...row, required: true, description: 'شناسه دانش‌آموز' }
+        : row);
+      request.bodyTemplate = '{"student":{"id":1,"name":"علی"}}';
+      const refreshed = refreshDocumentationMetadata(request);
+      const id = refreshed.inputParameters.find(row => row.name === 'student.id');
+      return id.required === true && id.description === 'شناسه دانش‌آموز' && refreshed.inputParameters.some(row => row.name === 'student.name');
+    } },
+    { name: 'Documentation header filtering keeps business and masked authentication headers', run: () => {
+      const normalized = createBlankNormalizedRequest();
+      normalized.headers = [
+        createHeader('Host', 'example.com', 0), createHeader('Connection', 'keep-alive', 1),
+        createHeader('Content-Length', '20', 2), createHeader('User-Agent', 'browser', 3),
+        createHeader('token', 'actual-token-value', 4), createHeader('x-business-unit', 'education', 5),
+      ];
+      const request = definitionFromNormalized(normalized, { applicationId: 'app', collectionId: 'col', environmentId: 'env-test', name: 'headers', userId: 'u' });
+      const rows = inferHeaderDocumentationParameters(request);
+      return rows.some(row => row.name === 'token' && row.exampleValue.includes('*')) &&
+        rows.some(row => row.name === 'x-business-unit') &&
+        !rows.some(row => ['Host', 'Connection', 'Content-Length', 'User-Agent'].includes(row.name));
+    } },
+    { name: 'Documentation cURL masking removes Content-Length and secrets', run: () => {
+      const safe = sanitizeDocumentationCurl("curl --header 'Content-Length: 99' --header 'token: actual-secret-token' --data '{\"password\":\"real-password\"}' https://example.com");
+      return !/content-length/i.test(safe) && !safe.includes('actual-secret-token') && !safe.includes('real-password') && safe.includes('****');
+    } },
+    { name: 'Documentation response schema is not execution metadata', run: () => {
+      const { request, manualExamples } = createDocumentationAcceptanceFixture();
+      const view = buildDocumentationViewModel(request, [], manualExamples);
+      const names = view.outputs.map(row => row.name);
+      return names.includes('WorkPlaceCode') && names.includes('EmployeeCode') &&
+        !names.some(name => ['Duration', 'Response Size', 'Evidence Type', 'HTTP Status'].includes(name));
+    } },
+    { name: 'Documentation groups nested output arrays and renders allowed values', run: () => {
+      const request = definitionFromNormalized(createBlankNormalizedRequest(), {
+        applicationId: 'app', collectionId: 'col', environmentId: 'env-test', name: 'سپرده کارکنان', userId: 'u',
+      });
+      const responseBody = {
+        data: [{
+          personnel_code: '12345', area_code: '1001', month: '04', year: '1405', sep_jari: '100000', percent: '3', isnew: '1',
+          deposit_status: '0', sanavat: '12', total_count: 25, page_count: 3, data: [],
+        }],
+        total_count: 25,
+        page_count: 3,
+      };
+      const manualExamples = [{
+        requestId: request.id, statusCode: 200, reviewStatus: 'APPROVED', enteredAt: nowIso(), body: JSON.stringify(responseBody),
+      }];
+      request.documentation = refreshDocumentationMetadata(request, [], manualExamples);
+      const descriptions = {
+        'data[]': ['string', 'لیستی از اطلاعات درخواست شده'],
+        total_count: ['integer', 'مجموع ردیف ها'],
+        page_count: ['integer', 'مجموع صفحات'],
+        'data[].personnel_code': ['string', 'کد پرسنلی'],
+        'data[].area_code': ['string', 'کد منطقه'],
+        'data[].month': ['string', 'ماه'],
+        'data[].year': ['string', 'سال'],
+        'data[].sep_jari': ['string', 'حق عضویت (مبلغی که ماهانه از حقوق کسر می‌شود)'],
+        'data[].percent': ['string', 'درصد حق عضویت (۲، ۳، ۴، ۵ درصد)'],
+        'data[].isnew': ['string', 'شامل (۰: قدیمی، ۱: جدید)'],
+        'data[].deposit_status': ['string', 'وضعیت سپرده (براساس جدول کدها)'],
+        'data[].sanavat': ['string', 'سنوات'],
+        'data[].total_count': ['integer', 'مجموع ردیف ها'],
+        'data[].page_count': ['integer', 'مجموع صفحات'],
+        'data[].data[]': ['list', 'لیستی از اطلاعات درخواست شده'],
+      };
+      request.documentation.outputParameters = request.documentation.outputParameters.map(row => descriptions[row.name]
+        ? { ...row, dataType: descriptions[row.name][0], description: descriptions[row.name][1] }
+        : row);
+      const depositStatus = request.documentation.outputParameters.find(row => row.name === 'data[].deposit_status');
+      const result = generateDocumentationMarkdown(request, [], manualExamples, 'self-check');
+      const buffer = buildDocxFromTemplate(request, result, [], manualExamples);
+      const documentXml = inflateZipEntry(readZipEntries(buffer).find(entry => entry.name === 'word/document.xml')).toString('utf8');
+      return request.documentation.outputParameters.some(row => row.name === 'data[]' && !row.parentPath) &&
+        request.documentation.outputParameters.some(row => row.name === 'data[].personnel_code' && row.parentPath === 'data[]') &&
+        depositStatus.allowedValues.length === 12 && depositStatus.allowedValues[11].value === '11' &&
+        result.markdown.includes('### پارامترهای خروجی data:') &&
+        result.markdown.includes('| 1 | personnel_code | string | کد پرسنلی |') &&
+        result.markdown.includes('#### مقادیر مجاز برای فیلد deposit_status:') &&
+        result.markdown.includes('| 0 | عادی (بدون تغییر) |') && result.markdown.includes('| 11 | انصراف در منطقه |') &&
+        documentXml.includes('پارامترهای خروجی data:') && documentXml.includes('مقادیر مجاز برای فیلد deposit_status:') &&
+        !documentXml.includes('data[].personnel_code');
+    } },
+    { name: 'Documentation metadata remains backward compatible', run: () => {
+      const legacy = {
+        id: 'legacy', name: 'Legacy API', description: 'Legacy description', method: 'GET', urlTemplate: 'https://example.com/legacy',
+        headers: [], queryParameters: [], cookies: [], bodyType: 'none', bodyTemplate: '', authentication: { type: 'none' },
+        tls: { verifyCertificate: true }, executionMode: 'RECOMMENDED', classification: { type: 'GENERIC_HTTP' },
+        applicationId: 'app', collectionId: 'col', environmentId: 'env-test', version: 1, documentation: { title: 'Legacy API', description: 'Legacy description' },
+      };
+      const normalized = ensureRequestApiFields(legacy);
+      return normalized.documentation.serviceIntroduction === 'Legacy description' &&
+        Array.isArray(normalized.documentation.responseCodes) && normalized.documentation.responseCodes.length === 28 &&
+        Array.isArray(normalized.documentation.inputParameters);
+    } },
+    { name: 'Persian operational DOCX structure, TOC, tables, appendix and redaction', run: () => {
+      const { request, manualExamples } = createDocumentationAcceptanceFixture();
+      const result = generateDocumentationMarkdown(request, [], manualExamples, 'self-check');
+      const buffer = buildDocxFromTemplate(request, result, [], manualExamples);
+      const entries = readZipEntries(buffer);
+      const documentEntry = entries.find(entry => entry.name === 'word/document.xml');
+      const settingsEntry = entries.find(entry => entry.name === 'word/settings.xml');
+      const xml = inflateZipEntry(documentEntry).toString('utf8');
+      const settings = inflateZipEntry(settingsEntry).toString('utf8');
+      const entryNames = new Set(entries.map(entry => entry.name));
+      const headings = [
+        'مستندات بهره برداری', 'مقدمه سرویس احراز هویت', 'سرویس احراز هویت',
+        'ورودی ها', 'ادرس و متد درخواست', 'پارامتر های سرایند', 'پارامتر های ورودی',
+        'خروجی ها', 'پارامترهای خروجی', 'نمونه فراخوانی دریافت جزئیات وب سرویس',
+        'نمونه تست موفق دریافت جزئیات وب سرویس', 'پیوست – مرجع کدهای پاسخ و خطا', 'کدهای پاسخ HTTPS وب سرویس',
+      ];
+      return buffer.slice(0, 2).toString('utf8') === 'PK' &&
+        ['[Content_Types].xml', 'word/styles.xml', 'word/header1.xml', 'word/footer1.xml', 'word/_rels/document.xml.rels', 'word/media/image1.jpeg'].every(name => entryNames.has(name)) &&
+        xml.includes('r:embed="rId8"') &&
+        headings.every(heading => xml.includes(heading)) &&
+        ['ردیف', 'نام پارامتر', 'نوع یا مقدار نمونه', 'نوع', 'الزامی', 'توضیحات'].every(column => xml.includes(column)) &&
+        xml.includes('TOC \\o') && settings.includes('<w:updateFields w:val="true"/>') &&
+        !xml.includes('gBLon4YS-real-secret-token-jpMQ==') && !xml.includes('3651113262') && !xml.includes('82123484') &&
+        result.markdown.includes('کدهای پاسخ HTTPS') && result.markdown.includes('3651***262') &&
+        result.markdown.includes('gBLon4YS...****...jpMQ==') && result.markdown.includes('82****84') &&
+        result.markdown.includes('3041**763') && result.markdown.includes('137**265');
+    } },
+    { name: 'Postman collection export masks secrets', run: () => {
+      const normalized = createBlankNormalizedRequest();
+      normalized.method = 'POST';
+      normalized.url = 'https://esb.medu.ir/TeacherUniversityFunds/GetTeacherUniversityFundData';
+      normalized.headers = [createHeader('Token', 'Q2oB0wJBmldnwLMwSecretTokenValue', 0, 'USER')];
+      normalized.body = { type: 'json', value: { nationalCode: '3651113262' }, raw: '{"nationalCode":"3651113262"}', contentType: 'application/json' };
+      const request = definitionFromNormalized(normalized, { applicationId: 'app', collectionId: 'col', environmentId: 'env-development', name: 'GetTeacherUniversityFundData', userId: 'u' });
+      const exported = buildPostmanCollectionExport({ id: 'api-col-011a6723-ec6e-45bf-9ef2-65a4bb57f594', name: 'GetTeacherUniversityFundData' }, [request]).collection;
+      const text = JSON.stringify(exported);
+      return text.includes('https://schema.getpostman.com/json/collection/v2.1.0/collection.json') &&
+        text.includes('content-type') &&
+        text.includes('Token') &&
+        !text.includes('Q2oB0wJBmldnwLMwSecretTokenValue') &&
+        !text.includes('3651113262');
+    } },
+    { name: 'SSRF localhost protection', run: async () => {
+      try {
+        await validateDestination('http://127.0.0.1:80');
+        return false;
+      } catch (error) {
+        return error.category === 'DESTINATION_NOT_ALLOWED';
+      }
+    } },
+    { name: 'Bash cURL export masks secrets', run: () => exportRequestAsCurl(definitionFromNormalized(createBlankNormalizedRequest(), { applicationId: 'app', collectionId: 'col', environmentId: 'env-development', name: 'x', userId: 'u' }), 'bash').includes('curl') },
+  ];
+  return Promise.all(cases.map(async item => {
+    try {
+      return { name: item.name, passed: await item.run() };
+    } catch (error) {
+      return { name: item.name, passed: false, message: error.message };
+    }
+  })).then(details => ({
+    passed: details.filter(item => item.passed).length,
+    failed: details.filter(item => !item.passed).length,
+    details,
+  }));
+}
+
+function createServer() {
+  return http.createServer(async (req, res) => {
+    res.setHeader('access-control-allow-origin', process.env.API_CONSOLE_CORS_ORIGIN || 'http://localhost:5173');
+    res.setHeader('access-control-allow-credentials', 'true');
+    res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('access-control-allow-headers', 'content-type,x-csrf-token,x-utms-context,x-api-console-context');
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    try {
+      const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      if (await serveOpenApiDocs(req, res, parsedUrl)) return;
+
+      await attachSession(req, res);
+      attachConsoleContext(req);
+
+      if (parsedUrl.pathname === '/api/health' && req.method === 'GET') {
+        sendJson(res, 200, {
+          status: 'ok',
+          service: 'api-console',
+          checkedAt: nowIso(),
+          modules: ['api-console', 'cde-bridge', 'session'],
+        });
+        return;
+      }
+      if (parsedUrl.pathname === '/api/__perf/metrics' && req.method === 'GET') {
+        if (!['test', 'performance', 'development'].includes(process.env.NODE_ENV || 'development')) {
+          throw new ApiConsoleError('INVALID_URL', 'Endpoint not found.', 404);
+        }
+        sendJson(res, 200, performanceMetricsSnapshot());
+        return;
+      }
+      if (canHandleSession(parsedUrl.pathname)) {
+        const body = await readJsonBody(req, 1024 * 1024);
+        const result = await handleSession(req, parsedUrl, body, res);
+        sendJson(res, 200, result);
+        return;
+      }
+      if (canHandleCde(parsedUrl.pathname)) {
+        const body = await readJsonBody(req, Number(process.env.CDE_MAX_BODY_BYTES || 32 * 1024 * 1024));
+        const result = await handleCde(req, parsedUrl, body);
+        sendJson(res, 200, result);
+        return;
+      }
+      if (!parsedUrl.pathname.startsWith('/api/api-console') && !parsedUrl.pathname.startsWith('/api/reports')) {
+        throw new ApiConsoleError('INVALID_URL', 'Endpoint not found.', 404);
+      }
+      if (!req.utmsContext && !LEGACY_CONTEXT_ENABLED) {
+        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'CDE login and project selection are required.', 401);
+      }
+      const body = await readJsonBody(req);
+      const result = await routeRequest(req, parsedUrl, body);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+}
+
+if (require.main === module) {
+  createServer().listen(PORT, () => {
+    console.log(`Online API Console backend listening on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = {
+  createServer,
+  parseCurlInternal,
+  validateDestination,
+  exportRequestAsCurl,
+  createBlankNormalizedRequest,
+  definitionFromNormalized,
+  inferDocumentationDataType,
+  inferStructuredDocumentationParameters,
+  inferRequestDocumentationParameters,
+  inferHeaderDocumentationParameters,
+  refreshDocumentationMetadata,
+  buildDocumentationViewModel,
+  generateDocumentationMarkdown,
+  buildDocxDocumentXml,
+  buildDocxFromTemplate,
+  sanitizeDocumentationCurl,
+  sanitizeDocumentationResponseExample,
+  DEFAULT_RESPONSE_CODE_CATALOG,
+  AUTHENTICATION_DOCUMENTATION_PROFILES,
+  runSelfCheck,
+  API_CONSOLE_POLICY,
+};

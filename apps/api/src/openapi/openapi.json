@@ -1,0 +1,546 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "API Console",
+    "version": "1.0.0",
+    "description": "Standalone Online API Console + CDE bridge"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:4274"
+    }
+  ],
+  "paths": {
+    "/api/api-console/policy": {
+      "get": {
+        "summary": "/api/api-console/policy",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/environments": {
+      "get": {
+        "summary": "/api/api-console/environments",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/runners": {
+      "get": {
+        "summary": "/api/api-console/runners",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/self-check": {
+      "get": {
+        "summary": "/api/api-console/self-check",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/validate-core": {
+      "post": {
+        "summary": "/api/api-console/validate-core",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/consumer-candidates": {
+      "get": {
+        "summary": "/api/api-console/consumer-candidates",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/reports/api-usage": {
+      "get": {
+        "summary": "/api/api-console/reports/api-usage",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/collections": {
+      "get|post": {
+        "summary": "/api/api-console/collections",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/collections/:id/export-postman": {
+      "get": {
+        "summary": "/api/api-console/collections/:id/export-postman",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/curl/parse": {
+      "post": {
+        "summary": "/api/api-console/curl/parse",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests": {
+      "get|post": {
+        "summary": "/api/api-console/requests",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/blank": {
+      "post": {
+        "summary": "/api/api-console/requests/blank",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id": {
+      "get|put|delete": {
+        "summary": "/api/api-console/requests/:id",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/share": {
+      "post": {
+        "summary": "/api/api-console/requests/:id/share",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/versions": {
+      "post": {
+        "summary": "/api/api-console/requests/:id/versions",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/execute": {
+      "post": {
+        "summary": "/api/api-console/requests/:id/execute",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/executions": {
+      "get": {
+        "summary": "/api/api-console/requests/:id/executions",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/export-curl": {
+      "post": {
+        "summary": "/api/api-console/requests/:id/export-curl",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/effective-request": {
+      "get": {
+        "summary": "/api/api-console/requests/:id/effective-request",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/manual-responses": {
+      "get|post": {
+        "summary": "/api/api-console/requests/:id/manual-responses",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/documentation/preview": {
+      "post": {
+        "summary": "/api/api-console/requests/:id/documentation/preview",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/requests/:id/documentation/final": {
+      "post": {
+        "summary": "/api/api-console/requests/:id/documentation/final",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/admin/users": {
+      "get": {
+        "summary": "List CDE-synced users and effective roles (System Administrator only)",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/admin/users/:id/system-admin": {
+      "put": {
+        "summary": "Grant or revoke managed System Administrator access",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/share-reviews": {
+      "get|post": {
+        "summary": "/api/api-console/share-reviews",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/share-reviews/:id/approve": {
+      "post": {
+        "summary": "/api/api-console/share-reviews/:id/approve",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/share-reviews/:id/return": {
+      "post": {
+        "summary": "/api/api-console/share-reviews/:id/return",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/repository": {
+      "get|post": {
+        "summary": "/api/api-console/repository",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/references": {
+      "get|post": {
+        "summary": "/api/api-console/references",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/api-console/__test/reset": {
+      "post": {
+        "summary": "/api/api-console/__test/reset",
+        "tags": [
+          "api-console"
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Health",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/session": {
+      "get": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Current session",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/session/context": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Select project context",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/session/logout": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Logout",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/cde/session": {
+      "get": {
+        "tags": [
+          "cde"
+        ],
+        "summary": "CDE status",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "cde"
+        ],
+        "summary": "Disconnect CDE",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/cde/session/start": {
+      "post": {
+        "tags": [
+          "cde"
+        ],
+        "summary": "Start CDE login",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/cde/session/password": {
+      "post": {
+        "tags": [
+          "cde"
+        ],
+        "summary": "Finish CDE password",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/cde/projects": {
+      "get": {
+        "tags": [
+          "cde"
+        ],
+        "summary": "List CDE projects",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/cde/projects/{projectKey}/catalog": {
+      "get": {
+        "tags": [
+          "cde"
+        ],
+        "summary": "Project catalog incl API_MODULE",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/cde/projects/{projectKey}/package": {
+      "post": {
+        "tags": [
+          "cde"
+        ],
+        "summary": "Open package",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    }
+  }
+}

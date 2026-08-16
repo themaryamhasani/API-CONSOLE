@@ -1,0 +1,19 @@
+{
+  "name": "api-console",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Standalone Online API Console with CDE login.",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev:web",
+    "dev:web": "npm run dev -w @api-console/web",
+    "dev:api": "npm run dev -w @api-console/api",
+    "backend": "npm run dev:api",
+    "backend:self-check": "npm run self-check -w @api-console/api",
+    "backend:admin-check": "npm run test:admin -w @api-console/api",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}

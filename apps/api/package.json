@@ -1,0 +1,18 @@
+{
+  "name": "@api-console/api",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "node src/main.cjs",
+    "test:admin": "node --test --test-force-exit --test-timeout=30000 test/admin-access.test.cjs",
+    "self-check": "node -e \"const s=require('./src/modules/api-console/infrastructure/http/api-console-server.cjs'); s.runSelfCheck().then(r=>{console.log(JSON.stringify(r,null,2)); process.exit(r.failed?1:0);}).catch(e=>{console.error(e); process.exit(1);})\"",
+    "build": "node -e \"const s=require('./src/modules/api-console/infrastructure/http/api-console-server.cjs'); if (!s.createServer) process.exit(1);\""
+  },
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "ioredis": "^5.8.2",
+    "swagger-ui-dist": "^5.27.1",
+    "tough-cookie": "^6.0.0"
+  }
+}

@@ -1,0 +1,584 @@
+import type { PaginatedResponse, UserRole } from './index';
+export type ApiHttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
+export type ApiBodyType = 'none' | 'json' | 'raw' | 'xml' | 'form-urlencoded' | 'multipart' | 'binary';
+export type ApiExecutionMode = 'RECOMMENDED' | 'EXACT';
+export type ApiClassificationType = 'GENERIC_HTTP' | 'CORE_QUERY' | 'CORE_COMMAND';
+export type ApiCoreOperationType = 'QUERY' | 'COMMAND';
+export type ApiSharingStatus = 'DRAFT' | 'PENDING_REVIEW' | 'RETURNED' | 'APPROVED' | 'DEPRECATED';
+export type ApiRequestSourceType = 'ORIGINAL' | 'REFERENCE';
+export type ApiConsumerType = 'USER' | 'ROLE';
+export type ApiShareReviewAction = 'APPROVED' | 'RETURNED';
+export type ApiUsageEventType = 'ADDED_TO_CONSOLE' | 'API_OPENED' | 'API_EXECUTED' | 'REMOVED_FROM_CONSOLE' | 'NEW_VERSION_VIEWED';
+export type ApiAuthType = 'none' | 'bearer' | 'basic' | 'api-key' | 'cookie-session' | 'custom-headers' | 'environment-secret';
+export type ApiHeaderCategory = 'USER_BUSINESS' | 'BROWSER_GENERATED' | 'TRANSPORT_GENERATED' | 'AUTHENTICATION' | 'ENVIRONMENT';
+export type ApiValueSource = 'IMPORTED_CURL' | 'USER' | 'ENVIRONMENT' | 'SYSTEM' | 'AUTHENTICATION';
+export type ApiEnvironmentKind = 'DEVELOPMENT' | 'TEST' | 'PRE_PRODUCTION' | 'PRODUCTION' | 'CUSTOM';
+export type ApiExecutionStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'BLOCKED';
+export type ApiTransportResult = 'SUCCESS' | 'FAILED' | 'BLOCKED' | 'CANCELLED';
+export type ApiBusinessResult = 'PASSED' | 'FAILED' | 'WARNING' | 'NOT_EVALUATED';
+export type ApiResponseEvidenceType = 'ACTUAL_EXECUTION' | 'IMPORTED_EVIDENCE' | 'MANUAL_EXAMPLE';
+export type ApiCurlDialect = 'BASH' | 'LINUX_MAC' | 'WINDOWS_CMD' | 'POWERSHELL' | 'CHROME_EDGE' | 'UNKNOWN';
+export type ApiExportDialect = 'bash' | 'windows-cmd' | 'powershell';
+export type ApiErrorCategory = 'CURL_PARSE_ERROR' | 'INVALID_URL' | 'UNSUPPORTED_CURL_OPTION' | 'VARIABLE_RESOLUTION_ERROR' | 'SECRET_RESOLUTION_ERROR' | 'AUTHENTICATION_ERROR' | 'DNS_ERROR' | 'TLS_ERROR' | 'CONNECTION_TIMEOUT' | 'READ_TIMEOUT' | 'RESPONSE_TOO_LARGE' | 'REDIRECT_BLOCKED' | 'DESTINATION_NOT_ALLOWED' | 'CORE_VALIDATION_ERROR' | 'HTTP_ERROR' | 'EXECUTION_CANCELLED' | 'INTERNAL_EXECUTION_ERROR';
+export const API_SHARING_STATUS_LABELS: Record<ApiSharingStatus, string> = {
+    DRAFT: 'پیش‌نویس',
+    PENDING_REVIEW: 'در انتظار بررسی',
+    RETURNED: 'بازگردانده‌شده',
+    APPROVED: 'تأییدشده',
+    DEPRECATED: 'منسوخ‌شده',
+};
+export interface ApiVariable {
+    id: string;
+    key: string;
+    currentValue: string;
+    initialValue?: string | undefined;
+    sensitive: boolean;
+    scope: 'GLOBAL' | 'ENVIRONMENT' | 'COLLECTION' | 'REQUEST' | 'EXECUTION';
+    description?: string | undefined;
+}
+export interface ApiEnvironmentProfile {
+    id: string;
+    name: string;
+    kind: ApiEnvironmentKind;
+    baseUrl: string;
+    variables: ApiVariable[];
+    defaultHeaders: ApiRequestHeader[];
+    secretReferences: Record<string, string>;
+    productionProtected: boolean;
+    authenticationDocumentationProfileId?: string | undefined;
+    createdAt: string;
+    updatedAt: string;
+}
+export interface ApiClassification {
+    type: ApiClassificationType;
+    serviceId: string | null;
+    operationPath: string | null;
+    coreOperationType: ApiCoreOperationType | null;
+    endpoint: string | null;
+}
+export interface ApiRequestBody {
+    type: ApiBodyType;
+    value: unknown;
+    raw: string;
+    contentType?: string | undefined;
+    fileName?: string | undefined;
+}
+export interface ApiRequestAuthentication {
+    type: ApiAuthType;
+    bearerTokenReference?: string | undefined;
+    basicUsername?: string | undefined;
+    basicPasswordReference?: string | undefined;
+    apiKeyName?: string | undefined;
+    apiKeyValueReference?: string | undefined;
+    cookieName?: string | undefined;
+    cookieValueReference?: string | undefined;
+    customHeaderReferences?: Array<{
+        name: string;
+        valueReference: string;
+    }> | undefined;
+}
+export interface ApiTlsSettings {
+    verifyCertificate: boolean;
+    importedInsecureFlag?: boolean | undefined;
+}
+export interface ApiRequestHeader {
+    id: string;
+    name: string;
+    valueTemplate: string;
+    enabled: boolean;
+    sensitive: boolean;
+    source: ApiValueSource;
+    category: ApiHeaderCategory;
+    description: string;
+    maskedValue: string;
+    displayOrder: number;
+    cannotTransmitExactly?: boolean | undefined;
+    replayNote?: string | undefined;
+}
+export interface ApiRequestCookie {
+    id: string;
+    name: string;
+    valueReference: string;
+    enabled: boolean;
+    sensitive: boolean;
+    maskedValue: string;
+    domain?: string | undefined;
+    path?: string | undefined;
+    expiresAt?: string | undefined;
+    source: ApiValueSource;
+    displayOrder: number;
+    temporary?: boolean | undefined;
+}
+export interface ApiKeyValueParameter {
+    id: string;
+    name: string;
+    value: string;
+    enabled: boolean;
+    sensitive?: boolean | undefined;
+    source?: ApiValueSource | undefined;
+    description?: string | undefined;
+    displayOrder: number;
+}
+export interface NormalizedApiRequest {
+    method: ApiHttpMethod;
+    url: string;
+    queryParameters: ApiKeyValueParameter[];
+    headers: ApiRequestHeader[];
+    cookies: ApiRequestCookie[];
+    body: ApiRequestBody;
+    authentication: ApiRequestAuthentication;
+    tls: ApiTlsSettings;
+    executionMode: ApiExecutionMode;
+    classification: ApiClassification;
+}
+export interface ApiCurlImportPreview {
+    id: string;
+    originalCurl: string;
+    detectedDialect: ApiCurlDialect;
+    normalizedRequest: NormalizedApiRequest;
+    effectiveMethod: ApiHttpMethod;
+    url: string;
+    headerCount: number;
+    cookieCount: number;
+    bodyType: ApiBodyType;
+    jsonValidity: {
+        valid: boolean;
+        error?: string | undefined;
+        line?: number | undefined;
+        column?: number | undefined;
+    };
+    tlsVerification: boolean;
+    warnings: string[];
+    unsupportedOptions: string[];
+    parserVersion: string;
+    importedAt: string;
+}
+export interface ApiCollection {
+    id: string;
+    applicationId: string;
+    workspaceName: string;
+    name: string;
+    description?: string | undefined;
+    ownerId: string;
+    status: 'ACTIVE' | 'ARCHIVED';
+    variables: ApiVariable[];
+    authenticationDocumentationProfileId?: string | undefined;
+    createdAt: string;
+    updatedAt: string;
+}
+export interface ApiPostmanCollectionExport {
+    fileName: string;
+    requestCount: number;
+    collection: Record<string, unknown>;
+}
+export interface ApiRequestAssertion {
+    id: string;
+    assertionType: 'EXPECTED_HTTP_STATUS' | 'MAX_RESPONSE_TIME' | 'EXPECTED_CONTENT_TYPE' | 'REQUIRED_JSON_PATH' | 'HEADER_VALUE' | 'BUSINESS_EXPRESSION' | 'JSON_SCHEMA';
+    configuration: Record<string, unknown>;
+    enabled: boolean;
+    lastResult?: ApiBusinessResult | undefined;
+    lastMessage?: string | undefined;
+}
+export interface ApiRequestScripts {
+    preRequest: string;
+    postResponse: string;
+    preRequestEnabled: boolean;
+    postResponseEnabled: boolean;
+}
+export type ApiDocumentationParameterLocation = 'HEADER' | 'QUERY' | 'PATH' | 'BODY' | 'RESPONSE';
+export interface ApiDocumentationAllowedValue {
+    id: string;
+    value: string;
+    description: string;
+    enabled: boolean;
+    displayOrder: number;
+}
+export interface ApiDocumentationParameter {
+    id: string;
+    name: string;
+    location: ApiDocumentationParameterLocation;
+    dataType: string;
+    required: boolean | null;
+    description: string;
+    exampleValue?: string | undefined;
+    parentPath?: string | undefined;
+    displayOrder: number;
+    enabled?: boolean | undefined;
+    deprecated?: boolean | undefined;
+    source?: 'AUTO' | 'MANUAL' | 'PROFILE' | string | undefined;
+    allowedValues?: ApiDocumentationAllowedValue[] | undefined;
+    allowedValuesCustomized?: boolean | undefined;
+}
+export interface ApiDocumentationResponseCode {
+    code: number;
+    message: string;
+    description: string;
+    enabled: boolean;
+    displayOrder: number;
+}
+export interface ApiAuthenticationDocumentation {
+    profileId?: string | undefined;
+    enabled: boolean;
+    title: string;
+    introduction: string;
+    baseUrl: string;
+    endpoint: string;
+    method: string;
+    contentType: string;
+    headerParameters?: ApiDocumentationParameter[] | undefined;
+    inputParameters: ApiDocumentationParameter[];
+    outputParameters: ApiDocumentationParameter[];
+    curlExample?: string | undefined;
+    responseExample?: string | undefined;
+}
+export interface ApiAuthenticationDocumentationProfile extends ApiAuthenticationDocumentation {
+    id: string;
+}
+export interface ApiDocumentationMetadata {
+    title: string;
+    description: string;
+    serviceIntroduction?: string | undefined;
+    baseUrl?: string | undefined;
+    operationPath?: string | undefined;
+    endpoint?: string | undefined;
+    method?: string | undefined;
+    headerParameters?: ApiDocumentationParameter[] | undefined;
+    inputParameters?: ApiDocumentationParameter[] | undefined;
+    outputParameters?: ApiDocumentationParameter[] | undefined;
+    authenticationProfileId?: string | undefined;
+    authenticationDocumentation?: ApiAuthenticationDocumentation | undefined;
+    responseCodes?: ApiDocumentationResponseCode[] | undefined;
+    organizationName?: string | undefined;
+    departmentName?: string | undefined;
+    documentRevision?: string | undefined;
+    documentDate?: string | undefined;
+    curlExample?: string | undefined;
+    responseExample?: string | undefined;
+    providerApplication?: string | undefined;
+    consumerApplications?: string[] | undefined;
+    version?: string | undefined;
+    owner?: string | undefined;
+    supportContact?: string | undefined;
+    changeHistory?: Array<{
+        version: string;
+        changedAt: string;
+        summary: string;
+    }> | undefined;
+}
+export interface ApiRequestDefinition {
+    id: string;
+    collectionId: string;
+    applicationId: string;
+    apiId: string;
+    semanticVersion: string;
+    sharingStatus: ApiSharingStatus;
+    sourceType: ApiRequestSourceType;
+    referenceId?: string | undefined;
+    sourceRequestId?: string | undefined;
+    shareRequestId?: string | undefined;
+    latestReturnReason?: string | undefined;
+    approvedAt?: string | undefined;
+    approvedBy?: string | undefined;
+    name: string;
+    description?: string | undefined;
+    method: ApiHttpMethod;
+    urlTemplate: string;
+    queryParameters: ApiKeyValueParameter[];
+    headers: ApiRequestHeader[];
+    cookies: ApiRequestCookie[];
+    bodyType: ApiBodyType;
+    bodyTemplate: string;
+    authentication: ApiRequestAuthentication;
+    tls: ApiTlsSettings;
+    executionMode: ApiExecutionMode;
+    classification: ApiClassification;
+    environmentId: string;
+    assertions: ApiRequestAssertion[];
+    scripts: ApiRequestScripts;
+    documentation: ApiDocumentationMetadata;
+    version: number;
+    status: 'ACTIVE' | 'ARCHIVED';
+    originalImportedCurl?: string | undefined;
+    importedCurlId?: string | undefined;
+    createdBy: string;
+    createdAt: string;
+    updatedBy?: string | undefined;
+    updatedAt: string;
+}
+export interface ApiVersionConsumer {
+    id: string;
+    apiId: string;
+    version: string;
+    consumerType: ApiConsumerType;
+    userId?: string | undefined;
+    roleKey?: UserRole | undefined;
+    applicationId: string;
+    status: 'ACTIVE' | 'REVOKED';
+    createdBy: string;
+    createdAt: string;
+    updatedBy?: string | undefined;
+    updatedAt?: string | undefined;
+}
+export interface ApiShareRevision {
+    id: string;
+    shareRequestId: string;
+    revisionNumber: number;
+    purpose: string;
+    introduction: string;
+    description: string;
+    snapshot: Record<string, unknown>;
+    submittedBy: string;
+    submittedAt: string;
+    status: ApiSharingStatus;
+    reviewedBy?: string | undefined;
+    reviewedAt?: string | undefined;
+    reviewAction?: ApiShareReviewAction | undefined;
+    returnReason?: string | undefined;
+    documentationReference?: string | undefined;
+    rowVersion: string;
+}
+export interface ApiShareRequest {
+    id: string;
+    requestId: string;
+    apiId: string;
+    apiTitle: string;
+    applicationId: string;
+    version: string;
+    submittedBy: string;
+    submittedByName?: string | undefined;
+    status: ApiSharingStatus;
+    currentRevisionNumber: number;
+    purpose?: string | undefined;
+    introduction?: string | undefined;
+    description?: string | undefined;
+    returnReason?: string | undefined;
+    reviewedBy?: string | undefined;
+    reviewedAt?: string | undefined;
+    revisions: ApiShareRevision[];
+    rowVersion: string;
+    createdAt: string;
+    updatedAt: string;
+    request?: ApiRequestDefinition | undefined;
+    consumers?: ApiVersionConsumer[] | undefined;
+}
+export interface ApiConsumerCandidate {
+    id: string;
+    consumerType: ApiConsumerType;
+    userId?: string | undefined;
+    roleKey?: UserRole | undefined;
+    applicationId?: string | undefined;
+    label: string;
+    description?: string | undefined;
+}
+export interface ApiConsoleDirectoryUser {
+    id: string;
+    fullName: string;
+    phoneNumber?: string | undefined;
+    email?: string | undefined;
+    source: 'CDE' | string;
+    isActive: boolean;
+    roles: UserRole[];
+    isSystemAdmin: boolean;
+    isBootstrapAdmin: boolean;
+    createdAt?: string | undefined;
+    updatedAt?: string | undefined;
+}
+export interface ApiRepositoryItem {
+    id: string;
+    apiId: string;
+    requestId: string;
+    title: string;
+    description?: string | undefined;
+    applicationId: string;
+    version: string;
+    method: ApiHttpMethod;
+    urlTemplate: string;
+    classification: ApiClassification;
+    sharingStatus: ApiSharingStatus;
+    ownerId: string;
+    approvedAt?: string | undefined;
+    consumers: ApiVersionConsumer[];
+    referenceId?: string | undefined;
+    referenceRequestId?: string | undefined;
+    hasNewerVersion: boolean;
+    latestVersion: string;
+    isNewForUser: boolean;
+    changeLog?: string | undefined;
+    createdAt: string;
+    updatedAt: string;
+    request?: ApiRequestDefinition | undefined;
+    shareRequest?: ApiShareRequest | undefined;
+    executions?: ApiRequestExecution[] | undefined;
+    manualResponses?: ApiManualResponseExample[] | undefined;
+}
+export interface ApiConsoleReference {
+    id: string;
+    apiId: string;
+    version: string;
+    sourceRequestId: string;
+    requestId?: string | undefined;
+    collectionId: string;
+    applicationId: string;
+    createdBy: string;
+    createdAt: string;
+    status: 'ACTIVE' | 'REMOVED';
+    removedAt?: string | undefined;
+    request?: ApiRequestDefinition | undefined;
+    sourceRequest?: ApiRequestDefinition | undefined;
+}
+export interface ApiUsageEvent {
+    id: string;
+    eventType: ApiUsageEventType;
+    userId: string;
+    userDisplayName: string;
+    activeRole: UserRole;
+    applicationId: string;
+    apiId: string;
+    apiTitle: string;
+    version: string;
+    referenceId?: string | undefined;
+    eventAt: string;
+    environmentId?: string | undefined;
+    correlationId?: string | undefined;
+}
+export interface ApiUsageReport extends PaginatedResponse<ApiUsageEvent> {
+    summary: {
+        total: number;
+        uniqueApis: number;
+        uniqueUsers: number;
+        byType: Partial<Record<ApiUsageEventType, number>>;
+    };
+}
+export interface ApiExecutionRunner {
+    id: string;
+    name: string;
+    networkZone: 'PUBLIC' | 'INTERNAL' | 'RESTRICTED' | 'TEST';
+    enabled: boolean;
+}
+export interface ApiEffectiveRequestSnapshot {
+    method: ApiHttpMethod;
+    url: string;
+    headers: ApiRequestHeader[];
+    cookies: ApiRequestCookie[];
+    body: ApiRequestBody;
+    tls: ApiTlsSettings;
+    omittedHeaders: Array<{
+        name: string;
+        reason: string;
+    }>;
+    variableResolution: Array<{
+        key: string;
+        source: ApiVariable['scope'];
+        sensitive: boolean;
+    }>;
+}
+export interface ApiRedirectRecord {
+    from: string;
+    to: string;
+    statusCode: number;
+    allowed: boolean;
+    reason?: string | undefined;
+}
+export interface ApiAssertionEvaluation {
+    assertionId: string;
+    assertionType: ApiRequestAssertion['assertionType'] | 'SCRIPT_TEST';
+    result: ApiBusinessResult;
+    message: string;
+}
+export interface ApiScriptExecutionResult {
+    phase: 'PRE_REQUEST' | 'POST_RESPONSE';
+    line: number;
+    command: string;
+    result: ApiBusinessResult;
+    message: string;
+}
+export interface ApiExecutionResponse {
+    statusCode?: number | undefined;
+    statusText?: string | undefined;
+    headers: ApiRequestHeader[];
+    cookies: ApiRequestCookie[];
+    bodyPreview: string;
+    bodyReference?: string | undefined;
+    contentType?: string | undefined;
+    responseSize: number;
+    durationMs: number;
+    resolvedIpAddress?: string | undefined;
+    redirectHistory: ApiRedirectRecord[];
+    tlsVerified: boolean;
+    safePreviewMode: 'JSON' | 'TEXT' | 'SANDBOXED_HTML' | 'DOWNLOAD_ONLY';
+}
+export interface ApiRequestExecution {
+    id: string;
+    requestId: string;
+    collectionId: string;
+    environmentId: string;
+    runnerId: string;
+    executedBy: string;
+    startedAt: string;
+    completedAt?: string | undefined;
+    durationMs?: number | undefined;
+    status: ApiExecutionStatus;
+    statusCode?: number | undefined;
+    responseSize?: number | undefined;
+    responseContentType?: string | undefined;
+    requestSnapshot: ApiEffectiveRequestSnapshot;
+    response?: ApiExecutionResponse | undefined;
+    tlsVerification: boolean;
+    transportResult: ApiTransportResult;
+    businessResult: ApiBusinessResult;
+    assertionResults: ApiAssertionEvaluation[];
+    scriptResults?: ApiScriptExecutionResult[] | undefined;
+    correlationId: string;
+    errorCategory?: ApiErrorCategory | undefined;
+    sanitizedError?: string | undefined;
+    environmentName: string;
+    evidenceType: ApiResponseEvidenceType;
+    businessJustification?: string | undefined;
+}
+export interface ImportedCurlRecord {
+    id: string;
+    requestId?: string | undefined;
+    originalTextReference: string;
+    sanitizedPreview: string;
+    detectedDialect: ApiCurlDialect;
+    parserVersion: string;
+    importedBy: string;
+    importedAt: string;
+}
+export interface ApiManualResponseExample {
+    id: string;
+    requestId: string;
+    statusCode: number;
+    headers: ApiRequestHeader[];
+    body: string;
+    claimedEnvironmentId: string;
+    source: string;
+    reason: string;
+    enteredBy: string;
+    enteredAt: string;
+    reviewedBy?: string | undefined;
+    reviewStatus: 'PENDING' | 'APPROVED' | 'REJECTED';
+    evidenceAttachmentId?: string | undefined;
+}
+export interface ApiDocumentationResult {
+    requestId: string;
+    generatedAt: string;
+    generatedBy: string;
+    approved: boolean;
+    markdown: string;
+    warnings: string[];
+    wordDocumentBase64?: string | undefined;
+    wordFileName?: string | undefined;
+    wordMimeType?: string | undefined;
+}
+export interface ApiConsolePermissionPolicy {
+    canView: UserRole[];
+    canCreate: UserRole[];
+    canEdit: UserRole[];
+    canExecute: UserRole[];
+    canExecuteProduction: UserRole[];
+    canExecuteCommand: UserRole[];
+    canExecuteProductionCommand: UserRole[];
+    canDelete: UserRole[];
+    canGenerateDocumentation: UserRole[];
+}

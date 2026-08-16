@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "API Console",
-    "version": "1.0.0",
-    "description": "Standalone Online API Console + CDE bridge"
+    "version": "1.1.0",
+    "description": "Standalone Online API Console + CDE bridge + secure project Runtime discovery and execution"
   },
   "servers": [
     {
@@ -438,6 +438,95 @@
             "description": "OK"
           }
         }
+      }
+    },
+    "/api/api-console/runtime-profiles": {
+      "get": {
+        "tags": ["runtime"],
+        "summary": "List Runtime Profiles and provision configured default Development origins idempotently",
+        "parameters": [{ "name": "applicationId", "in": "query", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Runtime Profile list" } }
+      }
+    },
+    "/api/api-console/admin/runtime-profiles": {
+      "post": {
+        "tags": ["runtime-admin"],
+        "summary": "Add a Runtime origin; applicationId and origin are sufficient and other fields use secure defaults",
+        "parameters": [{ "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Created profile" }, "403": { "description": "System Administrator required" } }
+      }
+    },
+    "/api/api-console/admin/runtime-profiles/{profileId}": {
+      "put": {
+        "tags": ["runtime-admin"], "summary": "Update a Runtime Profile",
+        "parameters": [{ "name": "profileId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Updated profile" } }
+      },
+      "delete": {
+        "tags": ["runtime-admin"], "summary": "Disable a Runtime Profile",
+        "parameters": [{ "name": "profileId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Disabled profile" } }
+      }
+    },
+    "/api/api-console/admin/runtime-profiles/{profileId}/validate": {
+      "post": {
+        "tags": ["runtime-admin"], "summary": "Validate allowlist, HTTPS and public DNS for a Runtime origin",
+        "parameters": [{ "name": "profileId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Validation result" }, "403": { "description": "Origin or resolved destination rejected" } }
+      }
+    },
+    "/api/api-console/runtime-profiles/{profileId}/session": {
+      "get": {
+        "tags": ["runtime"], "summary": "Get redacted Runtime session status",
+        "parameters": [{ "name": "profileId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Session status without cookie or client-id" } }
+      },
+      "delete": {
+        "tags": ["runtime"], "summary": "Disconnect a Runtime session",
+        "parameters": [{ "name": "profileId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Disconnected" } }
+      }
+    },
+    "/api/api-console/runtime-profiles/{profileId}/session/start": {
+      "post": {
+        "tags": ["runtime"], "summary": "Start Runtime login with the cellphone locked to the CDE identity",
+        "parameters": [{ "name": "profileId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Connected or password step required" } }
+      }
+    },
+    "/api/api-console/runtime-profiles/{profileId}/session/password": {
+      "post": {
+        "tags": ["runtime"], "summary": "Complete Runtime password step without persisting the password",
+        "parameters": [{ "name": "profileId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Connected Runtime session" }, "401": { "description": "Runtime credentials rejected" } }
+      }
+    },
+    "/api/api-console/projects/{projectKey}/discovery/scan": {
+      "post": {
+        "tags": ["discovery"], "summary": "Statically scan all accessible WEB_UI, API_MODULE and DATA_SERVICE branches",
+        "parameters": [{ "name": "projectKey", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Discovery snapshot and preview" } }
+      }
+    },
+    "/api/api-console/projects/{projectKey}/discovery/latest": {
+      "get": {
+        "tags": ["discovery"], "summary": "Get latest discovery preview",
+        "parameters": [{ "name": "projectKey", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Latest discovery snapshot" } }
+      }
+    },
+    "/api/api-console/projects/{projectKey}/discovery/{snapshotId}/sync": {
+      "post": {
+        "tags": ["discovery"], "summary": "Idempotently sync selected discovered operations to a Collection",
+        "parameters": [{ "name": "projectKey", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "snapshotId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Created, updated, unchanged, conflict and stale results" } }
+      }
+    },
+    "/api/api-console/runtime/operations/{operationId}/execute": {
+      "post": {
+        "tags": ["runtime"], "summary": "Execute a registered operation through the secure Runtime proxy",
+        "parameters": [{ "name": "operationId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Sanitized execution result" }, "401": { "description": "Runtime session required" }, "409": { "description": "Profile or confirmation incomplete" } }
       }
     },
     "/api/session/logout": {

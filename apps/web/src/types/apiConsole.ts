@@ -5,7 +5,7 @@ export type ApiExecutionMode = 'RECOMMENDED' | 'EXACT';
 export type ApiClassificationType = 'GENERIC_HTTP' | 'CORE_QUERY' | 'CORE_COMMAND';
 export type ApiCoreOperationType = 'QUERY' | 'COMMAND';
 export type ApiSharingStatus = 'DRAFT' | 'PENDING_REVIEW' | 'RETURNED' | 'APPROVED' | 'DEPRECATED';
-export type ApiRequestSourceType = 'ORIGINAL' | 'REFERENCE';
+export type ApiRequestSourceType = 'ORIGINAL' | 'REFERENCE' | 'CDE_DISCOVERY';
 export type ApiConsumerType = 'USER' | 'ROLE';
 export type ApiShareReviewAction = 'APPROVED' | 'RETURNED';
 export type ApiUsageEventType = 'ADDED_TO_CONSOLE' | 'API_OPENED' | 'API_EXECUTED' | 'REMOVED_FROM_CONSOLE' | 'NEW_VERSION_VIEWED';
@@ -304,6 +304,144 @@ export interface ApiRequestDefinition {
     createdAt: string;
     updatedBy?: string | undefined;
     updatedAt: string;
+    runtimeBinding?: RuntimeBinding | undefined;
+    sourceSync?: SourceSyncState | undefined;
+    schemaCompleteness?: 'COMPLETE' | 'NEEDS_INPUT' | undefined;
+    sourceEvidence?: SourceEvidence[] | undefined;
+}
+
+export type RuntimeEnvironmentKind = 'DEVELOPMENT' | 'TEST' | 'PRE_PRODUCTION' | 'PRODUCTION';
+export type RuntimeSessionPhase = 'DISCONNECTED' | 'STARTING' | 'PASSWORD_REQUIRED' | 'CONNECTED';
+export type DiscoveryPreviewState = 'NEW' | 'CHANGED' | 'UNCHANGED' | 'REMOVED';
+
+export interface SourceEvidence {
+    repositoryType?: 'WEB_UI' | 'API_MODULE' | 'DATA_SERVICE' | string | undefined;
+    packageId?: string | undefined;
+    branch?: Record<string, unknown> | undefined;
+    file?: string | undefined;
+    path?: string | undefined;
+    line?: number | undefined;
+    column?: number | undefined;
+    excerpt?: string | undefined;
+}
+
+export interface RuntimeProfile {
+    id: string;
+    applicationId: string;
+    projectKey: string;
+    name: string;
+    kind: RuntimeEnvironmentKind;
+    origin: string;
+    coreBasePath: string;
+    loginPath: string;
+    appRefererPath: string;
+    runtimeServiceId: string;
+    projectServiceId?: string | undefined;
+    serviceIdEvidence: SourceEvidence[];
+    serviceIdApprovedAt?: string | undefined;
+    serviceIdApprovedBy?: string | undefined;
+    userSource: string;
+    prostage?: string | undefined;
+    dataService: {
+        baseUrl: string;
+        authMode: 'NONE' | 'BEARER' | 'BASIC' | 'TOKEN_ENDPOINT';
+        username?: string | undefined;
+        tokenPath?: string | undefined;
+        executionEnabled: boolean;
+        authConfigured: boolean;
+    };
+    enabled: boolean;
+    rowVersion: string;
+    lastValidatedAt?: string | undefined;
+    lastValidation?: { valid: boolean; addresses: string[]; checkedAt: string } | undefined;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface RuntimeSessionStatus {
+    connected: boolean;
+    phase: RuntimeSessionPhase;
+    profileId: string;
+    nextStep?: 'password' | undefined;
+    loginName?: string | undefined;
+    runtimeUser?: { username?: string; firstName?: string; lastName?: string } | null | undefined;
+    ecreq?: boolean | undefined;
+    connectedAt?: string | undefined;
+    lastUsedAt?: string | undefined;
+}
+
+export interface DiscoveredOperation {
+    id: string;
+    projectKey: string;
+    sourceKind: 'API_MODULE' | 'DATA_SERVICE';
+    sourceId: string;
+    moduleId?: string | undefined;
+    type: 'CORE_QUERY' | 'CORE_COMMAND' | 'REST';
+    method?: ApiHttpMethod | undefined;
+    path?: string | undefined;
+    name: string;
+    payloadExample: Record<string, unknown>;
+    schema?: Record<string, unknown> | undefined;
+    schemaCompleteness: 'COMPLETE' | 'NEEDS_INPUT';
+    evidence: SourceEvidence[];
+    sourceFingerprint: string;
+    previewState: DiscoveryPreviewState;
+}
+
+export interface ApiDiscoverySnapshot {
+    id: string;
+    projectKey: string;
+    applicationId: string;
+    status: 'READY' | 'BLOCKED_SERVICE_ID';
+    parserVersion: string;
+    serviceIdStatus: 'RESOLVED' | 'CONFLICT' | 'MISSING';
+    projectServiceIdCandidates: Array<{ value: string; evidence: SourceEvidence[] }>;
+    operations: DiscoveredOperation[];
+    removedOperations: DiscoveredOperation[];
+    warnings: Array<{ code: string; message: string; evidence?: SourceEvidence }>;
+    stats: Record<string, number>;
+    sourceFingerprint: string;
+    scannedBy: string;
+    createdAt: string;
+}
+
+export interface RuntimeBinding {
+    runtimeProfileId: string;
+    projectKey: string;
+    projectServiceId?: string | undefined;
+    sourceKind: 'API_MODULE' | 'DATA_SERVICE';
+    operationId: string;
+    moduleId?: string | undefined;
+    sourceFingerprint: string;
+    requiresRuntimeSession: boolean;
+}
+
+export interface SourceSyncState {
+    status: 'SYNCED' | 'CONFLICT' | 'STALE';
+    sourceFingerprint: string;
+    baseDefinition?: Record<string, unknown> | undefined;
+    incomingDefinition?: Record<string, unknown> | undefined;
+    conflicts: Array<{ field: string; base: unknown; local: unknown; incoming: unknown }>;
+    syncedAt?: string | undefined;
+    staleAt?: string | undefined;
+    syncedBy?: string | undefined;
+}
+
+export interface DiscoverySyncResult {
+    created: string[];
+    updated: string[];
+    unchanged: string[];
+    conflicts: Array<{ requestId: string; conflicts: SourceSyncState['conflicts'] }>;
+    stale: string[];
+}
+
+export interface RuntimeCurlExport {
+    fileName: string;
+    mode: 'sample' | 'bundle';
+    value: string;
+    helperFileName?: string | undefined;
+    ecreqHelper?: string | undefined;
+    note?: string | undefined;
 }
 export interface ApiVersionConsumer {
     id: string;

@@ -219,6 +219,8 @@ async function finishCdePassword(req, body) {
 async function disconnectCde(req) {
   assertCsrf(req);
   const session = requireSession(req);
+  const { deleteAllRuntimeSessions } = require('../runtime/runtime-session-store.cjs');
+  await deleteAllRuntimeSessions(session.id);
   await deleteCdeSession(session.id);
   await markCdeDisconnected(session);
   return { connected: false, csrfToken: session.csrfToken };
@@ -469,6 +471,74 @@ async function browseProjectPackage(req, projectKey, body) {
   };
 }
 
+async function collectProjectSourceFiles(req, projectKey, repositoryTypes = ['WEB_UI', 'API_MODULE', 'DATA_SERVICE']) {
+  const accessibleProjectKey = await assertAccessibleProject(req, projectKey);
+  const selectedTypes = repositoryTypes.filter(type => REPOSITORY_CONFIG[type]);
+  const sources = [];
+  const warnings = [];
+  for (const repositoryType of selectedTypes) {
+    const config = REPOSITORY_CONFIG[repositoryType];
+    const repoName = projectRepositoryName(accessibleProjectKey, repositoryType);
+    let listedItems;
+    try {
+      const response = await callDataSource(req, config.key, { repoName });
+      listedItems = itemsOf(response);
+    } catch (error) {
+      if (['CDE_NOT_CONNECTED', 'CDE_RECONNECT_REQUIRED'].includes(error.category)) throw error;
+      if (isOptionalProjectBundleRepositoryFailure(repositoryType, error)) {
+        warnings.push({ code: 'CDE_REPOSITORY_UNAVAILABLE', repositoryType, repoName, message: error.message });
+        continue;
+      }
+      throw error;
+    }
+    for (const listedItem of listedItems) {
+      const packId = String(listedItem?.id || listedItem?._id || listedItem || '');
+      if (!packId) continue;
+      try {
+        let item = listedItem;
+        if (repositoryType !== 'API_MODULE') {
+          const response = await callDataSource(req, 'cde/package/any/one/fetch', { repoName, packId });
+          item = resultOf(response).pack;
+        }
+        if (!item || typeof item !== 'object') {
+          warnings.push({ code: 'CDE_PACKAGE_EMPTY', repositoryType, repoName, packId, message: 'CDE package did not contain a readable source object.' });
+          continue;
+        }
+        const branches = repositoryBranches(item, repositoryType);
+        if (!branches.length) {
+          warnings.push({ code: 'CDE_PACKAGE_NO_BRANCH', repositoryType, repoName, packId, message: 'CDE package has no accessible source branch.' });
+          continue;
+        }
+        for (const branch of branches) {
+          sources.push({
+            projectKey: accessibleProjectKey,
+            repositoryType,
+            repoName,
+            packId,
+            branch: {
+              selector: branch.selector,
+              versionId: branch.versionId,
+              editable: branch.editable,
+              meta: branch.meta,
+            },
+            files: normalizeRemoteFiles(branch, repositoryType, packId),
+          });
+        }
+      } catch (error) {
+        if (['CDE_NOT_CONNECTED', 'CDE_RECONNECT_REQUIRED'].includes(error.category)) throw error;
+        warnings.push({
+          code: error.category || 'CDE_PACKAGE_SCAN_FAILED',
+          repositoryType,
+          repoName,
+          packId,
+          message: error.message || 'CDE package could not be scanned.',
+        });
+      }
+    }
+  }
+  return { projectKey: accessibleProjectKey, sources, warnings };
+}
+
 function routeMatch(pathname, expression) {
   return pathname.match(expression);
 }
@@ -494,6 +564,7 @@ async function handleCde(req, parsedUrl, body) {
 module.exports = {
   CdeApiError,
   canHandleCde,
+  collectProjectSourceFiles,
   handleCde,
   normalizeCdeLoginName,
   projectRepositoryName,

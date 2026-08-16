@@ -379,6 +379,8 @@ async function handleSession(req, parsedUrl, body, res) {
   }
   if (pathname === '/api/session/logout' && req.method === 'POST') {
     assertCsrf(req);
+    const { deleteAllRuntimeSessions } = require('../runtime/runtime-session-store.cjs');
+    await deleteAllRuntimeSessions(session.id);
     await deleteSession(session.id);
     clearSessionCookie(res);
     req.apiConsoleSession = null;

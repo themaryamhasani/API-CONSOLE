@@ -42,6 +42,20 @@ Optional: copy existing UTMS `runtime/api-console/*` files into this folder to m
 
 `CDE_CORE_BASE_URL` defaults to `https://cde.edus.ir`. Change this later to add other origins.
 
+## Runtime discovery and execution
+
+The CDE connection is the control-plane login. Project APIs execute through one of the project's administrator-approved Runtime Profiles instead:
+
+1. Open **Runtime و Discovery**, run the static CDE scan, and review `APP_RAYA_SERVICE_ID` evidence.
+2. The system automatically provisions a Development Runtime Profile for each selected project and every origin in `RUNTIME_DEFAULT_ORIGINS` (default: `https://soha.m.edus.ir`). A `SYSTEM_ADMIN` only needs to add or change an HTTPS origin; `/core-api/v1`, `/devlogin`, `/`, `medugovir`, and `prostage=develop` are applied automatically and remain available as advanced overrides.
+3. The administrator selects the discovered project service ID. The runtime host service ID remains separate and is derived from the approved origin.
+4. Each developer connects the profile using the cellphone already attached to their CDE session and a runtime password. Passwords are never persisted; cookies and `client-id` are encrypted in Redis (or the development-only memory fallback).
+5. Previewed `ds/`, `fr/`, OpenAPI and literal Data Service operations can be synced idempotently to a Collection. Removed source operations become `STALE`; manual changes are preserved or reported as merge conflicts.
+
+Runtime origins must match `RUNTIME_ORIGIN_ALLOWLIST` and resolve only to public addresses. Cross-origin redirects, URL credentials and private/metadata destinations are rejected. Configure a unique `RUNTIME_SESSION_ENCRYPTION_KEY` in production.
+
+Runtime Swagger uses the authenticated API Console proxy. Postman and cURL exports contain the direct login/cookie-jar flow with empty phone/password variables and never export a stored cookie or credential. Data Service execution remains blocked until an administrator supplies an HTTPS base URL and vault-backed authentication configuration.
+
 ## Docs
 
 - [ONLINE_API_CONSOLE.md](docs/ONLINE_API_CONSOLE.md)

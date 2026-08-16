@@ -10,11 +10,27 @@ const {
   LEGACY_CONTEXT_ENABLED,
   attachSession,
   attachConsoleContext,
+  assertCsrf,
   canHandleSession,
   handleSession,
   isBootstrapSystemAdmin,
+  requireSession,
 } = require('../../../session/session-server.cjs');
-const { canHandleCde, handleCde } = require('../../../cde/cde-server.cjs');
+const { canHandleCde, collectProjectSourceFiles, handleCde, normalizeCdeLoginName } = require('../../../cde/cde-server.cjs');
+const { discoverProjectSources } = require('../../../cde/api-discovery.cjs');
+const {
+  executeCoreOperation,
+  finishRuntimeLogin,
+  normalizedProfile,
+  publicRuntimeStatus,
+  startRuntimeLogin,
+  validateRuntimeOrigin,
+} = require('../../../runtime/runtime-core-client.cjs');
+const {
+  deleteRuntimeSession,
+  getRuntimeSession,
+  setRuntimeSession,
+} = require('../../../runtime/runtime-session-store.cjs');
 const { serveOpenApiDocs } = require('../../../../openapi/serve-docs.cjs');
 
 const REPOSITORY_ROOT = path.resolve(__dirname, '../../../../../../..');
@@ -1693,7 +1709,7 @@ function defaultRunners() {
 
 function defaultStore() {
   return {
-    version: 1,
+    version: 2,
     collections: [],
     requests: [],
     executions: [],
@@ -1708,6 +1724,8 @@ function defaultStore() {
     notifications: [],
     directoryUsers: [],
     directoryRoleAssignments: [],
+    runtimeProfiles: [],
+    discoverySnapshots: [],
     environments: defaultEnvironments(),
     runners: defaultRunners(),
     globalVariables: defaultGlobalVariables(),
@@ -1767,10 +1785,13 @@ function normalizeStoreShape(raw) {
     notifications: Array.isArray(raw.notifications) ? raw.notifications : [],
     directoryUsers: Array.isArray(raw.directoryUsers) ? raw.directoryUsers : [],
     directoryRoleAssignments: Array.isArray(raw.directoryRoleAssignments) ? raw.directoryRoleAssignments : [],
+    runtimeProfiles: Array.isArray(raw.runtimeProfiles) ? raw.runtimeProfiles : [],
+    discoverySnapshots: Array.isArray(raw.discoverySnapshots) ? raw.discoverySnapshots : [],
     environments: raw.environments?.length ? raw.environments : defaultEnvironments(),
     runners: raw.runners?.length ? raw.runners : defaultRunners(),
     globalVariables: raw.globalVariables?.length ? raw.globalVariables : defaultGlobalVariables(),
     auditLog: Array.isArray(raw.auditLog) ? raw.auditLog : [],
+    version: 2,
   };
   const knownRequestIds = new Set(next.requests.map(request => request.id));
   next.references = next.references.filter(reference => !reference.requestId || knownRequestIds.has(reference.requestId));
@@ -2667,6 +2688,7 @@ async function performHttpRequest(transport, validation, redirectHistory, signal
             tlsVerified: transport.tls.verifyCertificate,
             safePreviewMode: responsePreviewMode(contentType),
             rawLocation: res.headers.location,
+            ...(transport.captureSensitiveJson ? { internalBody: bodyPreview } : {}),
           });
         } catch (error) {
           reject(error);
@@ -2700,6 +2722,7 @@ async function performHttpRequest(transport, validation, redirectHistory, signal
 
 async function executeWithRedirects(transport) {
   const started = Date.now();
+  const initialOrigin = new URL(transport.url).origin;
   const redirectHistory = [];
   let current = safeClone(transport);
   let validation = await validateDestination(current.url);
@@ -2725,6 +2748,9 @@ async function executeWithRedirects(transport) {
       }
       const from = current.url;
       const to = new URL(response.rawLocation, current.url).toString();
+      if (transport.sameOriginRedirectsOnly && new URL(to).origin !== initialOrigin) {
+        throw new ApiConsoleError('REDIRECT_BLOCKED', 'A cross-origin redirect was rejected.', 502);
+      }
       const nextValidation = await validateDestination(to);
       redirectHistory.push({ from, to, statusCode: response.statusCode, allowed: true });
       current.url = to;
@@ -4159,6 +4185,17 @@ function sendJson(res, statusCode, payload) {
   res.end(body);
 }
 
+function sendRaw(res, statusCode, contentType, body, headers = {}) {
+  const value = Buffer.isBuffer(body) ? body : Buffer.from(String(body || ''), 'utf8');
+  res.writeHead(statusCode, {
+    'content-type': contentType,
+    'content-length': value.length,
+    'cache-control': 'no-store',
+    ...headers,
+  });
+  res.end(value);
+}
+
 function sendError(res, error) {
   const statusCode = error.statusCode || 500;
   const details = error.details && typeof error.details === 'object'
@@ -4202,6 +4239,853 @@ function getPathParts(pathname) {
     return pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean);
   }
   return pathname.replace(/^\/api\/api-console\/?/, '').split('/').filter(Boolean);
+}
+
+const RUNTIME_KINDS = new Set(['DEVELOPMENT', 'TEST', 'PRE_PRODUCTION', 'PRODUCTION']);
+const DATA_SERVICE_AUTH_MODES = new Set(['NONE', 'BEARER', 'BASIC', 'TOKEN_ENDPOINT']);
+const DEFAULT_RUNTIME_ORIGIN = 'https://soha.m.edus.ir';
+
+function configuredDefaultRuntimeOrigins() {
+  return Array.from(new Set(String(process.env.RUNTIME_DEFAULT_ORIGINS || DEFAULT_RUNTIME_ORIGIN)
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)));
+}
+
+function runtimeKindLabel(kind) {
+  return ({
+    DEVELOPMENT: 'Development',
+    TEST: 'Test',
+    PRE_PRODUCTION: 'Pre-production',
+    PRODUCTION: 'Production',
+  })[kind] || 'Runtime';
+}
+
+function assertRuntimeProjectAccess(projectKey, context) {
+  const key = String(projectKey || '').trim();
+  if (!key) throw new ApiConsoleError('RUNTIME_PROJECT_REQUIRED', 'Runtime projectKey is required.', 422);
+  assertApplicationInContext(key, context);
+  return key;
+}
+
+function latestDiscovery(projectKey) {
+  return store.discoverySnapshots
+    .filter(snapshot => snapshot.projectKey === projectKey)
+    .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)))[0] || null;
+}
+
+function runtimeProfileView(profile) {
+  return {
+    ...profile,
+    dataService: profile.dataService ? {
+      ...profile.dataService,
+      authConfigured: Boolean(profile.dataService.authSecretRef || profile.dataService.authMode === 'NONE'),
+      authSecretRef: undefined,
+    } : undefined,
+  };
+}
+
+function normalizeServiceId(value) {
+  const serviceId = String(value || '').trim().toLowerCase();
+  if (!serviceId) return '';
+  if (!/^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(serviceId) || serviceId.includes('..')) {
+    throw new ApiConsoleError('RUNTIME_SERVICE_ID_INVALID', 'projectServiceId must be a host-style service identifier.', 422);
+  }
+  return serviceId;
+}
+
+function normalizeDataServiceProfile(input, current = {}) {
+  const data = input && typeof input === 'object' ? input : {};
+  const authMode = String(data.authMode || current.authMode || 'NONE').toUpperCase();
+  if (!DATA_SERVICE_AUTH_MODES.has(authMode)) {
+    throw new ApiConsoleError('DATA_SERVICE_AUTH_INVALID', 'Unsupported Data Service authentication mode.', 422);
+  }
+  let baseUrl = String(data.baseUrl ?? current.baseUrl ?? '').trim();
+  if (baseUrl) {
+    let parsed;
+    try {
+      parsed = new URL(baseUrl);
+    } catch {
+      throw new ApiConsoleError('DATA_SERVICE_BASE_URL_INVALID', 'Data Service base URL is invalid.', 422);
+    }
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new ApiConsoleError('DATA_SERVICE_BASE_URL_INVALID', 'Data Service base URL must use HTTPS and cannot contain credentials, query, or fragment.', 422);
+    }
+    baseUrl = parsed.toString().replace(/\/$/, '');
+  }
+  let authSecretRef = current.authSecretRef;
+  if (Object.prototype.hasOwnProperty.call(data, 'authSecret')) {
+    authSecretRef = data.authSecret ? rememberSecret(String(data.authSecret)) : undefined;
+  }
+  return {
+    baseUrl,
+    authMode,
+    username: String(data.username ?? current.username ?? ''),
+    tokenPath: String(data.tokenPath ?? current.tokenPath ?? '/auth/getToken'),
+    authSecretRef,
+    executionEnabled: Boolean(baseUrl && (authMode === 'NONE' || authSecretRef) && (authMode !== 'TOKEN_ENDPOINT' || String(data.username ?? current.username ?? '').trim())),
+  };
+}
+
+function normalizeRuntimeProfileInput(data, context, current = null) {
+  const applicationId = String(data.applicationId || data.projectKey || current?.applicationId || '').trim();
+  assertRuntimeProjectAccess(applicationId, context);
+  const kind = String(data.kind || current?.kind || 'DEVELOPMENT').toUpperCase();
+  if (!RUNTIME_KINDS.has(kind)) throw new ApiConsoleError('RUNTIME_PROFILE_INVALID', 'Runtime environment kind is invalid.', 422);
+  const normalized = normalizedProfile({
+    ...current,
+    ...data,
+    id: current?.id || data.id || makeId('runtime-profile'),
+    applicationId,
+    projectKey: applicationId,
+  });
+  const projectServiceId = normalizeServiceId(data.projectServiceId ?? current?.projectServiceId);
+  const latest = latestDiscovery(applicationId);
+  const candidate = latest?.projectServiceIdCandidates?.find(item => String(item.value).toLowerCase() === projectServiceId);
+  let evidence = data.serviceIdEvidence ?? current?.serviceIdEvidence;
+  if (candidate && !evidence) evidence = candidate.evidence;
+  if (projectServiceId && (!Array.isArray(evidence) || !evidence.length)) {
+    throw new ApiConsoleError('RUNTIME_SERVICE_ID_EVIDENCE_REQUIRED', 'Evidence is required before approving projectServiceId.', 422);
+  }
+  const now = nowIso();
+  return {
+    id: normalized.id,
+    applicationId,
+    projectKey: applicationId,
+    name: String(data.name ?? current?.name ?? `${applicationId} ${runtimeKindLabel(kind)}`).trim(),
+    kind,
+    origin: normalized.origin,
+    coreBasePath: normalized.coreBasePath,
+    loginPath: normalized.loginPath,
+    appRefererPath: normalized.appRefererPath,
+    runtimeServiceId: normalized.runtimeServiceId,
+    projectServiceId: projectServiceId || undefined,
+    serviceIdEvidence: projectServiceId ? safeClone(evidence) : [],
+    serviceIdApprovedAt: projectServiceId ? (current?.projectServiceId === projectServiceId ? current.serviceIdApprovedAt : now) : undefined,
+    serviceIdApprovedBy: projectServiceId ? context.userId : undefined,
+    userSource: normalized.userSource,
+    prostage: String(data.prostage ?? current?.prostage ?? (kind === 'DEVELOPMENT' ? 'develop' : '')).trim() || undefined,
+    dataService: normalizeDataServiceProfile(data.dataService, current?.dataService),
+    enabled: data.enabled === undefined ? current?.enabled !== false : data.enabled === true,
+    rowVersion: makeId('row'),
+    createdAt: current?.createdAt || now,
+    createdBy: current?.createdBy || context.userId,
+    updatedAt: now,
+    updatedBy: context.userId,
+  };
+}
+
+function ensureDefaultRuntimeProfiles(applicationId, context) {
+  let changed = false;
+  for (const origin of configuredDefaultRuntimeOrigins()) {
+    let normalizedOrigin;
+    try {
+      normalizedOrigin = normalizedProfile({ origin }).origin;
+    } catch (error) {
+      throw new ApiConsoleError(
+        'RUNTIME_DEFAULT_ORIGIN_INVALID',
+        `RUNTIME_DEFAULT_ORIGINS contains an invalid or disallowed origin: ${origin}`,
+        500,
+        { cause: error?.category || error?.message },
+      );
+    }
+    // A disabled profile is an explicit administrator decision and must not be recreated.
+    if (store.runtimeProfiles.some(profile => profile.applicationId === applicationId && profile.origin === normalizedOrigin)) continue;
+    const profile = normalizeRuntimeProfileInput({ applicationId, origin: normalizedOrigin }, context);
+    profile.createdBy = 'SYSTEM_DEFAULT';
+    profile.updatedBy = 'SYSTEM_DEFAULT';
+    store.runtimeProfiles.push(profile);
+    audit('RUNTIME_PROFILE_DEFAULT_PROVISIONED', { userId: 'SYSTEM_DEFAULT', role: 'SYSTEM' }, {
+      applicationId,
+      profileId: profile.id,
+      origin: profile.origin,
+    });
+    changed = true;
+  }
+  if (changed) saveStore(store);
+}
+
+function findRuntimeProfile(profileId, context, options = {}) {
+  const profile = store.runtimeProfiles.find(item => item.id === String(profileId));
+  if (!profile || (!options.includeDisabled && profile.enabled === false)) {
+    throw new ApiConsoleError('RUNTIME_PROFILE_NOT_FOUND', 'Runtime Profile was not found.', 404);
+  }
+  assertRuntimeProjectAccess(profile.applicationId, context);
+  return profile;
+}
+
+function runtimeSessionIdentity(req, context) {
+  const appSession = requireSession(req);
+  const phone = normalizeCdeLoginName(context.user?.phoneNumber || appSession.userLoginName);
+  if (!phone) throw new ApiConsoleError('RUNTIME_IDENTITY_REQUIRED', 'The connected CDE account does not expose a valid cellphone number.', 409);
+  return { appSession, phone };
+}
+
+function discoveryPreview(current, previous) {
+  const oldById = new Map((previous?.operations || []).map(operation => [operation.id, operation]));
+  const nextById = new Map((current.operations || []).map(operation => [operation.id, operation]));
+  const operations = current.operations.map(operation => ({
+    ...operation,
+    previewState: !oldById.has(operation.id)
+      ? 'NEW'
+      : oldById.get(operation.id).sourceFingerprint === operation.sourceFingerprint ? 'UNCHANGED' : 'CHANGED',
+  }));
+  const removed = (previous?.operations || [])
+    .filter(operation => !nextById.has(operation.id))
+    .map(operation => ({ ...operation, previewState: 'REMOVED' }));
+  const all = [...operations, ...removed];
+  return {
+    operations,
+    removedOperations: removed,
+    counts: {
+      new: all.filter(item => item.previewState === 'NEW').length,
+      changed: all.filter(item => item.previewState === 'CHANGED').length,
+      unchanged: all.filter(item => item.previewState === 'UNCHANGED').length,
+      removed: removed.length,
+      needsInput: operations.filter(item => item.schemaCompleteness === 'NEEDS_INPUT').length,
+    },
+  };
+}
+
+async function scanRuntimeDiscovery(req, projectKey, context) {
+  assertCsrf(req);
+  assertRuntimeProjectAccess(projectKey, context);
+  const previous = latestDiscovery(projectKey);
+  const collected = await collectProjectSourceFiles(req, projectKey);
+  const discovered = discoverProjectSources(projectKey, collected.sources);
+  const preview = discoveryPreview(discovered, previous);
+  const snapshot = {
+    id: makeId('discovery'),
+    projectKey,
+    applicationId: projectKey,
+    status: discovered.serviceIdStatus === 'RESOLVED' ? 'READY' : 'BLOCKED_SERVICE_ID',
+    parserVersion: discovered.parserVersion,
+    serviceIdStatus: discovered.serviceIdStatus,
+    projectServiceIdCandidates: discovered.projectServiceIdCandidates,
+    operations: preview.operations,
+    removedOperations: preview.removedOperations,
+    warnings: [...collected.warnings, ...discovered.warnings],
+    stats: { ...discovered.stats, ...preview.counts },
+    scannedBy: context.userId,
+    createdAt: nowIso(),
+    sourceFingerprint: createHash('sha256').update(JSON.stringify(discovered.operations.map(item => item.sourceFingerprint).sort())).digest('hex'),
+  };
+  store.discoverySnapshots.unshift(snapshot);
+  const keepIds = new Set(store.discoverySnapshots.filter(item => item.projectKey === projectKey).slice(0, 20).map(item => item.id));
+  store.discoverySnapshots = store.discoverySnapshots.filter(item => item.projectKey !== projectKey || keepIds.has(item.id));
+  audit('CDE_API_DISCOVERY_SCANNED', context, { projectKey, snapshotId: snapshot.id, operationCount: snapshot.operations.length, serviceIdStatus: snapshot.serviceIdStatus });
+  saveStore(store);
+  return safeClone(snapshot);
+}
+
+function normalizedRequestForDiscoveredOperation(operation, profile) {
+  const normalized = createBlankNormalizedRequest();
+  normalized.method = operation.type === 'REST' ? operation.method : 'POST';
+  if (operation.type === 'CORE_QUERY') {
+    normalized.url = `${profile.origin}${profile.coreBasePath}/data-provider/get-data-source`;
+    normalized.body = {
+      type: 'json',
+      contentType: 'application/json',
+      value: { serviceId: profile.projectServiceId || '{{projectServiceId}}', key: operation.sourceId.replace(/^ds\//, ''), params: operation.payloadExample || {} },
+      raw: JSON.stringify({ serviceId: profile.projectServiceId || '{{projectServiceId}}', key: operation.sourceId.replace(/^ds\//, ''), params: operation.payloadExample || {} }, null, 2),
+    };
+  } else if (operation.type === 'CORE_COMMAND') {
+    normalized.url = `${profile.origin}${profile.coreBasePath}/data-provider/store-form-data`;
+    normalized.body = {
+      type: 'json',
+      contentType: 'application/json',
+      value: { serviceId: profile.projectServiceId || '{{projectServiceId}}', formId: operation.sourceId.replace(/^fr\//, ''), data: operation.payloadExample || {} },
+      raw: JSON.stringify({ serviceId: profile.projectServiceId || '{{projectServiceId}}', formId: operation.sourceId.replace(/^fr\//, ''), data: operation.payloadExample || {} }, null, 2),
+    };
+  } else {
+    normalized.url = `${profile.dataService?.baseUrl || '{{dataServiceBaseUrl}}'}${operation.path}`;
+    if (!['GET', 'HEAD'].includes(operation.method)) {
+      normalized.body = {
+        type: 'json',
+        contentType: 'application/json',
+        value: operation.payloadExample || {},
+        raw: JSON.stringify(operation.payloadExample || {}, null, 2),
+      };
+    }
+  }
+  normalized.headers = [
+    createHeader('accept', 'application/json', 0, 'DISCOVERY'),
+    ...(!['GET', 'HEAD'].includes(normalized.method) ? [createHeader('content-type', 'application/json; charset=UTF-8', 1, 'DISCOVERY')] : []),
+  ];
+  return normalized;
+}
+
+function sourceControlledDefinition(operation, profile) {
+  const normalized = normalizedRequestForDiscoveredOperation(operation, profile);
+  return {
+    name: operation.name || operation.sourceId,
+    description: `Discovered from ${operation.sourceKind}: ${operation.sourceId}`,
+    method: normalized.method,
+    urlTemplate: normalized.url,
+    bodyType: normalized.body?.type || 'none',
+    bodyTemplate: normalized.body?.raw || '',
+    classification: operation.type === 'CORE_QUERY'
+      ? buildClassification('CORE_QUERY', { serviceId: profile.projectServiceId, key: operation.sourceId.replace(/^ds\//, '') }, CORE_QUERY_ENDPOINT)
+      : operation.type === 'CORE_COMMAND'
+        ? buildClassification('CORE_COMMAND', { serviceId: profile.projectServiceId, formId: operation.sourceId.replace(/^fr\//, '') }, CORE_COMMAND_ENDPOINT)
+        : buildClassification('GENERIC_HTTP', null, null),
+  };
+}
+
+function equalSourceField(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mergeDiscoveredRequest(existing, operation, profile, context) {
+  const incoming = sourceControlledDefinition(operation, profile);
+  const base = existing.sourceSync?.baseDefinition || {};
+  const conflicts = [];
+  const next = { ...existing };
+  for (const [field, incomingValue] of Object.entries(incoming)) {
+    const localValue = existing[field];
+    const baseValue = base[field];
+    const localChanged = !equalSourceField(localValue, baseValue);
+    const sourceChanged = !equalSourceField(incomingValue, baseValue);
+    if (localChanged && sourceChanged && !equalSourceField(localValue, incomingValue)) {
+      conflicts.push({ field, base: baseValue, local: localValue, incoming: incomingValue });
+    } else if (!localChanged) {
+      next[field] = incomingValue;
+    }
+  }
+  next.runtimeBinding = {
+    ...existing.runtimeBinding,
+    runtimeProfileId: profile.id,
+    projectServiceId: profile.projectServiceId,
+    sourceFingerprint: operation.sourceFingerprint,
+  };
+  next.sourceSync = {
+    status: conflicts.length ? 'CONFLICT' : 'SYNCED',
+    sourceFingerprint: operation.sourceFingerprint,
+    baseDefinition: conflicts.length ? base : incoming,
+    incomingDefinition: conflicts.length ? incoming : undefined,
+    conflicts,
+    syncedAt: nowIso(),
+    syncedBy: context.userId,
+  };
+  next.updatedAt = nowIso();
+  next.updatedBy = context.userId;
+  next.version = Number(existing.version || 1) + 1;
+  next.documentation = refreshDocumentationMetadata(next);
+  return next;
+}
+
+function syncDiscoverySnapshot(snapshot, body, context) {
+  const collectionId = String(body.collectionId || '');
+  const collection = store.collections.find(item => item.id === collectionId);
+  if (!collection || !belongsToUser(collection, context) || collection.applicationId !== snapshot.projectKey) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Select one of your Collections for the discovered project.', 403);
+  }
+  const profile = findRuntimeProfile(body.runtimeProfileId, context);
+  if (profile.applicationId !== snapshot.projectKey) throw new ApiConsoleError('RUNTIME_BINDING_INVALID', 'Runtime Profile and discovery project do not match.', 422);
+  const selectedIds = new Set(Array.isArray(body.operationIds) && body.operationIds.length ? body.operationIds.map(String) : snapshot.operations.map(item => item.id));
+  const result = { created: [], updated: [], unchanged: [], conflicts: [], stale: [] };
+  for (const operation of snapshot.operations.filter(item => selectedIds.has(item.id))) {
+    const existing = store.requests.find(request =>
+      request.collectionId === collectionId &&
+      request.runtimeBinding?.operationId === operation.id &&
+      request.status !== 'ARCHIVED'
+    );
+    if (!existing) {
+      const normalized = normalizedRequestForDiscoveredOperation(operation, profile);
+      const request = definitionFromNormalized(normalized, {
+        id: makeId('api-req'),
+        applicationId: snapshot.projectKey,
+        collectionId,
+        environmentId: collection.environmentId || 'env-development',
+        name: operation.name || operation.sourceId,
+        description: `Discovered from ${operation.sourceKind}: ${operation.sourceId}`,
+        userId: context.userId,
+        userName: context.user?.fullName || context.userId,
+      });
+      const controlled = sourceControlledDefinition(operation, profile);
+      Object.assign(request, controlled);
+      request.sourceType = 'CDE_DISCOVERY';
+      request.runtimeBinding = {
+        runtimeProfileId: profile.id,
+        projectKey: snapshot.projectKey,
+        projectServiceId: profile.projectServiceId,
+        sourceKind: operation.sourceKind,
+        operationId: operation.id,
+        moduleId: operation.moduleId,
+        sourceFingerprint: operation.sourceFingerprint,
+        requiresRuntimeSession: operation.sourceKind === 'API_MODULE',
+      };
+      request.sourceSync = { status: 'SYNCED', sourceFingerprint: operation.sourceFingerprint, baseDefinition: controlled, conflicts: [], syncedAt: nowIso(), syncedBy: context.userId };
+      request.schemaCompleteness = operation.schemaCompleteness;
+      request.sourceEvidence = operation.evidence;
+      store.requests.unshift(request);
+      result.created.push(request.id);
+      continue;
+    }
+    const conflictResolution = body.conflictResolutions?.[existing.id];
+    if (existing.sourceSync?.status === 'CONFLICT' && conflictResolution && typeof conflictResolution === 'object') {
+      const incoming = sourceControlledDefinition(operation, profile);
+      const conflictFields = (existing.sourceSync.conflicts || []).map(conflict => conflict.field);
+      const complete = conflictFields.every(field => ['SOURCE', 'LOCAL'].includes(conflictResolution[field]));
+      if (complete) {
+        conflictFields.forEach(field => {
+          if (conflictResolution[field] === 'SOURCE') existing[field] = safeClone(incoming[field]);
+        });
+        existing.runtimeBinding = {
+          ...existing.runtimeBinding,
+          runtimeProfileId: profile.id,
+          projectServiceId: profile.projectServiceId,
+          sourceFingerprint: operation.sourceFingerprint,
+        };
+        existing.sourceSync = {
+          status: 'SYNCED',
+          sourceFingerprint: operation.sourceFingerprint,
+          baseDefinition: incoming,
+          conflicts: [],
+          syncedAt: nowIso(),
+          syncedBy: context.userId,
+        };
+        existing.updatedAt = nowIso();
+        existing.updatedBy = context.userId;
+        existing.version = Number(existing.version || 1) + 1;
+        existing.documentation = refreshDocumentationMetadata(existing);
+        result.updated.push(existing.id);
+        continue;
+      }
+    }
+    if (existing.runtimeBinding.sourceFingerprint === operation.sourceFingerprint &&
+      existing.runtimeBinding.runtimeProfileId === profile.id &&
+      existing.runtimeBinding.projectServiceId === profile.projectServiceId &&
+      existing.sourceSync?.status === 'SYNCED') {
+      result.unchanged.push(existing.id);
+      continue;
+    }
+    const merged = mergeDiscoveredRequest(existing, operation, profile, context);
+    store.requests[store.requests.indexOf(existing)] = merged;
+    if (merged.sourceSync.status === 'CONFLICT') result.conflicts.push({ requestId: existing.id, conflicts: merged.sourceSync.conflicts });
+    else result.updated.push(existing.id);
+  }
+  const currentOperationIds = new Set(snapshot.operations.map(item => item.id));
+  store.requests.filter(request =>
+    request.collectionId === collectionId &&
+    request.runtimeBinding?.projectKey === snapshot.projectKey &&
+    request.sourceType === 'CDE_DISCOVERY' &&
+    request.status !== 'ARCHIVED' &&
+    !currentOperationIds.has(request.runtimeBinding.operationId)
+  ).forEach(request => {
+    request.sourceSync = { ...(request.sourceSync || {}), status: 'STALE', staleAt: nowIso(), syncedBy: context.userId };
+    request.updatedAt = nowIso();
+    result.stale.push(request.id);
+  });
+  audit('CDE_API_DISCOVERY_SYNCED', context, { snapshotId: snapshot.id, collectionId, profileId: profile.id, counts: Object.fromEntries(Object.entries(result).map(([key, value]) => [key, value.length])) });
+  saveStore(store);
+  return result;
+}
+
+async function executeDataServiceOperation(profile, operation, input) {
+  const config = profile.dataService || {};
+  if (!config.executionEnabled || !config.baseUrl) {
+    throw new ApiConsoleError('DATA_SERVICE_EXECUTION_BLOCKED', 'Data Service execution requires an administrator-approved base URL and authentication secret.', 409);
+  }
+  const url = new URL(operation.path, `${config.baseUrl}/`).toString();
+  const approvedBase = new URL(`${config.baseUrl}/`);
+  const target = new URL(url);
+  if (target.origin !== approvedBase.origin || !target.pathname.startsWith(approvedBase.pathname)) {
+    throw new ApiConsoleError('RUNTIME_BINDING_INVALID', 'Data Service operation escaped the approved base URL.', 422);
+  }
+  const headers = [createHeader('accept', 'application/json', 0, 'RUNTIME')];
+  if (!['GET', 'HEAD'].includes(operation.method)) headers.push(createHeader('content-type', 'application/json; charset=UTF-8', 1, 'RUNTIME'));
+  if (config.authMode !== 'NONE') {
+    const errors = [];
+    const secret = resolveSecretReference(config.authSecretRef, errors);
+    if (errors.length || !secret) throw new ApiConsoleError('DATA_SERVICE_AUTH_REQUIRED', 'Data Service authentication secret is unavailable.', 409);
+    if (config.authMode === 'BEARER') headers.push(createHeader('authorization', `Bearer ${secret}`, headers.length, 'RUNTIME'));
+    if (config.authMode === 'BASIC') headers.push(createHeader('authorization', `Basic ${Buffer.from(`${config.username}:${secret}`).toString('base64')}`, headers.length, 'RUNTIME'));
+    if (config.authMode === 'TOKEN_ENDPOINT') {
+      const tokenUrl = new URL(config.tokenPath || '/auth/getToken', `${config.baseUrl}/`);
+      if (tokenUrl.origin !== approvedBase.origin) throw new ApiConsoleError('DATA_SERVICE_AUTH_INVALID', 'Data Service token endpoint must stay on the approved origin.', 422);
+      const authResponse = await executeWithRedirects({
+        method: 'POST',
+        url: tokenUrl.toString(),
+        headers: [createHeader('accept', 'application/json', 0, 'RUNTIME'), createHeader('content-type', 'application/json; charset=UTF-8', 1, 'RUNTIME')],
+        cookies: [],
+        body: { type: 'json', value: null, raw: JSON.stringify({ username: config.username, password: secret }), contentType: 'application/json' },
+        tls: { verifyCertificate: true },
+        sameOriginRedirectsOnly: true,
+        captureSensitiveJson: true,
+      });
+      let token;
+      try {
+        const parsed = JSON.parse(authResponse.internalBody || '{}');
+        token = parsed.token || parsed.accessToken || parsed.access_token || parsed.Result?.token;
+      } catch {
+        token = undefined;
+      }
+      delete authResponse.internalBody;
+      if (authResponse.statusCode >= 400 || !token) throw new ApiConsoleError('DATA_SERVICE_AUTH_REQUIRED', 'Data Service token endpoint did not return a usable token.', 401);
+      headers.push(createHeader('authorization', `Bearer ${token}`, headers.length, 'RUNTIME'));
+    }
+  }
+  const body = ['GET', 'HEAD'].includes(operation.method)
+    ? { type: 'none', value: null, raw: '' }
+    : { type: 'json', value: input || {}, raw: JSON.stringify(input || {}), contentType: 'application/json' };
+  return executeWithRedirects({
+    method: operation.method,
+    url,
+    headers,
+    cookies: [],
+    body,
+    tls: { verifyCertificate: true },
+    sameOriginRedirectsOnly: true,
+  });
+}
+
+async function executeRuntimeDiscoveredOperation(req, operationId, body, context) {
+  assertCsrf(req);
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecute)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to execute Runtime operations.', 403);
+  }
+  const projectKey = String(body.projectKey || context.applicationId || '');
+  assertRuntimeProjectAccess(projectKey, context);
+  const snapshot = latestDiscovery(projectKey);
+  const operation = snapshot?.operations?.find(item => item.id === operationId);
+  if (!operation) throw new ApiConsoleError('RUNTIME_OPERATION_NOT_FOUND', 'The operation is not present in the latest discovery snapshot.', 404);
+  const profile = findRuntimeProfile(body.runtimeProfileId, context);
+  if (profile.applicationId !== projectKey) throw new ApiConsoleError('RUNTIME_BINDING_INVALID', 'Runtime Profile, project, and operation do not match.', 422);
+  if (body.expectedProjectServiceId && profile.projectServiceId !== body.expectedProjectServiceId) {
+    throw new ApiConsoleError('RUNTIME_BINDING_INVALID', 'The approved project service ID changed after this Request was synced. Sync discovery again.', 409);
+  }
+  if (['PRE_PRODUCTION', 'PRODUCTION'].includes(profile.kind) && !roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteProduction)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'This Runtime environment requires elevated execution permission.', 403);
+  }
+  if (!profile.projectServiceId && operation.sourceKind === 'API_MODULE') {
+    throw new ApiConsoleError('RUNTIME_SERVICE_ID_REQUIRED', 'A System Administrator must approve projectServiceId before Runtime execution.', 409);
+  }
+  if (operation.type === 'CORE_COMMAND') {
+    if (body.confirmed !== true) throw new ApiConsoleError('RUNTIME_COMMAND_CONFIRMATION_REQUIRED', 'Confirm this Core Command before execution.', 409);
+    if (context.role === 'DEVELOPER' && profile.kind !== 'DEVELOPMENT') {
+      throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Developers may execute Core Commands only on DEVELOPMENT Runtime Profiles.', 403);
+    }
+    if (context.role !== 'DEVELOPER' && !roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteCommand)) {
+      throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Core Command execution requires elevated permission.', 403);
+    }
+    if (['PRE_PRODUCTION', 'PRODUCTION'].includes(profile.kind) && !roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteProductionCommand)) {
+      throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Core Command execution on this Runtime environment requires elevated permission.', 403);
+    }
+    if (profile.kind === 'PRODUCTION' && !String(body.businessJustification || '').trim()) {
+      throw new ApiConsoleError('RUNTIME_COMMAND_CONFIRMATION_REQUIRED', 'Production Core Command requires a business justification.', 409);
+    }
+  }
+  const startedAt = nowIso();
+  let response;
+  if (operation.sourceKind === 'DATA_SERVICE') {
+    response = await executeDataServiceOperation(profile, operation, body.input);
+  } else {
+    const { appSession, phone } = runtimeSessionIdentity(req, context);
+    const state = await getRuntimeSession(appSession.id, profile.id);
+    if (!state || state.phase !== 'CONNECTED' || normalizeCdeLoginName(state.loginName) !== phone) {
+      throw new ApiConsoleError('RUNTIME_SESSION_REQUIRED', 'Connect this Runtime Profile with the same CDE cellphone before execution.', 401);
+    }
+    const call = await executeCoreOperation(state, profile, operation, body.input || {});
+    if (call.response?.Result?.IsUserLogin === false) {
+      await deleteRuntimeSession(appSession.id, profile.id);
+      throw new ApiConsoleError('RUNTIME_SESSION_EXPIRED', 'Runtime session expired. Connect again.', 401);
+    }
+    await setRuntimeSession(appSession.id, profile.id, call.state);
+    const serialized = JSON.stringify(call.response);
+    response = {
+      statusCode: 200,
+      statusText: 'OK',
+      headers: [{ name: 'content-type', value: 'application/json; charset=utf-8' }],
+      cookies: [],
+      bodyPreview: sanitizeText(serialized),
+      contentType: 'application/json; charset=utf-8',
+      responseSize: Buffer.byteLength(serialized),
+      durationMs: Date.now() - new Date(startedAt).getTime(),
+      redirectHistory: [],
+      tlsVerified: true,
+      safePreviewMode: 'JSON',
+    };
+  }
+  const execution = {
+    id: makeId('runtime-exec'),
+    operationId: operation.id,
+    requestId: body.requestId,
+    applicationId: projectKey,
+    runtimeProfileId: profile.id,
+    sourceKind: operation.sourceKind,
+    executedBy: context.userId,
+    startedAt,
+    completedAt: nowIso(),
+    status: 'COMPLETED',
+    statusCode: response.statusCode,
+    responseSize: response.responseSize,
+    responseContentType: response.contentType,
+    response,
+    transportResult: response.statusCode < 400 ? 'SUCCESS' : 'FAILED',
+    evidenceType: 'RUNTIME_EXECUTION',
+    correlationId: makeId('api-corr'),
+  };
+  store.executions.unshift(execution);
+  audit('RUNTIME_OPERATION_EXECUTED', context, { operationId, profileId: profile.id, projectKey, statusCode: response.statusCode });
+  saveStore(store);
+  return safeClone(execution);
+}
+
+function runtimeOpenApiDocument(projectKey, profile, snapshot) {
+  const paths = {};
+  for (const operation of snapshot.operations || []) {
+    const proxyPath = `/api/api-console/runtime/operations/${operation.id}/execute`;
+    paths[proxyPath] = {
+      post: {
+        tags: [operation.type === 'CORE_QUERY' ? 'Core Queries' : operation.type === 'CORE_COMMAND' ? 'Core Commands' : 'Data Service'],
+        operationId: `execute_${operation.id.replace(/[^a-zA-Z0-9_]/g, '_')}`,
+        summary: operation.name || operation.sourceId,
+        description: `${operation.sourceKind} ${operation.sourceId}. Credentials and Runtime cookies are injected only by the API Console backend.`,
+        parameters: [{ name: 'x-csrf-token', in: 'header', required: true, schema: { type: 'string' }, description: 'API Console CSRF token; the generated docs fill this automatically.' }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['projectKey', 'runtimeProfileId', 'input'],
+                properties: {
+                  projectKey: { type: 'string', const: projectKey, default: projectKey },
+                  runtimeProfileId: { type: 'string', const: profile.id, default: profile.id },
+                  input: operation.schema || { type: 'object', additionalProperties: true },
+                  ...(operation.type === 'CORE_COMMAND' ? { confirmed: { type: 'boolean', const: true, default: true } } : {}),
+                },
+              },
+              example: {
+                projectKey,
+                runtimeProfileId: profile.id,
+                input: operation.payloadExample || {},
+                ...(operation.type === 'CORE_COMMAND' ? { confirmed: true } : {}),
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Runtime execution result' },
+          401: { description: 'Runtime session is missing or expired' },
+          403: { description: 'Role, CSRF, or environment policy rejected the operation' },
+          409: { description: 'Profile configuration, confirmation, or Data Service credentials are incomplete' },
+        },
+        security: [{ appSession: [] }],
+        'x-runtime-binding': { profileId: profile.id, projectKey, operationId: operation.id, sourceFingerprint: operation.sourceFingerprint },
+      },
+    };
+  }
+  return {
+    openapi: '3.1.0',
+    info: { title: `${projectKey} Runtime API`, version: '1.0.0', description: `Secure proxy operations for ${profile.name}.` },
+    servers: [{ url: '/' }],
+    tags: [{ name: 'Core Queries' }, { name: 'Core Commands' }, { name: 'Data Service' }],
+    paths,
+    components: { securitySchemes: { appSession: { type: 'apiKey', in: 'cookie', name: process.env.API_CONSOLE_SESSION_COOKIE || 'api_console_session' } } },
+  };
+}
+
+function runtimeDocsHtml(projectKey, profile) {
+  const specUrl = `/api/api-console/projects/${encodeURIComponent(projectKey)}/runtime-profiles/${encodeURIComponent(profile.id)}/openapi.json`;
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${sanitizeText(projectKey)} Runtime API</title><link rel="stylesheet" href="/api/docs/swagger-ui.css"/></head>
+<body><div id="swagger-ui"></div><script src="/api/docs/swagger-ui-bundle.js"></script><script src="/api/docs/swagger-ui-standalone-preset.js"></script>
+<script>(async function(){
+  const session = await fetch('/api/session',{credentials:'same-origin'}).then(r=>r.json());
+  window.ui=SwaggerUIBundle({url:${JSON.stringify(specUrl).replace(/</g, '\\u003c')},dom_id:'#swagger-ui',presets:[SwaggerUIBundle.presets.apis,SwaggerUIStandalonePreset],layout:'StandaloneLayout',requestInterceptor:function(request){request.credentials='same-origin';request.headers=request.headers||{};request.headers['x-csrf-token']=session.csrfToken||'';return request;}});
+})().catch(function(error){document.body.textContent='Swagger initialization failed: '+error.message;});</script></body></html>`;
+}
+
+function runtimeHeaders(profile, login = false) {
+  return [
+    { key: 'accept', value: '*/*', type: 'text' },
+    { key: 'content-type', value: 'application/json; charset=UTF-8', type: 'text' },
+    { key: 'client-id', value: '{{clientId}}', type: 'text' },
+    { key: 'origin', value: '{{runtimeOrigin}}', type: 'text' },
+    { key: 'referer', value: login ? '{{runtimeOrigin}}{{loginPath}}' : '{{runtimeOrigin}}{{appRefererPath}}', type: 'text' },
+    ...(!login && profile.prostage ? [{ key: 'prostage', value: '{{prostage}}', type: 'text' }] : []),
+  ];
+}
+
+function postmanRuntimeRequest(name, path, body, profile, options = {}) {
+  return {
+    name,
+    event: [
+      {
+        listen: 'prerequest',
+        script: { type: 'text/javascript', exec: [
+          "if (!pm.collectionVariables.get('clientId')) { const part=()=>Math.random().toString(36).slice(2,10).padEnd(8,'0'); pm.collectionVariables.set('clientId',[Date.now().toString(36),part(),part(),part(),part()].join('-')); }",
+          "if (pm.collectionVariables.get('ecreq') === 'true' && pm.request.body && pm.request.body.raw) {",
+          "  const CryptoJS = pm.require('npm:crypto-js@4.2.0');",
+          "  const id = pm.collectionVariables.get('clientId'); const secret = id.split('-').sort().join('%');",
+          "  pm.request.body.raw = JSON.stringify({reqtoken: CryptoJS.AES.encrypt(pm.request.body.raw, secret).toString()});",
+          "}",
+        ] },
+      },
+      {
+        listen: 'test',
+        script: { type: 'text/javascript', exec: [
+          "let value; try { value = pm.response.json(); } catch (_) { value = null; }",
+          "if (value && value.token) { const CryptoJS = pm.require('npm:crypto-js@4.2.0'); const id=pm.collectionVariables.get('clientId'); const text=CryptoJS.AES.decrypt(value.token,id.split('-').sort().join('%')).toString(CryptoJS.enc.Utf8); pm.collectionVariables.set('lastDecryptedResponse',text); try { let decoded=JSON.parse(text); if(typeof decoded==='string') decoded=JSON.parse(decoded); value={Result:decoded}; } catch (_) {} }",
+          "if (value && value.Result && typeof value.Result.ecreq === 'boolean') pm.collectionVariables.set('ecreq', String(value.Result.ecreq));",
+        ] },
+      },
+    ],
+    request: {
+      method: options.method || 'POST',
+      header: options.method === 'GET' ? runtimeHeaders(profile, options.login).filter(item => item.key !== 'content-type') : runtimeHeaders(profile, options.login),
+      ...(body === undefined ? {} : { body: { mode: 'raw', raw: JSON.stringify(body, null, 2), options: { raw: { language: 'json' } } } }),
+      url: { raw: `{{runtimeOrigin}}${path}` },
+      description: options.description,
+    },
+  };
+}
+
+function buildRuntimePostmanCollection(projectKey, profile, snapshot) {
+  const queryPath = `${profile.coreBasePath}/data-provider/get-data-source`;
+  const commandPath = `${profile.coreBasePath}/data-provider/store-form-data`;
+  const whoAmI = { serviceId: '{{runtimeServiceId}}', key: 'pages-app/who-am-i', params: {} };
+  const folders = {
+    query: { name: 'Core Queries', item: [] },
+    command: { name: 'Core Commands', item: [] },
+    data: { name: 'DATA_SERVICE', item: [] },
+  };
+  for (const operation of snapshot.operations || []) {
+    if (operation.type === 'CORE_QUERY') {
+      folders.query.item.push(postmanRuntimeRequest(operation.name || operation.sourceId, queryPath, { serviceId: '{{projectServiceId}}', key: operation.sourceId.replace(/^ds\//, ''), params: operation.payloadExample || {} }, profile));
+    } else if (operation.type === 'CORE_COMMAND') {
+      folders.command.item.push(postmanRuntimeRequest(operation.name || operation.sourceId, commandPath, { serviceId: '{{projectServiceId}}', formId: operation.sourceId.replace(/^fr\//, ''), data: operation.payloadExample || {} }, profile));
+    } else {
+      folders.data.item.push({
+        name: operation.name || operation.sourceId,
+        request: {
+          method: operation.method,
+          header: [
+            { key: 'accept', value: 'application/json', type: 'text' },
+            ...(!['GET', 'HEAD'].includes(operation.method) ? [{ key: 'content-type', value: 'application/json', type: 'text' }] : []),
+            ...(['BEARER', 'TOKEN_ENDPOINT'].includes(profile.dataService?.authMode) ? [{ key: 'authorization', value: 'Bearer {{dataServiceToken}}', type: 'text' }] : []),
+          ],
+          ...(profile.dataService?.authMode === 'BASIC' ? { auth: { type: 'basic', basic: [{ key: 'username', value: '{{dataServiceUsername}}', type: 'string' }, { key: 'password', value: '{{dataServicePassword}}', type: 'string' }] } } : {}),
+          ...(!['GET', 'HEAD'].includes(operation.method) ? { body: { mode: 'raw', raw: JSON.stringify(operation.payloadExample || {}, null, 2), options: { raw: { language: 'json' } } } } : {}),
+          url: `{{dataServiceBaseUrl}}${operation.path}`,
+          description: 'Set Data Service authentication in Postman locally. Stored API Console credentials are never exported.',
+        },
+      });
+    }
+  }
+  if (profile.dataService?.authMode === 'TOKEN_ENDPOINT') {
+    folders.data.item.unshift({
+      name: 'DATA_SERVICE Login',
+      event: [{ listen: 'test', script: { type: 'text/javascript', exec: ["const value=pm.response.json(); if(value.token) pm.collectionVariables.set('dataServiceToken', value.token);"] } }],
+      request: {
+        method: 'POST',
+        header: [{ key: 'accept', value: 'application/json', type: 'text' }, { key: 'content-type', value: 'application/json', type: 'text' }],
+        body: { mode: 'raw', raw: JSON.stringify({ username: '{{dataServiceUsername}}', password: '{{dataServicePassword}}' }, null, 2), options: { raw: { language: 'json' } } },
+        url: `{{dataServiceBaseUrl}}${profile.dataService.tokenPath || '/auth/getToken'}`,
+        description: 'Credentials remain empty in the export and must be supplied locally.',
+      },
+    });
+  }
+  const collection = {
+    info: { _postman_id: randomUUID(), name: `${projectKey} - ${profile.name} Runtime`, schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+    variable: [
+      { key: 'runtimeOrigin', value: profile.origin, type: 'string' },
+      { key: 'coreBasePath', value: profile.coreBasePath, type: 'string' },
+      { key: 'loginPath', value: profile.loginPath, type: 'string' },
+      { key: 'appRefererPath', value: profile.appRefererPath, type: 'string' },
+      { key: 'runtimeServiceId', value: profile.runtimeServiceId, type: 'string' },
+      { key: 'projectServiceId', value: profile.projectServiceId || '', type: 'string' },
+      { key: 'prostage', value: profile.prostage || '', type: 'string' },
+      { key: 'dataServiceBaseUrl', value: profile.dataService?.baseUrl || '', type: 'string' },
+      { key: 'dataServiceToken', value: '', type: 'string' },
+      { key: 'dataServiceUsername', value: '', type: 'string' },
+      { key: 'dataServicePassword', value: '', type: 'string' },
+      { key: 'phone', value: '', type: 'string' },
+      { key: 'password', value: '', type: 'string' },
+      { key: 'clientId', value: '', type: 'string' },
+      { key: 'ecreq', value: 'false', type: 'string' },
+      { key: 'lastDecryptedResponse', value: '', type: 'string' },
+    ],
+    item: [
+      { name: 'Runtime Login', item: [
+        postmanRuntimeRequest('Initialize Cookie Jar', profile.loginPath, undefined, profile, { method: 'GET', login: true }),
+        postmanRuntimeRequest('Who Am I (before login)', queryPath, whoAmI, profile, { login: true }),
+        postmanRuntimeRequest('Submit Cellphone', commandPath, { serviceId: '{{runtimeServiceId}}', formId: 'auth/signin/iran-cellphone', data: { userSource: profile.userSource, userLoginName: '{{phone}}' } }, profile, { login: true }),
+        postmanRuntimeRequest('Submit Password', commandPath, { serviceId: '{{runtimeServiceId}}', formId: 'auth/signin/check-password', data: { userSource: profile.userSource, userLoginName: '{{phone}}', contact: 'iran-cellphone', password: '{{password}}' } }, profile, { login: true }),
+      ] },
+      { name: 'Who Am I', item: [postmanRuntimeRequest('Who Am I (authenticated)', queryPath, whoAmI, profile, { login: true })] },
+      folders.query,
+      folders.command,
+      folders.data,
+    ],
+  };
+  return { fileName: `${projectKey}-${profile.name}`.replace(/[^a-zA-Z0-9._-]+/g, '-') + '.postman_collection.json', requestCount: (snapshot.operations || []).length + 5 + (profile.dataService?.authMode === 'TOKEN_ENDPOINT' ? 1 : 0), collection };
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+function buildRuntimeCurlExport(projectKey, profile, snapshot, operationId, mode = 'sample') {
+  const operation = (snapshot.operations || []).find(item => item.id === operationId) || snapshot.operations?.[0];
+  if (!operation) throw new ApiConsoleError('RUNTIME_OPERATION_NOT_FOUND', 'No discovered operation is available for cURL export.', 404);
+  const queryPath = `${profile.coreBasePath}/data-provider/get-data-source`;
+  const commandPath = `${profile.coreBasePath}/data-provider/store-form-data`;
+  const requestBody = operation.type === 'CORE_QUERY'
+    ? { serviceId: profile.projectServiceId || '{{projectServiceId}}', key: operation.sourceId.replace(/^ds\//, ''), params: operation.payloadExample || {} }
+    : operation.type === 'CORE_COMMAND'
+      ? { serviceId: profile.projectServiceId || '{{projectServiceId}}', formId: operation.sourceId.replace(/^fr\//, ''), data: operation.payloadExample || {} }
+      : operation.payloadExample || {};
+  const operationUrl = operation.type === 'CORE_QUERY' ? `${profile.origin}${queryPath}` : operation.type === 'CORE_COMMAND' ? `${profile.origin}${commandPath}` : `${profile.dataService?.baseUrl || 'https://data-service.example.invalid'}${operation.path}`;
+  const headers = operation.sourceKind === 'API_MODULE'
+    ? [`-H 'accept: */*'`, `-H 'content-type: application/json; charset=UTF-8'`, `-H "client-id: $CLIENT_ID"`, `-H 'origin: ${profile.origin}'`, `-H 'referer: ${profile.origin}${profile.appRefererPath}'`, ...(profile.prostage ? [`-H 'prostage: ${profile.prostage}'`] : [])]
+    : [
+      `-H 'accept: application/json'`,
+      `-H 'content-type: application/json'`,
+      ...(['BEARER', 'TOKEN_ENDPOINT'].includes(profile.dataService?.authMode) ? [`-H "authorization: Bearer $DATA_SERVICE_TOKEN"`] : []),
+      ...(profile.dataService?.authMode === 'BASIC' ? [`-u "$DATA_SERVICE_USERNAME:$DATA_SERVICE_PASSWORD"`] : []),
+    ];
+  const directLines = [`curl --request ${operation.method || 'POST'} \\`, `  --url ${shellSingleQuote(operationUrl)} \\`, ...headers.map(header => `  ${header} \\`), ...(operation.sourceKind === 'API_MODULE' ? [`  --cookie "$COOKIE_JAR" \\`] : [])];
+  if (!['GET', 'HEAD'].includes(operation.method)) directLines.push(`  --data ${shellSingleQuote(JSON.stringify(requestBody))}`);
+  else directLines[directLines.length - 1] = directLines[directLines.length - 1].replace(/ \\$/, '');
+  const direct = directLines.join('\n');
+  if (mode !== 'bundle' || operation.sourceKind !== 'API_MODULE') {
+    return { fileName: `${operation.id}.sh`, mode: 'sample', value: `# Safe sample: no stored cookie, password, or secret is included.\nCLIENT_ID='replace-with-stable-client-id'\nCOOKIE_JAR='./runtime.cookies'\nDATA_SERVICE_TOKEN=''\nDATA_SERVICE_USERNAME=''\nDATA_SERVICE_PASSWORD=''\n${direct}\n` };
+  }
+  const who = JSON.stringify({ serviceId: profile.runtimeServiceId, key: 'pages-app/who-am-i', params: {} });
+  const phone = JSON.stringify({ serviceId: profile.runtimeServiceId, formId: 'auth/signin/iran-cellphone', data: { userSource: profile.userSource, userLoginName: '${PHONE}' } }).replace('"${PHONE}"', '"' + '${PHONE}' + '"');
+  const password = JSON.stringify({ serviceId: profile.runtimeServiceId, formId: 'auth/signin/check-password', data: { userSource: profile.userSource, userLoginName: '${PHONE}', contact: 'iran-cellphone', password: '${PASSWORD}' } }).replace('"${PHONE}"', '"' + '${PHONE}' + '"').replace('"${PASSWORD}"', '"' + '${PASSWORD}' + '"');
+  const value = `#!/usr/bin/env bash
+set -euo pipefail
+: "\${PHONE:?Set PHONE to the connected CDE cellphone}"
+: "\${PASSWORD:?Set PASSWORD at execution time}"
+CLIENT_ID="\${CLIENT_ID:-$(node -e "console.log(Date.now().toString(36)+'-'+require('crypto').randomBytes(24).toString('hex').match(/.{1,8}/g).slice(0,4).join('-'))")}";
+COOKIE_JAR="\${COOKIE_JAR:-./runtime.cookies}"
+ECREQ_HELPER="\${ECREQ_HELPER:-./runtime-ecreq-helper.cjs}"
+ECREQ=false
+post_runtime() {
+  local payload="$1" url="$2" referer="$3" stage="\${4:-}" response decoded flag
+  if [[ "$ECREQ" == "true" ]]; then payload="$(node "$ECREQ_HELPER" encode "$CLIENT_ID" "$payload")"; fi
+  local headers=(-H 'accept: */*' -H 'content-type: application/json; charset=UTF-8' -H "client-id: $CLIENT_ID" -H 'origin: ${profile.origin}' -H "referer: $referer")
+  if [[ -n "$stage" ]]; then headers+=(-H "prostage: $stage"); fi
+  response="$(curl --silent --show-error --cookie-jar "$COOKIE_JAR" --cookie "$COOKIE_JAR" "\${headers[@]}" --data "$payload" "$url")"
+  decoded="$(node "$ECREQ_HELPER" decode "$CLIENT_ID" "$response")"
+  printf '%s\n' "$decoded"
+  flag="$(node "$ECREQ_HELPER" flag "$CLIENT_ID" "$response")"
+  if [[ -n "$flag" ]]; then ECREQ="$flag"; fi
+}
+curl --silent --show-error --cookie-jar "$COOKIE_JAR" --cookie "$COOKIE_JAR" -H "client-id: $CLIENT_ID" ${shellSingleQuote(`${profile.origin}${profile.loginPath}`)} >/dev/null
+post_runtime ${shellSingleQuote(who)} ${shellSingleQuote(`${profile.origin}${queryPath}`)} ${shellSingleQuote(`${profile.origin}${profile.loginPath}`)}
+post_runtime "${phone.replace(/"/g, '\\"')}" ${shellSingleQuote(`${profile.origin}${commandPath}`)} ${shellSingleQuote(`${profile.origin}${profile.loginPath}`)}
+post_runtime "${password.replace(/"/g, '\\"')}" ${shellSingleQuote(`${profile.origin}${commandPath}`)} ${shellSingleQuote(`${profile.origin}${profile.loginPath}`)}
+post_runtime ${shellSingleQuote(who)} ${shellSingleQuote(`${profile.origin}${queryPath}`)} ${shellSingleQuote(`${profile.origin}${profile.loginPath}`)}
+post_runtime ${shellSingleQuote(JSON.stringify(requestBody))} ${shellSingleQuote(operationUrl)} ${shellSingleQuote(`${profile.origin}${profile.appRefererPath}`)} ${shellSingleQuote(profile.prostage || '')}
+`;
+  const helper = `// Requires: npm install crypto-js\nconst CryptoJS=require('crypto-js');\nconst [,,mode,id,input]=process.argv;\nconst secret=String(id||'').split('-').sort().join('%');\nfunction decoded(){ const envelope=JSON.parse(input||'{}'); if(!envelope.token) return envelope; const text=CryptoJS.AES.decrypt(String(envelope.token),secret).toString(CryptoJS.enc.Utf8); let value=JSON.parse(text); if(typeof value==='string') value=JSON.parse(value); return {Result:value}; }\nif(mode==='encode') process.stdout.write(JSON.stringify({reqtoken:CryptoJS.AES.encrypt(String(input||''),secret).toString()}));\nelse if(mode==='decode') process.stdout.write(JSON.stringify(decoded()));\nelse if(mode==='flag'){ const value=decoded(); const flag=value&&value.Result&&value.Result.ecreq; if(typeof flag==='boolean') process.stdout.write(String(flag)); }\nelse { console.error('mode must be encode, decode, or flag'); process.exit(2); }`;
+  return { fileName: `${projectKey}-${operation.id}-runtime-login.sh`, mode: 'bundle', value, helperFileName: 'runtime-ecreq-helper.cjs', ecreqHelper: helper, note: 'The included helper automatically encrypts subsequent JSON bodies and decrypts token responses when ecreq is enabled.' };
 }
 
 function upsertRequestWithPatch(existing, data, context) {
@@ -4311,6 +5195,164 @@ async function routeRequest(req, parsedUrl, body) {
   }
 
   if (first === 'policy' && req.method === 'GET') return API_CONSOLE_POLICY;
+
+  if (first === 'runtime-profiles' && !second && req.method === 'GET') {
+    const context = requireContext(req, body);
+    const applicationId = String(parsedUrl.searchParams.get('applicationId') || context.applicationId || '');
+    assertRuntimeProjectAccess(applicationId, context);
+    ensureDefaultRuntimeProfiles(applicationId, context);
+    return safeClone(store.runtimeProfiles
+      .filter(profile => profile.applicationId === applicationId && profile.enabled !== false)
+      .map(runtimeProfileView)
+      .sort((left, right) => left.name.localeCompare(right.name, 'fa')));
+  }
+
+  if (first === 'runtime-profiles' && second && third === 'session') {
+    const context = requireContext(req, body);
+    const profile = findRuntimeProfile(second, context);
+    const { appSession, phone } = runtimeSessionIdentity(req, context);
+    if (!fourth && req.method === 'GET') {
+      const state = await getRuntimeSession(appSession.id, profile.id);
+      if (state && normalizeCdeLoginName(state.loginName) !== phone) {
+        await deleteRuntimeSession(appSession.id, profile.id);
+        return { ...publicRuntimeStatus(null), profileId: profile.id };
+      }
+      return { ...publicRuntimeStatus(state), profileId: profile.id };
+    }
+    if (!fourth && req.method === 'DELETE') {
+      assertCsrf(req);
+      await deleteRuntimeSession(appSession.id, profile.id);
+      audit('RUNTIME_SESSION_DISCONNECTED', context, { profileId: profile.id });
+      saveStore(store);
+      return { ...publicRuntimeStatus(null), profileId: profile.id };
+    }
+    if (fourth === 'start' && req.method === 'POST') {
+      assertCsrf(req);
+      await deleteRuntimeSession(appSession.id, profile.id);
+      const result = await startRuntimeLogin(profile, phone);
+      await setRuntimeSession(appSession.id, profile.id, result.state, result.state.phase === 'PASSWORD_REQUIRED' ? 5 * 60 : undefined);
+      audit('RUNTIME_LOGIN_STARTED', context, { profileId: profile.id, nextStep: result.status.nextStep || result.status.phase });
+      saveStore(store);
+      return { ...result.status, profileId: profile.id };
+    }
+    if (fourth === 'password' && req.method === 'POST') {
+      assertCsrf(req);
+      const password = String(body.password || '');
+      if (!password) throw new ApiConsoleError('RUNTIME_PASSWORD_REQUIRED', 'Runtime password is required.', 422);
+      const state = await getRuntimeSession(appSession.id, profile.id);
+      if (!state) throw new ApiConsoleError('RUNTIME_LOGIN_NOT_STARTED', 'Start Runtime login again.', 409);
+      try {
+        const result = await finishRuntimeLogin(state, profile, password);
+        await setRuntimeSession(appSession.id, profile.id, result.state);
+        audit('RUNTIME_LOGIN_COMPLETED', context, { profileId: profile.id });
+        saveStore(store);
+        return { ...result.status, profileId: profile.id };
+      } catch (error) {
+        await setRuntimeSession(appSession.id, profile.id, state, 5 * 60);
+        if (error.category === 'RUNTIME_LOGICAL_ERROR') {
+          throw new ApiConsoleError('RUNTIME_INVALID_CREDENTIALS', 'Runtime did not accept the supplied credentials.', 401);
+        }
+        throw error;
+      }
+    }
+    throw new ApiConsoleError('INVALID_URL', 'Runtime session endpoint not found.', 404);
+  }
+
+  if (first === 'admin' && second === 'runtime-profiles') {
+    const context = requireContext(req, body);
+    assertSystemAdministrator(context);
+    if (!third && req.method === 'POST') {
+      assertCsrf(req);
+      const profile = normalizeRuntimeProfileInput(body.data || body, context);
+      if (store.runtimeProfiles.some(item => item.applicationId === profile.applicationId && item.origin === profile.origin && item.enabled !== false)) {
+        throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project and origin already exists.', 409);
+      }
+      store.runtimeProfiles.unshift(profile);
+      audit('RUNTIME_PROFILE_CREATED', context, { profileId: profile.id, applicationId: profile.applicationId, origin: profile.origin });
+      saveStore(store);
+      return safeClone(runtimeProfileView(profile));
+    }
+    const profile = store.runtimeProfiles.find(item => item.id === String(third));
+    if (!profile) throw new ApiConsoleError('RUNTIME_PROFILE_NOT_FOUND', 'Runtime Profile was not found.', 404);
+    assertRuntimeProjectAccess(profile.applicationId, context);
+    if (!fourth && req.method === 'PUT') {
+      assertCsrf(req);
+      if (body.rowVersion && body.rowVersion !== profile.rowVersion) throw new ApiConsoleError('RUNTIME_PROFILE_CONFLICT', 'Runtime Profile changed in another session.', 409);
+      const next = normalizeRuntimeProfileInput(body.data || body, context, profile);
+      if (store.runtimeProfiles.some(item => item.id !== next.id && item.applicationId === next.applicationId && item.origin === next.origin && item.enabled !== false)) {
+        throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project and origin already exists.', 409);
+      }
+      store.runtimeProfiles[store.runtimeProfiles.indexOf(profile)] = next;
+      audit('RUNTIME_PROFILE_UPDATED', context, { profileId: next.id, applicationId: next.applicationId, origin: next.origin });
+      saveStore(store);
+      return safeClone(runtimeProfileView(next));
+    }
+    if (!fourth && req.method === 'DELETE') {
+      assertCsrf(req);
+      profile.enabled = false;
+      profile.disabledAt = nowIso();
+      profile.disabledBy = context.userId;
+      profile.updatedAt = nowIso();
+      profile.rowVersion = makeId('row');
+      await deleteRuntimeSession(requireSession(req).id, profile.id);
+      audit('RUNTIME_PROFILE_DISABLED', context, { profileId: profile.id });
+      saveStore(store);
+      return safeClone(runtimeProfileView(profile));
+    }
+    if (fourth === 'validate' && req.method === 'POST') {
+      assertCsrf(req);
+      const validation = await validateRuntimeOrigin(profile.origin);
+      profile.lastValidatedAt = nowIso();
+      profile.lastValidation = { valid: true, addresses: validation.addresses, checkedAt: profile.lastValidatedAt };
+      profile.updatedAt = nowIso();
+      profile.rowVersion = makeId('row');
+      audit('RUNTIME_PROFILE_VALIDATED', context, { profileId: profile.id, hostname: validation.hostname, addresses: validation.addresses });
+      saveStore(store);
+      return safeClone({ profile: runtimeProfileView(profile), validation: profile.lastValidation });
+    }
+    throw new ApiConsoleError('INVALID_URL', 'Runtime Profile administration endpoint not found.', 404);
+  }
+
+  if (first === 'projects' && second && third === 'discovery') {
+    const projectKey = decodeURIComponent(second);
+    const context = requireContext(req, body);
+    assertRuntimeProjectAccess(projectKey, context);
+    if (fourth === 'scan' && req.method === 'POST') return scanRuntimeDiscovery(req, projectKey, context);
+    if (fourth === 'latest' && req.method === 'GET') {
+      const snapshot = latestDiscovery(projectKey);
+      if (!snapshot) throw new ApiConsoleError('DISCOVERY_NOT_FOUND', 'No discovery snapshot exists for this project.', 404);
+      return safeClone(snapshot);
+    }
+    if (fourth && fifth === 'sync' && req.method === 'POST') {
+      assertCsrf(req);
+      const snapshot = store.discoverySnapshots.find(item => item.id === fourth && item.projectKey === projectKey);
+      if (!snapshot) throw new ApiConsoleError('DISCOVERY_NOT_FOUND', 'Discovery snapshot was not found.', 404);
+      return safeClone(syncDiscoverySnapshot(snapshot, body.data || body, context));
+    }
+    throw new ApiConsoleError('INVALID_URL', 'Discovery endpoint not found.', 404);
+  }
+
+  if (first === 'projects' && second && third === 'runtime-profiles' && fourth && fifth) {
+    const projectKey = decodeURIComponent(second);
+    const context = requireContext(req, body);
+    assertRuntimeProjectAccess(projectKey, context);
+    const profile = findRuntimeProfile(fourth, context);
+    if (profile.applicationId !== projectKey) throw new ApiConsoleError('RUNTIME_BINDING_INVALID', 'Runtime Profile does not belong to the requested project.', 422);
+    const snapshot = latestDiscovery(projectKey);
+    if (!snapshot) throw new ApiConsoleError('DISCOVERY_NOT_FOUND', 'Run CDE discovery before generating Runtime outputs.', 404);
+    if (fifth === 'openapi.json' && req.method === 'GET') return runtimeOpenApiDocument(projectKey, profile, snapshot);
+    if (fifth === 'docs' && req.method === 'GET') return { __rawResponse: { contentType: 'text/html; charset=utf-8', body: runtimeDocsHtml(projectKey, profile) } };
+    if (fifth === 'postman' && req.method === 'GET') return buildRuntimePostmanCollection(projectKey, profile, snapshot);
+    if (fifth === 'curl' && req.method === 'GET') {
+      return buildRuntimeCurlExport(projectKey, profile, snapshot, parsedUrl.searchParams.get('operationId'), parsedUrl.searchParams.get('mode') || 'sample');
+    }
+    throw new ApiConsoleError('INVALID_URL', 'Runtime output endpoint not found.', 404);
+  }
+
+  if (first === 'runtime' && second === 'operations' && third && fourth === 'execute' && req.method === 'POST') {
+    const context = requireContext(req, body);
+    return executeRuntimeDiscoveredOperation(req, third, body.data || body, context);
+  }
 
   if (first === 'admin' && second === 'users') {
     const context = requireContext(req, body);
@@ -5014,6 +6056,24 @@ async function routeRequest(req, parsedUrl, body) {
     }
     if (third === 'execute' && req.method === 'POST') {
       const context = requireContext(req, body);
+      if (request.runtimeBinding?.operationId) {
+        const options = body.options || body;
+        if (options.runtimeProfileId && options.runtimeProfileId !== request.runtimeBinding.runtimeProfileId) {
+          throw new ApiConsoleError('RUNTIME_BINDING_INVALID', 'Request execution cannot override its synced Runtime Profile binding.', 422);
+        }
+        const parsedBody = parseJsonSafely(request.bodyTemplate || '{}');
+        const bodyValue = parsedBody.ok && parsedBody.value && typeof parsedBody.value === 'object' ? parsedBody.value : {};
+        const input = options.input || (request.classification.type === 'CORE_COMMAND' ? bodyValue.data : request.classification.type === 'CORE_QUERY' ? bodyValue.params : bodyValue);
+        return executeRuntimeDiscoveredOperation(req, request.runtimeBinding.operationId, {
+          ...options,
+          requestId: request.id,
+          projectKey: request.runtimeBinding.projectKey,
+          runtimeProfileId: request.runtimeBinding.runtimeProfileId,
+          expectedProjectServiceId: request.runtimeBinding.projectServiceId,
+          confirmed: options.confirmed ?? options.productionCommandConfirmed,
+          input,
+        }, context);
+      }
       return executeRequest(second, context, body.options || body);
     }
     if (third === 'executions' && req.method === 'GET') {
@@ -5021,6 +6081,13 @@ async function routeRequest(req, parsedUrl, body) {
     }
     if (third === 'export-curl' && req.method === 'POST') {
       const context = contextFromRequest(req, body);
+      if (request.runtimeBinding?.operationId) {
+        const runtimeContext = context || viewContext;
+        const profile = findRuntimeProfile(body.runtimeProfileId || request.runtimeBinding.runtimeProfileId, runtimeContext);
+        const snapshot = latestDiscovery(request.runtimeBinding.projectKey);
+        if (!snapshot) throw new ApiConsoleError('DISCOVERY_NOT_FOUND', 'The discovery snapshot for this Runtime request is unavailable.', 404);
+        return buildRuntimeCurlExport(request.runtimeBinding.projectKey, profile, snapshot, request.runtimeBinding.operationId, body.mode || 'sample');
+      }
       const dialect = body.dialect || 'bash';
       const exposeSecrets = !!body.exposeSecrets && context && roleAllowed(context.role, ['SYSTEM_ADMIN']);
       return { value: exportRequestAsCurl(request, dialect, exposeSecrets) };
@@ -5454,6 +6521,10 @@ function createServer() {
       }
       const body = await readJsonBody(req);
       const result = await routeRequest(req, parsedUrl, body);
+      if (result?.__rawResponse) {
+        sendRaw(res, result.__rawResponse.statusCode || 200, result.__rawResponse.contentType || 'text/plain; charset=utf-8', result.__rawResponse.body, result.__rawResponse.headers);
+        return;
+      }
       sendJson(res, 200, result);
     } catch (error) {
       sendError(res, error);
@@ -5483,6 +6554,11 @@ module.exports = {
   generateDocumentationMarkdown,
   buildDocxDocumentXml,
   buildDocxFromTemplate,
+  buildRuntimeCurlExport,
+  buildRuntimePostmanCollection,
+  runtimeOpenApiDocument,
+  mergeDiscoveredRequest,
+  sourceControlledDefinition,
   sanitizeDocumentationCurl,
   sanitizeDocumentationResponseExample,
   DEFAULT_RESPONSE_CODE_CATALOG,

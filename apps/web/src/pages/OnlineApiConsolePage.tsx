@@ -38,6 +38,7 @@ import { LoadingState, MinimalLoader } from '../components/ui/Loading';
 import { Modal } from '../components/ui/Modal';
 import { Table, Pagination } from '../components/ui/Table';
 import { toast } from '../components/ui/Toast';
+import { RuntimeWorkspace } from '../components/api-console/RuntimeWorkspace';
 import { useAuthStore } from '../stores/authStore';
 import { useDataScope } from '../utils/useDataScope';
 import { useApplicationLookup } from '../utils/useApplicationLookup';
@@ -91,7 +92,7 @@ type EditorTab =
   | 'history';
 
 type PageMode = 'list' | 'editor';
-type WorkspaceView = 'requests' | 'repository' | 'reviews' | 'users';
+type WorkspaceView = 'requests' | 'repository' | 'reviews' | 'users' | 'runtime';
 type ParserSelfCheckDetail = { name: string; passed: boolean; message?: string };
 type PostmanImportRequestPreview = {
   name: string;
@@ -1169,6 +1170,7 @@ export const OnlineApiConsolePage: React.FC = () => {
   const [versionModalOpen, setVersionModalOpen] = useState(false);
   const [versionForm, setVersionForm] = useState({ version: '', changeLog: '' });
   const [versioning, setVersioning] = useState(false);
+  const [runtimeConnected, setRuntimeConnected] = useState(false);
   const derivedRequestSeqRef = useRef(0);
   const loadAllSeqRef = useRef(0);
   const reloadRequestsSeqRef = useRef(0);
@@ -1208,6 +1210,19 @@ export const OnlineApiConsolePage: React.FC = () => {
       loadAll();
     }
   }, [activeContext, appId, filters.page, filters.limit, filters.collectionId, filters.classificationType]);
+
+  useEffect(() => {
+    if (!activeContext) {
+      setRuntimeConnected(false);
+      return;
+    }
+    let cancelled = false;
+    apiConsoleApi.getRuntimeProfiles(activeContext.applicationId, activeContext)
+      .then(rows => Promise.all(rows.map(profile => apiConsoleApi.getRuntimeSession(profile.id, activeContext).catch(() => null))))
+      .then(statuses => { if (!cancelled) setRuntimeConnected(statuses.some(status => status?.connected)); })
+      .catch(() => { if (!cancelled) setRuntimeConnected(false); });
+    return () => { cancelled = true; };
+  }, [activeContext?.contextId, activeContext?.applicationId]);
 
   useEffect(() => {
     if (activeContext && workspaceView === 'repository') {
@@ -1791,7 +1806,7 @@ export const OnlineApiConsolePage: React.FC = () => {
 
   const handleSend = () => {
     if (!selectedRequest || !selectedEnvironment) return;
-    if (selectedEnvironment.kind === 'PRODUCTION' && selectedRequest.classification.type === 'CORE_COMMAND') {
+    if (selectedRequest.classification.type === 'CORE_COMMAND' && (selectedRequest.runtimeBinding || selectedEnvironment.kind === 'PRODUCTION')) {
       setProductionModalOpen(true);
       return;
     }
@@ -2178,6 +2193,9 @@ export const OnlineApiConsolePage: React.FC = () => {
             </Badge>
             <Badge variant="default" size="sm">v{item.semanticVersion || item.documentation?.version || '1.0.0'}</Badge>
             {item.sourceType === 'REFERENCE' && <Badge variant="info" size="sm">Reference</Badge>}
+            {item.sourceType === 'CDE_DISCOVERY' && <Badge variant="info" size="sm">CDE Sync</Badge>}
+            {item.sourceSync?.status === 'STALE' && <Badge variant="danger" size="sm">STALE</Badge>}
+            {item.sourceSync?.status === 'CONFLICT' && <Badge variant="warning" size="sm">Sync Conflict</Badge>}
             {item.latestReturnReason && <Badge variant="danger" size="sm">بازگردانی</Badge>}
             {selectingRequestId === item.id && (
               <MinimalLoader size="xs" className="text-blue-600" />
@@ -2252,13 +2270,14 @@ export const OnlineApiConsolePage: React.FC = () => {
         title="Online API Console"
         onRefresh={loadAll}
         refreshing={loading}
-        actions={canManageGeneralSettings ? (
+        actions={(
           <div className="flex flex-wrap gap-2">
-            <Button variant="secondary" size="sm" icon={<ShieldCheck className="h-4 w-4" />} onClick={runSelfCheck}>
-              تست parser
+            <Button variant={runtimeConnected ? 'secondary' : 'ghost'} size="sm" icon={<PlayCircle className="h-4 w-4" />} onClick={() => { setPageMode('list'); setWorkspaceView('runtime'); }}>
+              Runtime: {runtimeConnected ? 'متصل' : 'قطع'}
             </Button>
+            {canManageGeneralSettings && <Button variant="secondary" size="sm" icon={<ShieldCheck className="h-4 w-4" />} onClick={runSelfCheck}>تست parser</Button>}
           </div>
-        ) : undefined}
+        )}
       />
 
       <main className="space-y-6 p-4 sm:p-6">
@@ -2278,6 +2297,7 @@ export const OnlineApiConsolePage: React.FC = () => {
                 {[
                   { id: 'requests' as const, label: 'Requestهای من', count: requests?.total || 0 },
                   { id: 'repository' as const, label: 'Repository APIها', count: repositoryRows?.total || 0 },
+                  { id: 'runtime' as const, label: 'Runtime و Discovery', count: runtimeConnected ? 1 : 0 },
                   { id: 'reviews' as const, label: 'تأیید اشتراک API', count: shareReviews?.total || 0, hidden: !canReviewShares },
                   { id: 'users' as const, label: 'مدیریت کاربران', count: adminUsers.length, hidden: !canManageGeneralSettings },
                 ].filter(item => !item.hidden).map(item => (
@@ -2434,6 +2454,17 @@ export const OnlineApiConsolePage: React.FC = () => {
                 onChangeSystemAdmin={(user, enabled) => setAdminRoleTarget({ user, enabled })}
               />
             )}
+
+            {workspaceView === 'runtime' && activeContext && (
+              <RuntimeWorkspace
+                context={activeContext}
+                projectKey={activeContext.applicationId}
+                collections={collections}
+                isSystemAdmin={canManageGeneralSettings}
+                onSynced={reloadRequests}
+                onConnectionChange={setRuntimeConnected}
+              />
+            )}
           </section>
         ) : (
           <section className="space-y-4">
@@ -2567,6 +2598,9 @@ export const OnlineApiConsolePage: React.FC = () => {
                         </Badge>
                         <Badge variant="default">v{selectedRequest.semanticVersion || selectedRequest.documentation?.version || '1.0.0'}</Badge>
                         {selectedRequest.sourceType === 'REFERENCE' && <Badge variant="info">Reference</Badge>}
+                        {selectedRequest.sourceType === 'CDE_DISCOVERY' && <Badge variant="info">CDE Sync</Badge>}
+                        {selectedRequest.sourceSync?.status === 'STALE' && <Badge variant="danger">STALE</Badge>}
+                        {selectedRequest.sourceSync?.status === 'CONFLICT' && <Badge variant="warning">Sync Conflict</Badge>}
                         {selectedRequest.tls.importedInsecureFlag && (
                           <Badge variant="warning">واردشده با --insecure</Badge>
                         )}
@@ -2578,6 +2612,15 @@ export const OnlineApiConsolePage: React.FC = () => {
                   {selectedEnvironment?.kind === 'PRODUCTION' && selectedRequest.classification.type === 'CORE_COMMAND' && (
                     <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
                       اجرای Production Core Command نیازمند permission بالاتر، confirmation و business justification است.
+                    </div>
+                  )}
+                  {selectedRequest.runtimeBinding && (
+                    <div className="mt-4 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
+                      <div className="font-semibold">Runtime binding ثبت‌شده</div>
+                      <div className="mt-1 font-mono text-xs" dir="ltr">
+                        profile={selectedRequest.runtimeBinding.runtimeProfileId} · operation={selectedRequest.runtimeBinding.operationId} · source={selectedRequest.runtimeBinding.sourceKind}
+                      </div>
+                      <div className="mt-1 text-xs">Cookie و client-id در این Request ذخیره نشده‌اند و هنگام اجرا فقط در backend تزریق می‌شوند.</div>
                     </div>
                   )}
                   {selectedRequest.latestReturnReason && (
@@ -3279,10 +3322,10 @@ export const OnlineApiConsolePage: React.FC = () => {
         </div>
       </Modal>
 
-      <Modal isOpen={productionModalOpen} onClose={() => setProductionModalOpen(false)} title="Production Core Command Confirmation" size="lg">
+      <Modal isOpen={productionModalOpen} onClose={() => setProductionModalOpen(false)} title={selectedRequest?.runtimeBinding ? 'Runtime Core Command Confirmation' : 'Production Core Command Confirmation'} size="lg">
         <div className="space-y-4">
           <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-            این Request به عنوان Production Core Command تشخیص داده شده است. قبل از Execution مقصد، Service ID، operation path و business reason را تایید کنید.
+            این Request به عنوان {selectedRequest?.runtimeBinding ? 'Runtime Core Command' : 'Production Core Command'} تشخیص داده شده است. قبل از Execution مقصد، Service ID و operation path را تأیید کنید.
           </div>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <div>
@@ -3311,16 +3354,16 @@ export const OnlineApiConsolePage: React.FC = () => {
               onChange={(event) => setProductionForm(prev => ({ ...prev, confirmed: event.target.checked }))}
               className="rounded border-gray-300"
             />
-            تایید می‌کنم این Production Core Command مجاز است.
+            تأیید می‌کنم این Core Command روی محیط انتخاب‌شده مجاز است.
           </label>
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setProductionModalOpen(false)}>انصراف</Button>
             <Button
               variant="danger"
-              disabled={!productionForm.confirmed || !productionForm.reason.trim()}
+              disabled={!productionForm.confirmed || (!selectedRequest?.runtimeBinding && !productionForm.reason.trim())}
               onClick={() => executeSelected({ productionCommandConfirmed: productionForm.confirmed, businessJustification: productionForm.reason })}
             >
-              اجرای Production Command
+              اجرای Command
             </Button>
           </div>
         </div>

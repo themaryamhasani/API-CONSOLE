@@ -1,4 +1,5 @@
 import type { ActiveContext, ApplicationScopeFilter, PaginatedResponse } from '../types';
+import { getCsrfToken } from './cdeApi';
 import type {
   ApiCollection,
   ApiConsoleDirectoryUser,
@@ -22,6 +23,12 @@ import type {
   ApiDocumentationResult,
   ApiAuthenticationDocumentationProfile,
   NormalizedApiRequest,
+  RuntimeProfile,
+  RuntimeSessionStatus,
+  ApiDiscoverySnapshot,
+  DiscoverySyncResult,
+  RuntimeCurlExport,
+  DiscoveredOperation,
 } from '../types/apiConsole';
 
 const API_BASE = (import.meta.env.VITE_API_CONSOLE_BASE_URL || '/api/api-console').replace(/\/$/, '');
@@ -57,6 +64,10 @@ type ParserSelfCheckResult = {
   details: Array<{ name: string; passed: boolean; message?: string }>;
 };
 
+type RuntimeProfileInput = Omit<Partial<RuntimeProfile>, 'dataService'> & {
+  dataService?: Partial<RuntimeProfile['dataService']> & { authSecret?: string };
+};
+
 const API_ERROR_CATEGORY_LABELS: Record<string, string> = {
   CURL_PARSE_ERROR: 'خطای خواندن cURL',
   INVALID_URL: 'آدرس یا مسیر نامعتبر',
@@ -75,6 +86,16 @@ const API_ERROR_CATEGORY_LABELS: Record<string, string> = {
   HTTP_ERROR: 'خطای HTTP',
   EXECUTION_CANCELLED: 'اجرا لغو شد',
   INTERNAL_EXECUTION_ERROR: 'خطای داخلی اجرا',
+  RUNTIME_PROFILE_INVALID: 'تنظیمات Runtime نامعتبر',
+  RUNTIME_ORIGIN_INVALID: 'Origin نامعتبر',
+  RUNTIME_ORIGIN_NOT_ALLOWED: 'Origin خارج از allowlist',
+  RUNTIME_SSRF_BLOCKED: 'مقصد Runtime مسدود',
+  RUNTIME_SESSION_REQUIRED: 'ورود Runtime لازم است',
+  RUNTIME_SESSION_EXPIRED: 'نشست Runtime منقضی شده',
+  RUNTIME_COMMAND_CONFIRMATION_REQUIRED: 'تأیید Command لازم است',
+  RUNTIME_SERVICE_ID_REQUIRED: 'Service ID تأیید نشده',
+  DISCOVERY_NOT_FOUND: 'Discovery موجود نیست',
+  DATA_SERVICE_EXECUTION_BLOCKED: 'اجرای Data Service مسدود است',
 };
 
 const API_ERROR_MESSAGE_TRANSLATIONS: Record<string, string> = {
@@ -234,6 +255,8 @@ async function requestJson<T>(path: string, options: ApiConsoleRequestOptions = 
   };
   if (method !== 'GET') {
     headers['content-type'] = 'application/json';
+    const csrf = getCsrfToken();
+    if (csrf) headers['x-csrf-token'] = csrf;
   }
   const requestInit: RequestInit = {
     method,
@@ -301,6 +324,70 @@ export const apiConsoleApi = {
 
   getRunners(): Promise<ApiExecutionRunner[]> {
     return requestJson('/runners');
+  },
+
+  getRuntimeProfiles(applicationId: string, context: ActiveContext): Promise<RuntimeProfile[]> {
+    return requestJson(withQuery('/runtime-profiles', { applicationId }), { context });
+  },
+
+  createRuntimeProfile(data: RuntimeProfileInput, context: ActiveContext): Promise<RuntimeProfile> {
+    return requestJson('/admin/runtime-profiles', { method: 'POST', context, body: { data } });
+  },
+
+  updateRuntimeProfile(id: string, data: RuntimeProfileInput, context: ActiveContext): Promise<RuntimeProfile> {
+    return requestJson(`/admin/runtime-profiles/${encodeURIComponent(id)}`, { method: 'PUT', context, body: { data, rowVersion: data.rowVersion } });
+  },
+
+  disableRuntimeProfile(id: string, context: ActiveContext): Promise<RuntimeProfile> {
+    return requestJson(`/admin/runtime-profiles/${encodeURIComponent(id)}`, { method: 'DELETE', context, body: {} });
+  },
+
+  validateRuntimeProfile(id: string, context: ActiveContext): Promise<{ profile: RuntimeProfile; validation: { valid: boolean; addresses: string[]; checkedAt: string } }> {
+    return requestJson(`/admin/runtime-profiles/${encodeURIComponent(id)}/validate`, { method: 'POST', context, body: {} });
+  },
+
+  getRuntimeSession(profileId: string, context: ActiveContext): Promise<RuntimeSessionStatus> {
+    return requestJson(`/runtime-profiles/${encodeURIComponent(profileId)}/session`, { context });
+  },
+
+  startRuntimeSession(profileId: string, context: ActiveContext): Promise<RuntimeSessionStatus> {
+    return requestJson(`/runtime-profiles/${encodeURIComponent(profileId)}/session/start`, { method: 'POST', context, body: {} });
+  },
+
+  finishRuntimeSession(profileId: string, password: string, context: ActiveContext): Promise<RuntimeSessionStatus> {
+    return requestJson(`/runtime-profiles/${encodeURIComponent(profileId)}/session/password`, { method: 'POST', context, body: { password } });
+  },
+
+  disconnectRuntimeSession(profileId: string, context: ActiveContext): Promise<RuntimeSessionStatus> {
+    return requestJson(`/runtime-profiles/${encodeURIComponent(profileId)}/session`, { method: 'DELETE', context, body: {} });
+  },
+
+  scanProjectDiscovery(projectKey: string, context: ActiveContext): Promise<ApiDiscoverySnapshot> {
+    return requestJson(`/projects/${encodeURIComponent(projectKey)}/discovery/scan`, { method: 'POST', context, body: {} });
+  },
+
+  getLatestProjectDiscovery(projectKey: string, context: ActiveContext): Promise<ApiDiscoverySnapshot> {
+    return requestJson(`/projects/${encodeURIComponent(projectKey)}/discovery/latest`, { context });
+  },
+
+  syncProjectDiscovery(projectKey: string, snapshotId: string, data: { collectionId: string; runtimeProfileId: string; operationIds?: string[]; conflictResolutions?: Record<string, Record<string, 'SOURCE' | 'LOCAL'>> }, context: ActiveContext): Promise<DiscoverySyncResult> {
+    return requestJson(`/projects/${encodeURIComponent(projectKey)}/discovery/${encodeURIComponent(snapshotId)}/sync`, { method: 'POST', context, body: data });
+  },
+
+  executeRuntimeOperation(operation: DiscoveredOperation, data: { projectKey: string; runtimeProfileId: string; input?: Record<string, unknown>; confirmed?: boolean; businessJustification?: string }, context: ActiveContext): Promise<ApiRequestExecution> {
+    return requestJson(`/runtime/operations/${encodeURIComponent(operation.id)}/execute`, { method: 'POST', context, body: data });
+  },
+
+  getRuntimePostman(projectKey: string, profileId: string, context: ActiveContext): Promise<ApiPostmanCollectionExport> {
+    return requestJson(`/projects/${encodeURIComponent(projectKey)}/runtime-profiles/${encodeURIComponent(profileId)}/postman`, { context });
+  },
+
+  getRuntimeCurl(projectKey: string, profileId: string, operationId: string, mode: 'sample' | 'bundle', context: ActiveContext): Promise<RuntimeCurlExport> {
+    return requestJson(withQuery(`/projects/${encodeURIComponent(projectKey)}/runtime-profiles/${encodeURIComponent(profileId)}/curl`, { operationId, mode }), { context });
+  },
+
+  runtimeDocsUrl(projectKey: string, profileId: string): string {
+    return `${API_BASE}/projects/${encodeURIComponent(projectKey)}/runtime-profiles/${encodeURIComponent(profileId)}/docs`;
   },
 
   getAuthenticationDocumentationProfiles(): Promise<ApiAuthenticationDocumentationProfile[]> {

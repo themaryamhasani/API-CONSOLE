@@ -1,11 +1,9 @@
-import React, { useState } from 'react';
-import { CheckCircle, KeyRound, ShieldCheck, Smartphone } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { ArrowLeft, CheckCircle, KeyRound, Smartphone } from 'lucide-react';
 import { Button } from '../components/ui/Button';
-import { Card } from '../components/ui/Card';
-import { Input } from '../components/ui/Input';
-import { Modal } from '../components/ui/Modal';
+import { Input, Select } from '../components/ui/Input';
 import { toast } from '../components/ui/Toast';
-import { PlatformApiError, cdeApi, sessionApi, setCsrfToken } from '../services/cdeApi';
+import { PlatformApiError, cdeApi, sessionApi, setCsrfToken, type CdeOriginOption } from '../services/cdeApi';
 import { useSessionStore } from '../stores/sessionStore';
 
 function isValidCdeCellphone(value: string): boolean {
@@ -18,6 +16,7 @@ function cdeLoginErrorMessage(error: unknown): string {
     if (error.code === 'CDE_INVALID_CREDENTIALS') return 'رمز عبور CDE نادرست است.';
     if (error.code === 'CDE_LOGIN_CHALLENGE_EXPIRED') return 'مهلت ورود منقضی شد. دوباره شروع کنید.';
     if (error.code === 'CDE_LOGIN_NAME_INVALID') return 'شماره همراه معتبر وارد کنید.';
+    if (error.code === 'CDE_ORIGIN_INVALID') return 'Origin انتخاب‌شده معتبر نیست.';
     return error.message;
   }
   return error instanceof Error ? error.message : 'اتصال به CDE ناموفق بود.';
@@ -28,13 +27,36 @@ export const CdeLoginPage: React.FC = () => {
   const refreshProjects = useSessionStore(state => state.refreshProjects);
   const selectProject = useSessionStore(state => state.selectProject);
 
-  const [showCdeLogin, setShowCdeLogin] = useState(true);
   const [cdeLoginName, setCdeLoginName] = useState('');
   const [cdePassword, setCdePassword] = useState('');
   const [cdeChallenge, setCdeChallenge] = useState('');
   const [cdeLoginStep, setCdeLoginStep] = useState<'phone' | 'password'>('phone');
   const [cdeError, setCdeError] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
+  const [origins, setOrigins] = useState<CdeOriginOption[]>([]);
+  const [selectedOriginId, setSelectedOriginId] = useState('');
+  const [originsLoading, setOriginsLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setOriginsLoading(true);
+    void cdeApi
+      .listOrigins()
+      .then(rows => {
+        if (cancelled) return;
+        setOrigins(rows);
+        if (rows[0]) setSelectedOriginId(rows[0].id);
+      })
+      .catch(error => {
+        if (!cancelled) setCdeError(cdeLoginErrorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setOriginsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const finishConnected = async () => {
     const projects = await refreshProjects();
@@ -44,9 +66,15 @@ export const CdeLoginPage: React.FC = () => {
   };
 
   const handleCdeLogin = async () => {
-    if (cdeLoginStep === 'phone' && !isValidCdeCellphone(cdeLoginName)) {
-      setCdeError('شماره همراه معتبر وارد کنید؛ مانند ۰۹۱۲۱۲۳۴۵۶۷.');
-      return;
+    if (cdeLoginStep === 'phone') {
+      if (!selectedOriginId) {
+        setCdeError('ابتدا Origin مربوط به CDE را انتخاب کنید.');
+        return;
+      }
+      if (!isValidCdeCellphone(cdeLoginName)) {
+        setCdeError('شماره همراه معتبر وارد کنید؛ مانند ۰۹۱۲۱۲۳۴۵۶۷.');
+        return;
+      }
     }
     if (cdeLoginStep === 'password' && !cdePassword) {
       setCdeError('رمز عبور CDE را وارد کنید.');
@@ -55,16 +83,14 @@ export const CdeLoginPage: React.FC = () => {
     setActionLoading(true);
     setCdeError('');
     try {
-      // Use app session for CSRF only. Do NOT call /api/cde/session here during
-      // the password step — that used to wipe the mid-login CDE cookie jar.
       const session = await sessionApi.current();
       if (session.csrfToken) setCsrfToken(session.csrfToken);
 
       if (cdeLoginStep === 'phone') {
+        await cdeApi.selectOrigin(selectedOriginId);
         const response = await cdeApi.startLogin(cdeLoginName.trim());
         if (response.csrfToken) setCsrfToken(response.csrfToken);
         if (response.connected) {
-          setShowCdeLogin(false);
           await finishConnected();
         } else {
           if (response.nextStep !== 'password' || !response.challenge) {
@@ -77,7 +103,6 @@ export const CdeLoginPage: React.FC = () => {
         const response = await cdeApi.finishPassword(cdeChallenge, cdePassword);
         if (response.csrfToken) setCsrfToken(response.csrfToken);
         setCdePassword('');
-        setShowCdeLogin(false);
         await finishConnected();
       }
     } catch (error) {
@@ -93,110 +118,138 @@ export const CdeLoginPage: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-[var(--theme-canvas)] px-4 py-10">
-      <div className="mx-auto max-w-xl">
-        <Card className="p-6">
-          <h1 className="text-2xl font-bold text-[var(--theme-text)]">API Console</h1>
-          <p className="mt-2 text-sm leading-7 text-[var(--theme-text-muted)]">
-            برای ورود به ماژول API Console با حساب CDE متصل شوید. پس از اتصال، پروژه‌ها و مخزن API Module بارگذاری می‌شوند.
+    <div className="ac-login-stage">
+      <div className="relative z-10 grid w-full max-w-5xl gap-10 lg:grid-cols-[1.1fr_0.9fr] lg:items-center">
+        <div className="ac-rise px-2 text-white lg:px-4">
+          <p className="font-display text-5xl font-bold tracking-tight sm:text-6xl">API Console</p>
+          <p className="mt-4 max-w-md text-base leading-8 text-white/70">
+            فضای کار مینیمال برای طراحی، اجرای امن، و انتشار APIهای سازمانی.
           </p>
-          <div className="mt-6">
-            <Button onClick={() => setShowCdeLogin(true)}>اتصال حساب CDE</Button>
+          <div className="mt-8 flex flex-wrap gap-2 text-xs text-white/55">
+            <span className="rounded-full border border-white/15 px-3 py-1">Session-trusted</span>
+            <span className="rounded-full border border-white/15 px-3 py-1">Audit-ready</span>
+            <span className="rounded-full border border-white/15 px-3 py-1">CDE SSO</span>
           </div>
-        </Card>
-      </div>
+        </div>
 
-      <Modal
-        isOpen={showCdeLogin}
-        onClose={() => {
-          if (!actionLoading) setShowCdeLogin(false);
-        }}
-        title="اتصال حساب CDE"
-        size="md"
-      >
         <form
-          className="space-y-5"
-          onSubmit={(event) => {
+          className="ac-rise-delay rounded-2xl border border-white/10 bg-white/95 p-6 shadow-2xl backdrop-blur dark:bg-[var(--theme-surface)]/95 sm:p-8"
+          onSubmit={event => {
             event.preventDefault();
             if (!actionLoading) void handleCdeLogin();
           }}
         >
-          <div className="grid grid-cols-2 overflow-hidden rounded-xl border border-gray-200 bg-gray-50 p-1" aria-label="مراحل اتصال CDE">
-            <div className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium ${cdeLoginStep === 'phone' ? 'bg-white text-blue-700 shadow-sm' : 'text-emerald-700'}`}>
-              {cdeLoginStep === 'password' ? <CheckCircle className="h-4 w-4" /> : <Smartphone className="h-4 w-4" />}
-              <span>۱. شماره همراه</span>
+          <div className="mb-6 flex items-center gap-2">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]">
+              {cdeLoginStep === 'phone' ? <Smartphone className="h-4 w-4" /> : <KeyRound className="h-4 w-4" />}
             </div>
-            <div className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium ${cdeLoginStep === 'password' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-400'}`}>
-              <KeyRound className="h-4 w-4" />
-              <span>۲. رمز عبور</span>
+            <div>
+              <h2 className="text-base font-semibold text-[var(--theme-text)]">ورود با CDE</h2>
+              <p className="text-xs text-[var(--theme-text-subtle)]">
+                {cdeLoginStep === 'phone' ? 'مرحله ۱ از ۲ — شماره همراه' : 'مرحله ۲ از ۲ — رمز عبور'}
+              </p>
             </div>
           </div>
 
-          <div className="rounded-xl border border-blue-100 bg-gradient-to-l from-blue-50 to-white p-4">
-            <div className="flex items-start gap-3">
-              <div className="rounded-lg bg-blue-100 p-2 text-blue-700"><ShieldCheck className="h-5 w-5" /></div>
-              <div>
-                <p className="text-sm font-semibold text-gray-900">اتصال امن به حساب شخصی CDE</p>
-                <p className="mt-1 text-xs leading-6 text-gray-600">
-                  رمز عبور فقط برای ورود به Core ارسال می‌شود و در این برنامه ذخیره نخواهد شد. تنها نشست رمزنگاری‌شده نگهداری می‌شود.
-                </p>
-              </div>
+          <div className="mb-5 grid grid-cols-2 gap-2">
+            <div
+              className={`rounded-lg px-3 py-2 text-center text-xs font-medium ${
+                cdeLoginStep === 'phone'
+                  ? 'bg-[var(--theme-accent)] text-white'
+                  : 'bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]'
+              }`}
+            >
+              {cdeLoginStep === 'password' ? <CheckCircle className="mx-auto mb-1 h-3.5 w-3.5" /> : null}
+              شماره
+            </div>
+            <div
+              className={`rounded-lg px-3 py-2 text-center text-xs font-medium ${
+                cdeLoginStep === 'password'
+                  ? 'bg-[var(--theme-accent)] text-white'
+                  : 'bg-[var(--theme-surface-muted)] text-[var(--theme-text-subtle)]'
+              }`}
+            >
+              رمز
             </div>
           </div>
 
           {cdeLoginStep === 'phone' ? (
-            <Input
-              key="cde-phone"
-              label="شماره همراه حساب CDE"
-              value={cdeLoginName}
-              onChange={(event) => {
-                setCdeLoginName(event.target.value.slice(0, 18));
-                if (cdeError) setCdeError('');
-              }}
-              placeholder="۰۹۱۲۱۲۳۴۵۶۷"
-              hint="شماره ثبت‌شده در CDE را با یا بدون صفر ابتدایی وارد کنید."
-              dir="ltr"
-              inputMode="tel"
-              autoComplete="tel"
-              autoFocus
-              disabled={actionLoading}
-            />
+            <div className="space-y-4">
+              <Select
+                label="Origin"
+                value={selectedOriginId}
+                onChange={event => {
+                  setSelectedOriginId(event.target.value);
+                  if (cdeError) setCdeError('');
+                }}
+                disabled={actionLoading || originsLoading || origins.length === 0}
+                options={origins.map(origin => ({
+                  value: origin.id,
+                  label: `${origin.label}`,
+                }))}
+              />
+              <Input
+                key="cde-phone"
+                label="شماره همراه"
+                value={cdeLoginName}
+                onChange={event => {
+                  setCdeLoginName(event.target.value.slice(0, 18));
+                  if (cdeError) setCdeError('');
+                }}
+                placeholder="۰۹۱۲۱۲۳۴۵۶۷"
+                dir="ltr"
+                inputMode="tel"
+                autoComplete="tel"
+                autoFocus
+                disabled={actionLoading}
+              />
+            </div>
           ) : (
-            <Input
-              key="cde-password"
-              label="رمز عبور CDE"
-              type="password"
-              value={cdePassword}
-              onChange={(event) => {
-                setCdePassword(event.target.value);
-                if (cdeError) setCdeError('');
-              }}
-              dir="ltr"
-              autoComplete="current-password"
-              autoFocus
-              disabled={actionLoading}
-            />
+            <div className="space-y-4">
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 text-xs text-[var(--theme-text-subtle)] hover:text-[var(--theme-accent)]"
+                onClick={() => {
+                  setCdeLoginStep('phone');
+                  setCdePassword('');
+                  setCdeError('');
+                }}
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                تغییر شماره
+              </button>
+              <Input
+                key="cde-password"
+                label="رمز عبور CDE"
+                type="password"
+                value={cdePassword}
+                onChange={event => {
+                  setCdePassword(event.target.value);
+                  if (cdeError) setCdeError('');
+                }}
+                dir="ltr"
+                autoComplete="current-password"
+                autoFocus
+                disabled={actionLoading}
+              />
+            </div>
           )}
 
-          {cdeError ? <p className="text-sm text-red-600">{cdeError}</p> : null}
+          {cdeError ? <p className="mt-4 text-sm text-[var(--theme-danger)]">{cdeError}</p> : null}
 
-          <div className="flex justify-end gap-2">
-            <Button
-              type="button"
-              variant="secondary"
-              disabled={actionLoading}
-              onClick={() => {
-                if (!actionLoading) setShowCdeLogin(false);
-              }}
-            >
-              انصراف
-            </Button>
-            <Button type="submit" disabled={actionLoading}>
-              {actionLoading ? 'در حال اتصال…' : cdeLoginStep === 'phone' ? 'ادامه' : 'ورود'}
-            </Button>
-          </div>
+          <Button
+            type="submit"
+            className="mt-6 w-full"
+            disabled={actionLoading || (cdeLoginStep === 'phone' && !selectedOriginId)}
+          >
+            {actionLoading ? 'در حال اتصال…' : cdeLoginStep === 'phone' ? 'ادامه' : 'ورود به Console'}
+          </Button>
+
+          <p className="mt-4 text-center text-[11px] leading-5 text-[var(--theme-text-subtle)]">
+            رمز عبور ذخیره نمی‌شود؛ فقط نشست امن روی سرور نگه داشته می‌شود.
+          </p>
         </form>
-      </Modal>
+      </div>
     </div>
   );
 };

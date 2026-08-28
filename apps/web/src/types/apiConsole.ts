@@ -45,7 +45,13 @@ export interface ApiEnvironmentProfile {
     defaultHeaders: ApiRequestHeader[];
     secretReferences: Record<string, string>;
     productionProtected: boolean;
+    archived?: boolean | undefined;
+    seeded?: boolean | undefined;
+    clonedFrom?: string | undefined;
     authenticationDocumentationProfileId?: string | undefined;
+    runnerId?: string | undefined;
+    webhookUrl?: string | undefined;
+    webhookSecret?: string | undefined;
     createdAt: string;
     updatedAt: string;
 }
@@ -131,6 +137,13 @@ export interface NormalizedApiRequest {
     executionMode: ApiExecutionMode;
     classification: ApiClassification;
 }
+export interface ApiSecretScanResult {
+    findings: string[];
+    mode: string;
+    blocked?: boolean | undefined;
+    warnings?: string[] | undefined;
+}
+
 export interface ApiCurlImportPreview {
     id: string;
     originalCurl: string;
@@ -152,7 +165,10 @@ export interface ApiCurlImportPreview {
     unsupportedOptions: string[];
     parserVersion: string;
     importedAt: string;
+    secretScan?: ApiSecretScanResult | undefined;
 }
+export type ApiVisibility = 'PRIVATE' | 'PROJECT_SHARED';
+
 export interface ApiCollection {
     id: string;
     applicationId: string;
@@ -161,6 +177,7 @@ export interface ApiCollection {
     description?: string | undefined;
     ownerId: string;
     status: 'ACTIVE' | 'ARCHIVED';
+    visibility?: ApiVisibility | undefined;
     variables: ApiVariable[];
     authenticationDocumentationProfileId?: string | undefined;
     createdAt: string;
@@ -283,6 +300,7 @@ export interface ApiRequestDefinition {
     description?: string | undefined;
     method: ApiHttpMethod;
     urlTemplate: string;
+    folderPath?: string[] | undefined;
     queryParameters: ApiKeyValueParameter[];
     headers: ApiRequestHeader[];
     cookies: ApiRequestCookie[];
@@ -308,6 +326,17 @@ export interface ApiRequestDefinition {
     sourceSync?: SourceSyncState | undefined;
     schemaCompleteness?: 'COMPLETE' | 'NEEDS_INPUT' | undefined;
     sourceEvidence?: SourceEvidence[] | undefined;
+    visibility?: ApiVisibility | undefined;
+    coOwnerIds?: string[] | undefined;
+    ownerId?: string | undefined;
+    runnerId?: string | undefined;
+    breakingChange?: boolean | undefined;
+    migrationNote?: string | undefined;
+    deprecatedAt?: string | undefined;
+    deprecationReason?: string | undefined;
+    deprecationEffectiveAt?: string | undefined;
+    ticketId?: string | undefined;
+    ticketUrl?: string | undefined;
 }
 
 export type RuntimeEnvironmentKind = 'DEVELOPMENT' | 'TEST' | 'PRE_PRODUCTION' | 'PRODUCTION';
@@ -475,6 +504,21 @@ export interface ApiShareRevision {
     documentationReference?: string | undefined;
     rowVersion: string;
 }
+export interface ApiReviewChecklist {
+    docsComplete: boolean;
+    noSecrets: boolean;
+    classificationOk: boolean;
+    consumersSpecified: boolean;
+}
+
+export interface ApiShareComment {
+    id: string;
+    authorId: string;
+    authorName?: string | undefined;
+    text: string;
+    createdAt: string;
+}
+
 export interface ApiShareRequest {
     id: string;
     requestId: string;
@@ -489,10 +533,14 @@ export interface ApiShareRequest {
     purpose?: string | undefined;
     introduction?: string | undefined;
     description?: string | undefined;
+    ticketId?: string | undefined;
+    ticketUrl?: string | undefined;
     returnReason?: string | undefined;
     reviewedBy?: string | undefined;
     reviewedAt?: string | undefined;
     revisions: ApiShareRevision[];
+    comments?: ApiShareComment[] | undefined;
+    checklist?: ApiReviewChecklist | undefined;
     rowVersion: string;
     createdAt: string;
     updatedAt: string;
@@ -518,6 +566,7 @@ export interface ApiConsoleDirectoryUser {
     roles: UserRole[];
     isSystemAdmin: boolean;
     isBootstrapAdmin: boolean;
+    isBootstrapQaLead?: boolean | undefined;
     createdAt?: string | undefined;
     updatedAt?: string | undefined;
 }
@@ -542,12 +591,205 @@ export interface ApiRepositoryItem {
     latestVersion: string;
     isNewForUser: boolean;
     changeLog?: string | undefined;
+    breakingChange?: boolean | undefined;
+    migrationNote?: string | undefined;
+    deprecationReason?: string | undefined;
+    ticketId?: string | undefined;
+    ticketUrl?: string | undefined;
     createdAt: string;
     updatedAt: string;
     request?: ApiRequestDefinition | undefined;
     shareRequest?: ApiShareRequest | undefined;
     executions?: ApiRequestExecution[] | undefined;
     manualResponses?: ApiManualResponseExample[] | undefined;
+}
+
+export type ApiDocLanguage = 'FA' | 'EN';
+
+export interface ApiPortalItem {
+    id: string;
+    apiId: string;
+    title: string;
+    version: string;
+    applicationId: string;
+    method: ApiHttpMethod;
+    urlTemplate: string;
+    classification: ApiClassification;
+    sharingStatus: ApiSharingStatus;
+    breakingChange?: boolean | undefined;
+    migrationNote?: string | undefined;
+    ticketId?: string | undefined;
+    ticketUrl?: string | undefined;
+    description?: string | undefined;
+    executeProductionAllowed: false;
+}
+
+export interface ApiPortalDetail extends ApiRequestDefinition {
+    openapi?: Record<string, unknown> | undefined;
+    executeProductionAllowed: false;
+    ticketId?: string | undefined;
+    ticketUrl?: string | undefined;
+}
+
+export interface ApiPortalShareTokenResult {
+    id: string;
+    token: string;
+    expiresAt: string;
+    urlPath: string;
+}
+
+export interface ApiPublicPortalDocument {
+    apiId: string;
+    version: string;
+    name: string;
+    method: ApiHttpMethod;
+    urlTemplate: string;
+    description?: string | undefined;
+    documentation?: ApiDocumentationMetadata | undefined;
+    classification?: ApiClassification | undefined;
+    sharingStatus: ApiSharingStatus;
+    breakingChange?: boolean | undefined;
+    migrationNote?: string | undefined;
+    openapi?: Record<string, unknown> | undefined;
+    executeProductionAllowed: false;
+    expiresAt?: string | undefined;
+    readOnly: true;
+}
+
+export interface ApiContractBaseline {
+    id: string;
+    collectionId: string;
+    name: string;
+    fingerprint: string;
+    schemaSummary: Record<string, { required: string[]; properties: Record<string, string> }>;
+    createdAt: string;
+    createdBy?: string | undefined;
+}
+
+export interface ApiContractCompareResult {
+    baselineId: string;
+    fingerprint: string;
+    currentFingerprint: string;
+    breaking: Array<Record<string, unknown>>;
+    nonBreaking: Array<Record<string, unknown>>;
+}
+
+export interface ApiBrandingTemplate {
+    id: string;
+    name: string;
+    language: ApiDocLanguage;
+    filePath?: string | undefined;
+    createdAt: string;
+    updatedAt: string;
+    createdBy?: string | undefined;
+}
+
+export interface ApiBrandingState {
+    activeTemplateId: string;
+    templates: ApiBrandingTemplate[];
+}
+
+export interface ApiBrandingPreview {
+    language: ApiDocLanguage;
+    labels: Record<string, string>;
+    sample: {
+        title: string;
+        method: string;
+        endpoint: string;
+    };
+}
+
+export interface ApiMockDefinition {
+    id: string;
+    requestId: string;
+    collectionId: string;
+    applicationId: string;
+    environmentId?: string | undefined;
+    method: ApiHttpMethod;
+    pathMatch: string;
+    statusCode: number;
+    responseBody: string;
+    responseHeaders: Array<{ name: string; value: string }>;
+    status: 'ACTIVE' | 'DISABLED' | 'EXPIRED' | 'REMOVED' | string;
+    expiresAt?: string | undefined;
+    createdBy: string;
+    createdAt: string;
+    updatedAt: string;
+    hitCount: number;
+}
+
+export interface ApiContractSuiteResult {
+    collectionId: string;
+    assertionCount: number;
+    updatedRequests: number;
+    openapi?: Record<string, unknown> | undefined;
+}
+
+export type ApiJitAccessStatus = 'PENDING' | 'ACTIVE' | 'REVOKED' | 'EXPIRED' | string;
+
+export interface ApiJitAccessGrant {
+    id: string;
+    userId: string;
+    applicationId: string;
+    reason: string;
+    status: ApiJitAccessStatus;
+    requestedAt: string;
+    expiresAt?: string | null | undefined;
+    approvedBy?: string | null | undefined;
+    approvedAt?: string | null | undefined;
+    revokedAt?: string | undefined;
+}
+
+export interface ApiComplianceReport {
+    generatedAt: string;
+    dateFrom: string | null;
+    dateTo: string | null;
+    totals: {
+        tlsInsecureExecutions: number;
+        exactModeRequests: number;
+        productionCommandExecutions: number;
+        approvedSharesWithoutConsumers: number;
+    };
+    samples: {
+        tlsInsecure: ApiRequestExecution[];
+        exactModeRequestIds: string[];
+        productionCommands: Array<{ id: string; requestId: string; startedAt: string }>;
+        sharesWithoutConsumers: Array<{ id: string; apiId: string; version: string }>;
+    };
+}
+
+export interface ApiOrgPolicies {
+    privateDestinationAllowlist: string[];
+    dualApprovalProductionCommand: boolean;
+    forbidInsecureTlsInProduction: boolean;
+    forbidExactModeInProduction: boolean;
+    maxPortalShareTtlHours?: number;
+    allowAnonymousPortalShare?: boolean;
+    updatedAt?: string | null;
+    updatedBy?: string | null;
+    envPrivateDestinationAllowlist?: string[];
+    envDualApproval?: boolean;
+}
+
+export type ApiDualApprovalStatus = 'PENDING' | 'ACTIVE' | 'REVOKED' | 'EXPIRED' | string;
+
+export interface ApiDualApprovalGrant {
+    id: string;
+    requestId: string;
+    userId: string;
+    applicationId?: string;
+    reason: string;
+    status: ApiDualApprovalStatus;
+    requestedAt: string;
+    approvedBy?: string | null;
+    approvedAt?: string | null;
+    expiresAt?: string | null;
+}
+
+export interface CdeOriginOption {
+    id: string;
+    label: string;
+    baseUrl: string;
 }
 export interface ApiConsoleReference {
     id: string;
@@ -592,6 +834,49 @@ export interface ApiExecutionRunner {
     name: string;
     networkZone: 'PUBLIC' | 'INTERNAL' | 'RESTRICTED' | 'TEST';
     enabled: boolean;
+    allowedOriginPatterns?: string[] | undefined;
+    createdAt?: string | undefined;
+    updatedAt?: string | undefined;
+}
+
+export interface ApiActivityEvent {
+    id: string;
+    eventType: string;
+    actorUserId: string;
+    actorRole?: string | undefined;
+    details?: Record<string, unknown> | undefined;
+    createdAt: string;
+}
+
+export interface ApiTestRunResult {
+    requestId: string;
+    name: string;
+    executionId?: string | undefined;
+    status: 'PASSED' | 'FAILED' | 'SKIPPED' | string;
+    transportResult?: string | undefined;
+    businessResult?: string | undefined;
+    assertionPassed?: number | undefined;
+    assertionFailed?: number | undefined;
+    error?: string | undefined;
+}
+
+export interface ApiTestRun {
+    id: string;
+    collectionId: string;
+    applicationId: string;
+    environmentId?: string | undefined;
+    actorUserId: string;
+    actorRole?: string | undefined;
+    stopOnFail: boolean;
+    results: ApiTestRunResult[];
+    summary: {
+        total: number;
+        passed: number;
+        failed: number;
+        skipped: number;
+    };
+    createdAt: string;
+    webhookDelivery?: { ok?: boolean; skipped?: boolean; error?: string; statusCode?: number } | null | undefined;
 }
 export interface ApiEffectiveRequestSnapshot {
     method: ApiHttpMethod;
@@ -719,4 +1004,8 @@ export interface ApiConsolePermissionPolicy {
     canExecuteProductionCommand: UserRole[];
     canDelete: UserRole[];
     canGenerateDocumentation: UserRole[];
+  canReviewShares: UserRole[];
+  canViewUsageReports: UserRole[];
+  canManageUsers: UserRole[];
+  canManageProtectedEnvironments: UserRole[];
 }

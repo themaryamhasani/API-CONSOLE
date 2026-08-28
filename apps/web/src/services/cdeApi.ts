@@ -70,6 +70,12 @@ export interface CdeProjectDescriptor {
   };
 }
 
+export interface CdeOriginOption {
+  id: string;
+  label: string;
+  baseUrl: string;
+}
+
 export class PlatformApiError extends Error {
   code: string;
   status: number;
@@ -147,6 +153,10 @@ export const cdeApi = {
     method: 'POST', body: JSON.stringify({ challenge, password }),
   }),
   disconnect: () => request<CdeConnectionStatus>('/api/cde/session', { method: 'DELETE' }),
+  listOrigins: () => request<{ data: CdeOriginOption[] }>('/api/cde/origins').then(payload => payload.data || []),
+  selectOrigin: (originId: string) => request<{ selected: CdeOriginOption }>('/api/cde/origins/select', {
+    method: 'POST', body: JSON.stringify({ originId }),
+  }),
   projects: () => request<CdeProjectDescriptor[]>('/api/cde/projects'),
   projectCatalog: (projectKey: string) => request<CdeCatalog>(`/api/cde/projects/${encodeURIComponent(projectKey)}/catalog`),
   projectPackage: (projectKey: string, data: {

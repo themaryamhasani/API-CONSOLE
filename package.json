@@ -13,7 +13,13 @@
     "backend": "npm run dev:api",
     "backend:self-check": "npm run self-check -w @api-console/api",
     "backend:admin-check": "npm run test:admin -w @api-console/api",
+    "backend:session-check": "npm run test:session -w @api-console/api",
+    "backend:env-check": "npm run test:environments -w @api-console/api",
     "backend:runtime-check": "npm run test:runtime -w @api-console/api",
+    "backend:phase2-check": "npm run test:phase2 -w @api-console/api",
+    "backend:phase3-check": "npm run test:phase3 -w @api-console/api",
+    "backend:vault-check": "npm run test:vault -w @api-console/api",
+    "zone-worker": "npm run zone-worker -w @api-console/api",
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"
   }

@@ -2,27 +2,33 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const dns = require('dns').promises;
 const zlib = require('zlib');
 const { monitorEventLoopDelay } = require('perf_hooks');
-const { createCipheriv, createDecipheriv, randomBytes, randomUUID } = require('crypto');
+const { createHash, randomUUID } = require('crypto');
 const {
-  LEGACY_CONTEXT_ENABLED,
+  isLegacyContextEnabled,
   attachSession,
   attachConsoleContext,
   assertCsrf,
   canHandleSession,
   handleSession,
   isBootstrapSystemAdmin,
+  loginListIncludes,
+  listActiveSessions,
   requireSession,
 } = require('../../../session/session-server.cjs');
 const { canHandleCde, collectProjectSourceFiles, handleCde, normalizeCdeLoginName } = require('../../../cde/cde-server.cjs');
 const { discoverProjectSources } = require('../../../cde/api-discovery.cjs');
+const { createPhase2Router, REVIEW_CHECKLIST_KEYS } = require('./phase2-routes.cjs');
+const { createPhase3Router, deliverWebhook: deliverItsmWebhook, scanTextForSecrets, parseConfiguredOrigins } = require('./phase3-routes.cjs');
 const {
   executeCoreOperation,
   finishRuntimeLogin,
   normalizedProfile,
   publicRuntimeStatus,
+  runtimeWhoAmI,
   startRuntimeLogin,
   validateRuntimeOrigin,
 } = require('../../../runtime/runtime-core-client.cjs');
@@ -32,12 +38,27 @@ const {
   setRuntimeSession,
 } = require('../../../runtime/runtime-session-store.cjs');
 const { serveOpenApiDocs } = require('../../../../openapi/serve-docs.cjs');
+const vaultProviderModule = require('../security/vault-provider.cjs');
+const { assertProductionSecrets, inspectProductionSecrets } = require('../security/production-secrets.cjs');
+const {
+  resolveBackend: resolveStoreBackend,
+  resolveSqlitePath,
+  createStoreAdapter,
+  loadStoreViaAdapter,
+  writeStoreViaAdapter,
+} = require('../persistence/store-adapter.cjs');
 
 const REPOSITORY_ROOT = path.resolve(__dirname, '../../../../../../..');
 const resolveRepositoryPath = value => path.isAbsolute(value) ? value : path.join(REPOSITORY_ROOT, value);
 const PORT = Number(process.env.API_CONSOLE_PORT || 4274);
 const DATA_DIR = resolveRepositoryPath(process.env.API_CONSOLE_DATA_DIR || path.join('runtime', 'api-console'));
 const STORE_FILE = process.env.API_CONSOLE_STORE_FILE || path.join(DATA_DIR, 'api-console-store.json');
+const STORE_BACKEND = resolveStoreBackend();
+const SQLITE_FILE = process.env.API_CONSOLE_SQLITE_FILE
+  ? resolveRepositoryPath(process.env.API_CONSOLE_SQLITE_FILE)
+  : resolveSqlitePath(process.env, DATA_DIR);
+/** @type {null | { backend: string, load: Function, save: Function, close?: Function }} */
+let activeStoreAdapter = null;
 const SECRET_VAULT_FILE = process.env.API_CONSOLE_SECRET_VAULT_FILE || path.join(DATA_DIR, 'api-console-secrets.json');
 const SECRET_KEY_FILE = process.env.API_CONSOLE_SECRET_KEY_FILE || path.join(DATA_DIR, 'api-console-secret.key');
 const DOCX_TEMPLATE_FILE = process.env.API_CONSOLE_DOCX_TEMPLATE_FILE || path.join(__dirname, '..', 'templates', 'api-console-document-template.docx');
@@ -216,6 +237,10 @@ const API_CONSOLE_POLICY = {
   canExecuteProductionCommand: ['SYSTEM_ADMIN', 'TECH_LEAD'],
   canDelete: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER', 'DEVELOPER'],
   canGenerateDocumentation: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER', 'DEVELOPER'],
+  canReviewShares: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
+  canViewUsageReports: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
+  canManageUsers: ['SYSTEM_ADMIN'],
+  canManageProtectedEnvironments: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
 };
 
 const USER_ROLES = ['SYSTEM_ADMIN', 'DEVELOPER', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER'];
@@ -316,6 +341,32 @@ function sanitizeText(text) {
     .replace(/((?:token|access_token|refresh_token|password|client-secret|api-key|client-id|national-code)\s*["']?\s*[:=]\s*["'])[^"',\s}]+/gi, '$1{{secret}}');
 }
 
+function sanitizeJsonForPreview(value) {
+  return JSON.parse(JSON.stringify(value, (_, item) => (typeof item === 'string' ? sanitizeText(item) : item)));
+}
+
+function prettyJsonPreview(value) {
+  try {
+    return JSON.stringify(sanitizeJsonForPreview(value), null, 2);
+  } catch {
+    return sanitizeText(typeof value === 'string' ? value : JSON.stringify(value));
+  }
+}
+
+async function ensureRuntimeSessionStillConnected(appSessionId, profile, state) {
+  try {
+    const probe = await runtimeWhoAmI(state, profile);
+    if (probe.response?.Result?.IsUserLogin === true) {
+      return { connected: true, state: probe.state };
+    }
+    await deleteRuntimeSession(appSessionId, profile.id);
+    return { connected: false, state: probe.state };
+  } catch {
+    // Keep the cookie jar from the business call. A transient who-am-i failure must not force re-login.
+    return { connected: true, state };
+  }
+}
+
 function isSecretReference(value) {
   const text = String(value || '');
   return text.startsWith('secret://') || text.startsWith('secret/');
@@ -325,77 +376,45 @@ function ensureDataDirectory() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+function getVaultProvider() {
+  return vaultProviderModule.getProvider();
+}
+
 function loadOrCreateSecretKey() {
   if (cachedSecretKey) return cachedSecretKey;
-  ensureDataDirectory();
-  if (process.env.API_CONSOLE_SECRET_KEY) {
-    cachedSecretKey = Buffer.from(process.env.API_CONSOLE_SECRET_KEY, 'base64');
-  } else if (fs.existsSync(SECRET_KEY_FILE)) {
-    cachedSecretKey = Buffer.from(fs.readFileSync(SECRET_KEY_FILE, 'utf8').trim(), 'base64');
-  } else {
-    cachedSecretKey = randomBytes(32);
-    fs.writeFileSync(SECRET_KEY_FILE, cachedSecretKey.toString('base64'), { encoding: 'utf8', mode: 0o600 });
-  }
-  if (cachedSecretKey.length !== 32) {
-    throw new ApiConsoleError('SECRET_RESOLUTION_ERROR', 'API Console secret key must be 32 bytes in base64 form.');
+  try {
+    cachedSecretKey = vaultProviderModule.loadOrCreateSecretKey();
+  } catch (error) {
+    throw new ApiConsoleError('SECRET_RESOLUTION_ERROR', error.message || 'API Console secret key must be 32 bytes in base64 form.');
   }
   return cachedSecretKey;
 }
 
 function loadSecretVault() {
-  ensureDataDirectory();
-  if (!fs.existsSync(SECRET_VAULT_FILE)) return { version: 1, secrets: {} };
-  try {
-    const parsed = JSON.parse(fs.readFileSync(SECRET_VAULT_FILE, 'utf8'));
-    return {
-      version: 1,
-      secrets: parsed.secrets && typeof parsed.secrets === 'object' ? parsed.secrets : {},
-    };
-  } catch {
-    return { version: 1, secrets: {} };
-  }
+  return vaultProviderModule.loadSecretVault();
 }
 
 function saveSecretVault(vault) {
-  ensureDataDirectory();
-  const tmp = `${SECRET_VAULT_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(vault, null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, SECRET_VAULT_FILE);
+  vaultProviderModule.saveSecretVault(vault);
 }
 
 function encryptSecretValue(value) {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', loadOrCreateSecretKey(), iv);
-  const ciphertext = Buffer.concat([cipher.update(String(value || ''), 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return {
-    algorithm: 'aes-256-gcm',
-    iv: iv.toString('base64'),
-    tag: tag.toString('base64'),
-    ciphertext: ciphertext.toString('base64'),
-    createdAt: nowIso(),
-  };
+  return vaultProviderModule.encryptSecretValue(value);
 }
 
 function decryptSecretValue(record) {
-  if (!record || record.algorithm !== 'aes-256-gcm') {
-    throw new ApiConsoleError('SECRET_RESOLUTION_ERROR', 'Unsupported API Console secret record.');
+  try {
+    return vaultProviderModule.decryptSecretValue(record);
+  } catch (error) {
+    throw new ApiConsoleError('SECRET_RESOLUTION_ERROR', error.message || 'Unsupported API Console secret record.');
   }
-  const decipher = createDecipheriv('aes-256-gcm', loadOrCreateSecretKey(), Buffer.from(record.iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(record.tag, 'base64'));
-  return Buffer.concat([
-    decipher.update(Buffer.from(record.ciphertext, 'base64')),
-    decipher.final(),
-  ]).toString('utf8');
 }
 
 function rememberSecret(value) {
   const ref = `secret://api-console/${randomUUID()}`;
   const normalizedValue = String(value || '');
   runtimeSecrets.set(ref, normalizedValue);
-  const vault = loadSecretVault();
-  vault.secrets[ref] = encryptSecretValue(normalizedValue);
-  saveSecretVault(vault);
+  getVaultProvider().store(ref, normalizedValue);
   return ref;
 }
 
@@ -1132,6 +1151,9 @@ function definitionFromNormalized(normalized, data) {
     description: data.description,
     method: normalized.method,
     urlTemplate: normalized.url,
+    folderPath: Array.isArray(data.folderPath)
+      ? data.folderPath.map(part => String(part || '').trim()).filter(Boolean)
+      : [],
     queryParameters: normalized.queryParameters || [],
     headers: normalized.headers || [],
     cookies: normalized.cookies || [],
@@ -1687,6 +1709,8 @@ function defaultEnvironments() {
     defaultHeaders: [mkHeader('prostage', '{{stage}}', 0), mkHeader('accept', 'application/json', 1)],
     secretReferences: {},
     productionProtected,
+    archived: false,
+    seeded: true,
     createdAt: nowIso(),
     updatedAt: nowIso(),
   });
@@ -1700,11 +1724,24 @@ function defaultEnvironments() {
 
 function defaultRunners() {
   return [
-    { id: 'runner-public', name: 'Public Network Runner', networkZone: 'PUBLIC', enabled: true },
-    { id: 'runner-internal', name: 'Internal Network Runner', networkZone: 'INTERNAL', enabled: true },
-    { id: 'runner-restricted', name: 'Restricted Network Runner', networkZone: 'RESTRICTED', enabled: true },
-    { id: 'runner-test', name: 'Test Network Runner', networkZone: 'TEST', enabled: true },
+    { id: 'runner-public', name: 'Public Network Runner', networkZone: 'PUBLIC', allowedOriginPatterns: ['*'], enabled: true },
+    { id: 'runner-internal', name: 'Internal Network Runner', networkZone: 'INTERNAL', allowedOriginPatterns: ['*'], enabled: true },
+    { id: 'runner-restricted', name: 'Restricted Network Runner', networkZone: 'RESTRICTED', allowedOriginPatterns: ['*'], enabled: true },
+    { id: 'runner-test', name: 'Test Network Runner', networkZone: 'TEST', allowedOriginPatterns: ['*'], enabled: true },
   ];
+}
+
+function defaultOrgPolicies() {
+  return {
+    privateDestinationAllowlist: [],
+    dualApprovalProductionCommand: false,
+    forbidInsecureTlsInProduction: true,
+    forbidExactModeInProduction: true,
+    maxPortalShareTtlHours: 168,
+    allowAnonymousPortalShare: true,
+    updatedAt: null,
+    updatedBy: null,
+  };
 }
 
 function defaultStore() {
@@ -1730,6 +1767,13 @@ function defaultStore() {
     runners: defaultRunners(),
     globalVariables: defaultGlobalVariables(),
     auditLog: [],
+    testRuns: [],
+    orgPolicies: defaultOrgPolicies(),
+    dualApprovals: [],
+    portalShareTokens: [],
+    contractBaselines: [],
+    executionQueue: [],
+    zoneWorkerHeartbeat: null,
   };
 }
 
@@ -1758,8 +1802,20 @@ function ensureRequestApiFields(request) {
     ...request,
     apiId,
     semanticVersion,
+    folderPath: Array.isArray(request.folderPath)
+      ? request.folderPath.map(part => String(part || '').trim()).filter(Boolean)
+      : [],
+    visibility: request.visibility === 'PROJECT_SHARED' ? 'PROJECT_SHARED' : 'PRIVATE',
+    coOwnerIds: Array.isArray(request.coOwnerIds)
+      ? [...new Set(request.coOwnerIds.map(id => String(id || '').trim()).filter(Boolean))].slice(0, 5)
+      : [],
+    ownerId: request.ownerId || request.createdBy,
+    runnerId: request.runnerId || undefined,
+    breakingChange: request.breakingChange === true,
+    migrationNote: request.migrationNote ? String(request.migrationNote) : undefined,
     sharingStatus: SHARE_STATUSES.has(request.sharingStatus) ? request.sharingStatus : 'DRAFT',
     sourceType: request.sourceType || 'ORIGINAL',
+    originId: request.originId || 'default',
     documentation: legacyDocumentation,
   };
   next.documentation = refreshDocumentationMetadata(next);
@@ -1785,38 +1841,170 @@ function normalizeStoreShape(raw) {
     notifications: Array.isArray(raw.notifications) ? raw.notifications : [],
     directoryUsers: Array.isArray(raw.directoryUsers) ? raw.directoryUsers : [],
     directoryRoleAssignments: Array.isArray(raw.directoryRoleAssignments) ? raw.directoryRoleAssignments : [],
-    runtimeProfiles: Array.isArray(raw.runtimeProfiles) ? raw.runtimeProfiles : [],
-    discoverySnapshots: Array.isArray(raw.discoverySnapshots) ? raw.discoverySnapshots : [],
-    environments: raw.environments?.length ? raw.environments : defaultEnvironments(),
-    runners: raw.runners?.length ? raw.runners : defaultRunners(),
+    runtimeProfiles: Array.isArray(raw.runtimeProfiles)
+      ? raw.runtimeProfiles.map(profile => ({ ...profile, originId: profile.originId || 'default' }))
+      : [],
+    discoverySnapshots: Array.isArray(raw.discoverySnapshots)
+      ? raw.discoverySnapshots.map(snapshot => ({ ...snapshot, originId: snapshot.originId || 'default' }))
+      : [],
+    environments: (raw.environments?.length ? raw.environments : defaultEnvironments()).map(env => ({
+      archived: false,
+      ...env,
+      seeded: Boolean(env.seeded) || ['env-development', 'env-test', 'env-preprod', 'env-production'].includes(env.id),
+      variables: Array.isArray(env.variables) ? env.variables : [],
+      defaultHeaders: Array.isArray(env.defaultHeaders) ? env.defaultHeaders : [],
+      secretReferences: env.secretReferences && typeof env.secretReferences === 'object' ? env.secretReferences : {},
+    })),
+    runners: (raw.runners?.length ? raw.runners : defaultRunners()).map(runner => ({
+      allowedOriginPatterns: Array.isArray(runner.allowedOriginPatterns) ? runner.allowedOriginPatterns : ['*'],
+      enabled: runner.enabled !== false,
+      ...runner,
+    })),
     globalVariables: raw.globalVariables?.length ? raw.globalVariables : defaultGlobalVariables(),
     auditLog: Array.isArray(raw.auditLog) ? raw.auditLog : [],
+    testRuns: Array.isArray(raw.testRuns) ? raw.testRuns : [],
+    orgPolicies: {
+      ...defaultOrgPolicies(),
+      ...(raw.orgPolicies && typeof raw.orgPolicies === 'object' ? raw.orgPolicies : {}),
+      privateDestinationAllowlist: Array.isArray(raw.orgPolicies?.privateDestinationAllowlist)
+        ? raw.orgPolicies.privateDestinationAllowlist.map(item => String(item || '').trim()).filter(Boolean)
+        : [],
+      dualApprovalProductionCommand: raw.orgPolicies?.dualApprovalProductionCommand === true,
+      forbidInsecureTlsInProduction: raw.orgPolicies?.forbidInsecureTlsInProduction !== false,
+      forbidExactModeInProduction: raw.orgPolicies?.forbidExactModeInProduction !== false,
+      maxPortalShareTtlHours: Number(raw.orgPolicies?.maxPortalShareTtlHours || 168),
+      allowAnonymousPortalShare: raw.orgPolicies?.allowAnonymousPortalShare !== false,
+    },
+    dualApprovals: Array.isArray(raw.dualApprovals) ? raw.dualApprovals : [],
+    portalShareTokens: Array.isArray(raw.portalShareTokens) ? raw.portalShareTokens : [],
+    contractBaselines: Array.isArray(raw.contractBaselines) ? raw.contractBaselines : [],
+    executionQueue: Array.isArray(raw.executionQueue) ? raw.executionQueue : [],
+    zoneWorkerHeartbeat: raw.zoneWorkerHeartbeat || null,
     version: 2,
   };
+  next.collections = next.collections.map(collection => ({
+    visibility: collection.visibility === 'PROJECT_SHARED' ? 'PROJECT_SHARED' : 'PRIVATE',
+    ...collection,
+    originId: collection.originId || 'default',
+  }));
   const knownRequestIds = new Set(next.requests.map(request => request.id));
   next.references = next.references.filter(reference => !reference.requestId || knownRequestIds.has(reference.requestId));
   return next;
 }
 
-function loadStore() {
+function loadStoreFromFile() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(STORE_FILE)) {
-    const store = normalizeStoreShape(defaultStore());
-    saveStore(store);
-    return store;
+    const next = normalizeStoreShape(defaultStore());
+    saveStoreToFile(next);
+    return next;
   }
   const parsed = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
   return normalizeStoreShape(parsed);
 }
 
-function saveStore(store) {
+function saveStoreToFile(nextStore) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const tmp = `${STORE_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8');
+  fs.writeFileSync(tmp, JSON.stringify(nextStore, null, 2), 'utf8');
   fs.renameSync(tmp, STORE_FILE);
 }
 
+/**
+ * Low-risk persistence entry: FILE keeps current JSON behavior; SQLITE loads
+ * store_blob into the same in-memory shape (entity tables updated on save).
+ */
+function loadStore() {
+  if (STORE_BACKEND === 'SQLITE') {
+    const { adapter, store: loaded } = loadStoreViaAdapter({
+      backend: 'SQLITE',
+      dataDir: DATA_DIR,
+      sqliteFile: SQLITE_FILE,
+      normalizeStore: normalizeStoreShape,
+      defaultStore,
+      loadStore: () => {
+        if (fs.existsSync(STORE_FILE)) {
+          return normalizeStoreShape(JSON.parse(fs.readFileSync(STORE_FILE, 'utf8')));
+        }
+        return normalizeStoreShape(defaultStore());
+      },
+    });
+    activeStoreAdapter = adapter;
+    return loaded;
+  }
+  activeStoreAdapter = createStoreAdapter({
+    backend: 'FILE',
+    loadStore: loadStoreFromFile,
+    saveStore: saveStoreToFile,
+  });
+  return activeStoreAdapter.load();
+}
+
+function saveStore(nextStore) {
+  if (activeStoreAdapter) {
+    writeStoreViaAdapter(activeStoreAdapter, nextStore);
+    return;
+  }
+  saveStoreToFile(nextStore);
+}
+
 let store = loadStore();
+
+const tryHandlePhase2 = createPhase2Router({
+  ApiConsoleError,
+  makeId,
+  nowIso,
+  safeClone,
+  sanitizeText,
+  requireContext,
+  assertCsrf,
+  roleAllowed,
+  API_CONSOLE_POLICY,
+  assertApplicationInContext,
+  contextApplicationIds,
+  matchesApplicationScope,
+  paginate,
+  audit,
+  notifyUser,
+  saveStore,
+  getStore: () => store,
+  setStoreField: (key, value) => { store[key] = value; },
+  belongsToUser,
+  ensureRequestApiFields,
+  protectRequestSecrets,
+  semanticVersionOf,
+  consumersForVersion,
+  executeRequest: (...args) => executeRequest(...args),
+  findEnvironment,
+  assertCanReviewShares,
+});
+
+const tryHandlePhase3 = createPhase3Router({
+  ApiConsoleError,
+  makeId,
+  nowIso,
+  safeClone,
+  sanitizeText,
+  requireContext,
+  assertCsrf,
+  roleAllowed,
+  API_CONSOLE_POLICY,
+  assertApplicationInContext,
+  matchesApplicationScope,
+  paginate,
+  audit,
+  notifyUser,
+  saveStore,
+  getStore: () => store,
+  setStoreField: (key, value) => { store[key] = value; },
+  belongsToUser,
+  semanticVersionOf,
+  consumersForVersion,
+  findEnvironment,
+  assertCanReviewShares,
+  DATA_DIR,
+  DOCX_TEMPLATE_FILE,
+});
 
 function audit(eventType, actor, details = {}) {
   store.auditLog.unshift({
@@ -1824,7 +2012,11 @@ function audit(eventType, actor, details = {}) {
     eventType,
     actorUserId: actor?.userId || actor?.id || 'anonymous',
     actorRole: actor?.role || 'UNKNOWN',
-    details: JSON.parse(JSON.stringify(details, (_, value) => typeof value === 'string' ? sanitizeText(value) : value)),
+    originId: actor?.cdeOriginId || details.originId || undefined,
+    details: JSON.parse(JSON.stringify({
+      ...details,
+      ...(actor?.cdeOriginId ? { originId: actor.cdeOriginId } : {}),
+    }, (_, value) => typeof value === 'string' ? sanitizeText(value) : value)),
     createdAt: nowIso(),
   });
   store.auditLog = store.auditLog.slice(0, 500);
@@ -1859,21 +2051,25 @@ function trackDirectoryContext(context) {
     changed = true;
   }
 
-  if (context.role && context.applicationId) {
+  // Never elevate from client/session-claimed role. Only ensure a SESSION_SYNC DEVELOPER
+  // membership exists so consumer directories can discover synced CDE users.
+  if (context.applicationId) {
     const appIds = context.scopeApplicationIds?.length ? context.scopeApplicationIds : [context.applicationId];
     appIds.forEach(applicationId => {
       const exists = store.directoryRoleAssignments.some(item =>
         item.userId === context.userId &&
-        item.role === context.role &&
-        item.applicationId === applicationId
+        item.role === 'DEVELOPER' &&
+        item.applicationId === applicationId &&
+        item.isActive !== false
       );
       if (!exists) {
         store.directoryRoleAssignments.unshift({
           id: makeId('dir-role'),
           userId: context.userId,
-          role: context.role,
+          role: 'DEVELOPER',
           applicationId,
           isActive: true,
+          source: 'SESSION_SYNC',
           createdAt: nowIso(),
         });
         changed = true;
@@ -1884,8 +2080,14 @@ function trackDirectoryContext(context) {
 }
 
 function assertSystemAdministrator(context) {
-  if (context.role !== 'SYSTEM_ADMIN') {
-    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Only System Administrators can manage users and approve shared API requests.', 403);
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canManageUsers)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Only System Administrators can manage users.', 403);
+  }
+}
+
+function assertCanReviewShares(context) {
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canReviewShares)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to review shared API requests.', 403);
   }
 }
 
@@ -1894,7 +2096,11 @@ function activeRolesForDirectoryUser(userId) {
     .filter(assignment =>
       assignment.userId === userId &&
       assignment.isActive !== false &&
-      (assignment.role !== 'SYSTEM_ADMIN' || assignment.source === 'ADMIN_APPROVAL')
+      (
+        (assignment.role === 'SYSTEM_ADMIN' && assignment.source === 'ADMIN_APPROVAL') ||
+        (assignment.role !== 'SYSTEM_ADMIN' && assignment.role !== 'DEVELOPER' && assignment.source === 'ADMIN_APPROVAL') ||
+        (assignment.role === 'DEVELOPER' && (assignment.source === 'SESSION_SYNC' || assignment.source === 'ADMIN_APPROVAL'))
+      )
     )
     .map(assignment => assignment.role)
     .filter(role => USER_ROLES.includes(role))));
@@ -1903,13 +2109,17 @@ function activeRolesForDirectoryUser(userId) {
 function directoryUserView(user) {
   const roles = activeRolesForDirectoryUser(user.id);
   const bootstrapAdmin = isBootstrapSystemAdmin(user.phoneNumber);
+  const bootstrapQaLead = loginListIncludes(process.env.API_CONSOLE_QA_LEAD_LOGINS, user.phoneNumber);
   if (bootstrapAdmin && !roles.includes('SYSTEM_ADMIN')) roles.unshift('SYSTEM_ADMIN');
+  if (bootstrapQaLead && !roles.includes('QA_LEAD') && !roles.includes('SYSTEM_ADMIN')) roles.push('QA_LEAD');
+  if (!roles.length) roles.push('DEVELOPER');
   return {
     ...user,
     source: user.source || 'CDE',
-    roles,
+    roles: Array.from(new Set(roles)),
     isSystemAdmin: bootstrapAdmin || roles.includes('SYSTEM_ADMIN'),
     isBootstrapAdmin: bootstrapAdmin,
+    isBootstrapQaLead: bootstrapQaLead,
   };
 }
 
@@ -1973,6 +2183,93 @@ function setManagedSystemAdministrator(userId, enabled, context) {
   });
   saveStore(store);
   return directoryUserView(user);
+}
+
+function setManagedDirectoryRole(userId, role, enabled, context, options = {}) {
+  assertSystemAdministrator(context);
+  const normalizedRole = String(role || '').trim();
+  if (!USER_ROLES.includes(normalizedRole)) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Unsupported directory role.', 422);
+  }
+  if (normalizedRole === 'SYSTEM_ADMIN') {
+    return setManagedSystemAdministrator(userId, enabled, context);
+  }
+  if (normalizedRole === 'DEVELOPER' && !enabled) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'DEVELOPER is the default role and cannot be revoked from the directory UI.', 409);
+  }
+
+  const user = store.directoryUsers.find(item => item.id === userId && item.isActive !== false);
+  if (!user) throw new ApiConsoleError('INVALID_URL', 'CDE directory user not found.', 404);
+  if (normalizedRole === 'QA_LEAD' && !enabled && loginListIncludes(process.env.API_CONSOLE_QA_LEAD_LOGINS, user.phoneNumber)) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Bootstrap QA Lead access is controlled by API_CONSOLE_QA_LEAD_LOGINS.', 409);
+  }
+
+  const requestedApps = normalizeRoleApplicationIds(options.applicationIds ?? options.applicationId);
+  const explicitApplicationScope = options.applicationId != null || options.applicationIds != null;
+  const assignments = store.directoryRoleAssignments.filter(assignment =>
+    assignment.userId === user.id && assignment.role === normalizedRole
+  );
+  const changedAt = nowIso();
+  if (enabled) {
+    requestedApps.forEach(applicationId => {
+      const approvedActive = assignments.find(assignment =>
+        assignment.isActive !== false &&
+        assignment.source === 'ADMIN_APPROVAL' &&
+        String(assignment.applicationId || 'ALL') === applicationId
+      );
+      if (approvedActive) return;
+      const reusable = assignments.find(assignment =>
+        assignment.source === 'ADMIN_APPROVAL' &&
+        String(assignment.applicationId || 'ALL') === applicationId
+      ) || assignments.find(assignment => assignment.source === 'ADMIN_APPROVAL' && assignment.isActive === false);
+      if (reusable && reusable.source === 'ADMIN_APPROVAL') {
+        reusable.isActive = true;
+        reusable.applicationId = applicationId;
+        reusable.scope = 'APP';
+        reusable.source = 'ADMIN_APPROVAL';
+        reusable.updatedAt = changedAt;
+        reusable.updatedBy = context.userId;
+      } else {
+        store.directoryRoleAssignments.unshift({
+          id: makeId('dir-role'),
+          userId: user.id,
+          role: normalizedRole,
+          applicationId,
+          scope: 'APP',
+          isActive: true,
+          source: 'ADMIN_APPROVAL',
+          createdAt: changedAt,
+          createdBy: context.userId,
+        });
+      }
+    });
+  } else {
+    assignments
+      .filter(assignment => assignment.source === 'ADMIN_APPROVAL')
+      .filter(assignment => !explicitApplicationScope || requestedApps.includes(String(assignment.applicationId || 'ALL')))
+      .forEach(assignment => {
+        assignment.isActive = false;
+        assignment.updatedAt = changedAt;
+        assignment.updatedBy = context.userId;
+      });
+  }
+  audit(enabled ? 'DIRECTORY_ROLE_GRANTED' : 'DIRECTORY_ROLE_REVOKED', context, {
+    targetUserId: user.id,
+    targetUserName: user.fullName,
+    role: normalizedRole,
+    applicationIds: requestedApps,
+  });
+  saveStore(store);
+  return directoryUserView(user);
+}
+
+function normalizeRoleApplicationIds(value) {
+  if (Array.isArray(value)) {
+    const ids = value.map(item => String(item || '').trim()).filter(Boolean);
+    return ids.length ? Array.from(new Set(ids)) : ['ALL'];
+  }
+  const single = String(value || '').trim();
+  return [single || 'ALL'];
 }
 
 function notifyUser(userId, title, message, entityType, entityId, correlationId) {
@@ -2111,6 +2408,9 @@ function repositoryItemFromRequest(request, context) {
     latestVersion: latest ? semanticVersionOf(latest) : version,
     isNewForUser: !!receipt && !receipt.viewedAt,
     changeLog: request.documentation?.changeHistory?.slice(-1)[0]?.summary || '',
+    breakingChange: request.breakingChange === true,
+    migrationNote: request.migrationNote || '',
+    deprecationReason: request.deprecationReason || '',
     createdAt: request.createdAt,
     updatedAt: request.updatedAt,
   };
@@ -2171,16 +2471,198 @@ function buildShareSnapshot(request, context) {
 }
 
 function findEnvironment(id) {
-  return store.environments.find(item => item.id === id) || store.environments[0];
+  return store.environments.find(item => item.id === id && item.archived !== true) || store.environments.find(item => item.archived !== true) || store.environments[0];
 }
 
-function selectRunner(environment, resolvedAddress) {
-  if (resolvedAddress && isPrivateNetworkAddress(resolvedAddress)) {
-    return store.runners.find(runner => runner.networkZone === 'INTERNAL') || store.runners[0];
+function listActiveEnvironments() {
+  return store.environments.filter(item => item.archived !== true);
+}
+
+function assertCanMutateEnvironment(context, environment, creating = false) {
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canEdit)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to manage environments.', 403);
   }
-  if (environment.kind === 'PRODUCTION') return store.runners.find(runner => runner.networkZone === 'RESTRICTED') || store.runners[0];
-  if (environment.kind === 'TEST') return store.runners.find(runner => runner.networkZone === 'TEST') || store.runners[0];
-  return store.runners.find(runner => runner.networkZone === 'PUBLIC') || store.runners[0];
+  const protectedEnv = creating
+    ? Boolean(environment?.productionProtected) || ['PRE_PRODUCTION', 'PRODUCTION'].includes(environment?.kind)
+    : Boolean(environment?.productionProtected) || environment?.kind === 'PRODUCTION' || environment?.kind === 'PRE_PRODUCTION';
+  if (protectedEnv && !roleAllowed(context.role, API_CONSOLE_POLICY.canManageProtectedEnvironments)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Protected environments require System Admin, Tech Lead or QA Lead.', 403);
+  }
+}
+
+function normalizeEnvironmentInput(data = {}, existing = null) {
+  const kind = String(data.kind || existing?.kind || 'CUSTOM').toUpperCase();
+  const allowedKinds = ['DEVELOPMENT', 'TEST', 'PRE_PRODUCTION', 'PRODUCTION', 'CUSTOM'];
+  if (!allowedKinds.includes(kind)) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Unsupported environment kind.', 422);
+  }
+  const name = String(data.name || existing?.name || '').trim();
+  if (!name) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Environment name is required.', 422);
+  const baseUrl = String(data.baseUrl || existing?.baseUrl || '').trim();
+  if (!baseUrl) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Environment baseUrl is required.', 422);
+  const productionProtected = data.productionProtected != null
+    ? data.productionProtected === true
+    : Boolean(existing?.productionProtected) || kind === 'PRODUCTION' || kind === 'PRE_PRODUCTION';
+  const variables = Array.isArray(data.variables)
+    ? data.variables.map((item, index) => ({
+      id: item.id || makeId('var'),
+      key: String(item.key || '').trim(),
+      currentValue: String(item.currentValue ?? ''),
+      initialValue: item.initialValue != null ? String(item.initialValue) : String(item.currentValue ?? ''),
+      sensitive: item.sensitive === true,
+      scope: 'ENVIRONMENT',
+      description: String(item.description || ''),
+      displayOrder: index,
+    })).filter(item => item.key)
+    : (existing?.variables || []);
+  const defaultHeaders = Array.isArray(data.defaultHeaders)
+    ? data.defaultHeaders.map((item, index) => createHeader(
+      String(item.name || ''),
+      String(item.valueTemplate || item.value || ''),
+      index,
+      'ENVIRONMENT'
+    )).filter(item => item.name)
+    : (existing?.defaultHeaders || []);
+  const secretReferences = data.secretReferences && typeof data.secretReferences === 'object'
+    ? Object.fromEntries(Object.entries(data.secretReferences).map(([key, value]) => [String(key), String(value)]))
+    : (existing?.secretReferences || {});
+  return {
+    name,
+    kind,
+    baseUrl,
+    variables,
+    defaultHeaders,
+    secretReferences,
+    productionProtected,
+    authenticationDocumentationProfileId: data.authenticationDocumentationProfileId || existing?.authenticationDocumentationProfileId,
+  };
+}
+
+function createEnvironment(data, context) {
+  const normalized = normalizeEnvironmentInput(data);
+  assertCanMutateEnvironment(context, normalized, true);
+  if (listActiveEnvironments().some(item => item.name.toLowerCase() === normalized.name.toLowerCase())) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'An environment with this name already exists.', 409);
+  }
+  const environment = {
+    id: makeId('env'),
+    ...normalized,
+    archived: false,
+    seeded: false,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    createdBy: context.userId,
+  };
+  store.environments.unshift(environment);
+  audit('ENVIRONMENT_CREATED', context, { environmentId: environment.id, name: environment.name, kind: environment.kind });
+  saveStore(store);
+  return environment;
+}
+
+function updateEnvironment(id, data, context) {
+  const environment = store.environments.find(item => item.id === id);
+  if (!environment || environment.archived) throw new ApiConsoleError('INVALID_URL', 'Environment not found.', 404);
+  assertCanMutateEnvironment(context, environment);
+  const normalized = normalizeEnvironmentInput(data, environment);
+  assertCanMutateEnvironment(context, normalized, true);
+  Object.assign(environment, normalized, { updatedAt: nowIso(), updatedBy: context.userId });
+  audit('ENVIRONMENT_UPDATED', context, { environmentId: environment.id, name: environment.name });
+  saveStore(store);
+  return environment;
+}
+
+function cloneEnvironment(id, context) {
+  const source = store.environments.find(item => item.id === id);
+  if (!source || source.archived) throw new ApiConsoleError('INVALID_URL', 'Environment not found.', 404);
+  assertCanMutateEnvironment(context, { ...source, productionProtected: false, kind: source.kind === 'PRODUCTION' ? 'CUSTOM' : source.kind }, true);
+  const baseName = `${source.name} Copy`;
+  let name = baseName;
+  let suffix = 2;
+  while (listActiveEnvironments().some(item => item.name.toLowerCase() === name.toLowerCase())) {
+    name = `${baseName} ${suffix}`;
+    suffix += 1;
+  }
+  const cloned = {
+    id: makeId('env'),
+    name,
+    kind: source.kind === 'PRODUCTION' || source.kind === 'PRE_PRODUCTION' ? 'CUSTOM' : source.kind,
+    baseUrl: source.baseUrl,
+    variables: (source.variables || []).map(variable => ({
+      ...safeClone(variable),
+      id: makeId('var'),
+      currentValue: variable.sensitive ? '' : variable.currentValue,
+      initialValue: variable.sensitive ? '' : (variable.initialValue || variable.currentValue),
+    })),
+    defaultHeaders: safeClone(source.defaultHeaders || []),
+    secretReferences: {},
+    productionProtected: false,
+    archived: false,
+    seeded: false,
+    clonedFrom: source.id,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    createdBy: context.userId,
+  };
+  store.environments.unshift(cloned);
+  audit('ENVIRONMENT_CLONED', context, { environmentId: cloned.id, sourceEnvironmentId: source.id, name: cloned.name });
+  saveStore(store);
+  return cloned;
+}
+
+function archiveEnvironment(id, context, { force = false } = {}) {
+  const environment = store.environments.find(item => item.id === id);
+  if (!environment || environment.archived) throw new ApiConsoleError('INVALID_URL', 'Environment not found.', 404);
+  assertCanMutateEnvironment(context, environment);
+  if (environment.seeded && !force) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Seeded environments require force=true to archive.', 409);
+  }
+  const inUse = store.requests.some(request => request.environmentId === id && request.status !== 'ARCHIVED');
+  if (inUse && !force) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Environment is in use by one or more requests. Pass force=true to archive anyway.', 409);
+  }
+  environment.archived = true;
+  environment.updatedAt = nowIso();
+  environment.updatedBy = context.userId;
+  audit('ENVIRONMENT_ARCHIVED', context, { environmentId: environment.id, name: environment.name, forced: Boolean(force), inUse });
+  saveStore(store);
+  return environment;
+}
+
+function selectRunner(environment, resolvedAddress, preferredRunnerId, requestUrl) {
+  const preferredId = preferredRunnerId || environment?.runnerId;
+  let runner;
+  if (preferredId) {
+    runner = store.runners.find(item => item.id === preferredId);
+    if (!runner || runner.enabled === false) {
+      throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', 'Runner zone انتخاب‌شده در دسترس نیست یا غیرفعال است.', 409);
+    }
+  } else if (resolvedAddress && isPrivateNetworkAddress(resolvedAddress)) {
+    runner = store.runners.find(item => item.networkZone === 'INTERNAL' && item.enabled !== false) || store.runners[0];
+  } else if (environment.kind === 'PRODUCTION') {
+    runner = store.runners.find(item => item.networkZone === 'RESTRICTED' && item.enabled !== false) || store.runners[0];
+  } else if (environment.kind === 'TEST') {
+    runner = store.runners.find(item => item.networkZone === 'TEST' && item.enabled !== false) || store.runners[0];
+  } else {
+    runner = store.runners.find(item => item.networkZone === 'PUBLIC' && item.enabled !== false) || store.runners[0];
+  }
+  if (!runner || runner.enabled === false) {
+    throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', 'هیچ Runner Zone فعالی برای این محیط در دسترس نیست.', 409);
+  }
+  const patterns = Array.isArray(runner.allowedOriginPatterns) ? runner.allowedOriginPatterns : ['*'];
+  if (requestUrl && patterns.length && !patterns.includes('*')) {
+    let hostname = '';
+    try { hostname = new URL(requestUrl).hostname.toLowerCase(); } catch {}
+    const allowed = patterns.some(pattern => {
+      const normalized = String(pattern || '').toLowerCase();
+      if (!normalized) return false;
+      if (normalized.startsWith('*.')) return hostname === normalized.slice(2) || hostname.endsWith(normalized.slice(1));
+      return hostname === normalized || hostname.endsWith(`.${normalized}`);
+    });
+    if (!allowed) {
+      throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', `مقصد خارج از allowedOriginPatterns برای Runner «${runner.name}» است.`, 409);
+    }
+  }
+  return runner;
 }
 
 function parseApplicationScope(value) {
@@ -2222,7 +2704,51 @@ function assertApplicationInContext(applicationId, context) {
 
 function belongsToUser(entity, context) {
   if (!context?.userId) return true;
-  return entity.ownerId === context.userId || entity.createdBy === context.userId;
+  if (entity.ownerId === context.userId || entity.createdBy === context.userId) return true;
+  if ((entity.coOwnerIds || []).includes(context.userId)) return true;
+  if (entity.visibility === 'PROJECT_SHARED') {
+    const appId = String(entity.applicationId || '').trim();
+    if (appId && contextApplicationIds(context).includes(appId)) return true;
+  }
+  return false;
+}
+
+function resolveOriginId(context) {
+  return String(context?.cdeOriginId || 'default');
+}
+
+function resolveListOriginFilter(context, parsedUrl) {
+  const queryOrigin = String(parsedUrl?.searchParams?.get('originId') || '').trim();
+  if (context?.role === 'SYSTEM_ADMIN' && queryOrigin.toUpperCase() === 'ALL') return null;
+  if (context?.role === 'SYSTEM_ADMIN' && queryOrigin) return queryOrigin;
+  return resolveOriginId(context);
+}
+
+function matchesOriginId(entity, originFilter) {
+  if (originFilter == null) return true;
+  return String(entity?.originId || 'default') === String(originFilter);
+}
+
+function runnerHostTag() {
+  return process.env.API_CONSOLE_RUNNER_HOST || os.hostname();
+}
+
+function reloadStoreFromDisk() {
+  if (!fs.existsSync(STORE_FILE)) return;
+  try {
+    store = normalizeStoreShape(JSON.parse(fs.readFileSync(STORE_FILE, 'utf8')));
+  } catch {}
+}
+
+function zoneWorkerHeartbeatFresh(maxAgeMs = 45000) {
+  const heartbeat = store.zoneWorkerHeartbeat;
+  if (!heartbeat) return false;
+  const age = Date.now() - new Date(heartbeat).getTime();
+  return Number.isFinite(age) && age >= 0 && age <= maxAgeMs;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function paginate(data, page = 1, limit = 30) {
@@ -2240,16 +2766,15 @@ function paginate(data, page = 1, limit = 30) {
 
 function resolveSecretReference(ref, errors) {
   if (runtimeSecrets.has(ref)) return runtimeSecrets.get(ref);
-  const vault = loadSecretVault();
-  if (vault.secrets[ref]) {
-    try {
-      const value = decryptSecretValue(vault.secrets[ref]);
+  try {
+    const value = getVaultProvider().resolve(ref);
+    if (value != null && value !== '') {
       runtimeSecrets.set(ref, value);
       return value;
-    } catch (error) {
-      errors.push({ category: 'SECRET_RESOLUTION_ERROR', message: `Secret reference "${ref}" could not be decrypted by the API Console backend.` });
-      return ref;
     }
+  } catch (error) {
+    errors.push({ category: 'SECRET_RESOLUTION_ERROR', message: `Secret reference "${ref}" could not be decrypted by the API Console backend.` });
+    return ref;
   }
   errors.push({ category: 'SECRET_RESOLUTION_ERROR', message: `Secret reference "${ref}" could not be resolved by the API Console backend.` });
   return ref;
@@ -2482,19 +3007,32 @@ function isHardBlockedIPv6(host) {
     lower.startsWith('0:0:0:0:0:ffff:');
 }
 
+function parsePrivateDestinationOrigin(candidate) {
+  const text = String(candidate || '').trim();
+  if (!text) return null;
+  try {
+    const parsed = new URL(text);
+    const isOriginOnly = (parsed.pathname === '/' || parsed.pathname === '') && !parsed.search && !parsed.hash;
+    if (['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password && isOriginOnly) {
+      return parsed.origin.toLowerCase();
+    }
+  } catch {
+    // Invalid entries never grant network access.
+  }
+  return null;
+}
+
 function configuredPrivateDestinationOrigins() {
   const origins = new Set();
   for (const value of String(process.env.API_CONSOLE_PRIVATE_DESTINATION_ALLOWLIST || '').split(',')) {
-    const candidate = value.trim();
-    if (!candidate) continue;
-    try {
-      const parsed = new URL(candidate);
-      const isOriginOnly = (parsed.pathname === '/' || parsed.pathname === '') && !parsed.search && !parsed.hash;
-      if (['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password && isOriginOnly) {
-        origins.add(parsed.origin.toLowerCase());
-      }
-    } catch {
-      // Invalid entries never grant network access.
+    const origin = parsePrivateDestinationOrigin(value);
+    if (origin) origins.add(origin);
+  }
+  const orgList = store?.orgPolicies?.privateDestinationAllowlist;
+  if (Array.isArray(orgList)) {
+    for (const value of orgList) {
+      const origin = parsePrivateDestinationOrigin(value);
+      if (origin) origins.add(origin);
     }
   }
   return origins;
@@ -2843,6 +3381,16 @@ function evaluateAssertions(request, response) {
           message: passed ? `${pathValue} exists.` : `${pathValue} was not found.`,
         };
       }
+      case 'JSON_SCHEMA': {
+        const schema = assertion.configuration.schema || assertion.configuration.jsonSchema || assertion.configuration;
+        const validation = evaluateJsonSchemaAssertion(response.bodyPreview, schema);
+        return {
+          assertionId: assertion.id,
+          assertionType: assertion.assertionType,
+          result: validation.passed ? 'PASSED' : 'FAILED',
+          message: validation.message,
+        };
+      }
       default:
         return {
           assertionId: assertion.id,
@@ -2852,6 +3400,46 @@ function evaluateAssertions(request, response) {
         };
     }
   });
+}
+
+function evaluateJsonSchemaAssertion(body, schemaInput) {
+  const parsed = parseJsonSafely(body);
+  if (!parsed.ok) {
+    return { passed: false, message: 'Response body is not valid JSON for schema assertion.' };
+  }
+  let schema = schemaInput;
+  if (typeof schema === 'string') {
+    const schemaParsed = parseJsonSafely(schema);
+    if (!schemaParsed.ok) return { passed: false, message: 'Configured JSON Schema is invalid.' };
+    schema = schemaParsed.value;
+  }
+  if (!schema || typeof schema !== 'object') {
+    return { passed: false, message: 'JSON Schema configuration is missing.' };
+  }
+  if (schema.type === 'object' && (parsed.value === null || typeof parsed.value !== 'object' || Array.isArray(parsed.value))) {
+    return { passed: false, message: 'Expected JSON object response.' };
+  }
+  if (schema.type === 'array' && !Array.isArray(parsed.value)) {
+    return { passed: false, message: 'Expected JSON array response.' };
+  }
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  for (const key of required) {
+    if (!parsed.value || typeof parsed.value !== 'object' || !Object.prototype.hasOwnProperty.call(parsed.value, key)) {
+      return { passed: false, message: `Required schema property "${key}" is missing.` };
+    }
+  }
+  const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+  for (const [key, propSchema] of Object.entries(properties)) {
+    if (!parsed.value || !Object.prototype.hasOwnProperty.call(parsed.value, key)) continue;
+    const expectedType = propSchema && typeof propSchema === 'object' ? propSchema.type : undefined;
+    if (!expectedType) continue;
+    const actual = parsed.value[key];
+    const actualType = Array.isArray(actual) ? 'array' : actual === null ? 'null' : typeof actual;
+    if (expectedType !== actualType) {
+      return { passed: false, message: `Property "${key}" expected type ${expectedType}, got ${actualType}.` };
+    }
+  }
+  return { passed: true, message: 'JSON Schema assertion passed.' };
 }
 
 function simpleJsonPathExists(body, pathValue) {
@@ -3014,6 +3602,23 @@ function runPreRequestScript(request, scripts, executionVariables = {}) {
         const [pathValue, value] = command.args;
         setJsonBodyPath(request, pathValue, value);
         results.push(scriptResult('PRE_REQUEST', item.line, command.name, 'PASSED', `JSON body path "${pathValue}" updated.`));
+      } else if (command.name === 'setCookie') {
+        const [name, value] = command.args;
+        if (!name) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'setCookie requires name and value.');
+        const cookies = Array.isArray(request.cookies) ? request.cookies : [];
+        const index = cookies.findIndex(cookie => String(cookie.name || '').toLowerCase() === String(name).toLowerCase());
+        const nextCookie = {
+          id: index >= 0 ? cookies[index].id : makeId('cookie'),
+          name: String(name),
+          valueReference: String(value ?? ''),
+          enabled: true,
+          sensitive: false,
+          source: 'USER',
+        };
+        if (index >= 0) cookies[index] = { ...cookies[index], ...nextCookie };
+        else cookies.push(nextCookie);
+        request.cookies = cookies;
+        results.push(scriptResult('PRE_REQUEST', item.line, command.name, 'PASSED', `Cookie "${name}" updated.`));
       } else {
         throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Unsupported pre-request command "${command.name}".`);
       }
@@ -3061,6 +3666,24 @@ function runPostResponseScript(scripts, response) {
         const [pathValue] = command.args;
         passed = simpleJsonPathExists(response.bodyPreview, String(pathValue || ''));
         message = passed ? `${pathValue} exists.` : `${pathValue} was not found.`;
+      } else if (command.name === 'testJsonEquals') {
+        const [pathValue, expected] = command.args;
+        const parsed = parseJsonSafely(response.bodyPreview);
+        let actual;
+        if (parsed.ok && pathValue) {
+          const parts = String(pathValue).replace(/^\$\./, '').split('.').filter(Boolean);
+          actual = parsed.value;
+          for (const part of parts) {
+            if (actual && typeof actual === 'object' && Object.prototype.hasOwnProperty.call(actual, part)) actual = actual[part];
+            else { actual = undefined; break; }
+          }
+        }
+        passed = String(actual) === String(expected);
+        message = passed ? `${pathValue} equals expected value.` : `${pathValue} expected "${expected}", got "${actual}".`;
+      } else if (command.name === 'testStatusIn') {
+        const expected = command.args.map(Number).filter(value => !Number.isNaN(value));
+        passed = expected.length ? expected.includes(Number(response.statusCode)) : true;
+        message = passed ? `HTTP status ${response.statusCode} matched.` : `Expected status in [${expected.join(', ')}], got ${response.statusCode || 'none'}.`;
       } else if (command.name === 'testBodyContains') {
         const [expected] = command.args;
         passed = String(response.bodyPreview || '').includes(String(expected || ''));
@@ -3111,22 +3734,58 @@ function createBlockedExecution(request, snapshot, environment, userId, category
   };
 }
 
+function dualApprovalRequired() {
+  const orgEnabled = store?.orgPolicies?.dualApprovalProductionCommand === true;
+  const envEnabled = String(process.env.API_CONSOLE_DUAL_APPROVAL || '').toLowerCase() === 'true';
+  return orgEnabled || envEnabled;
+}
+
+function findActiveDualApproval(requestId, userId) {
+  const now = Date.now();
+  return (store.dualApprovals || []).find(grant =>
+    grant.requestId === requestId &&
+    grant.userId === userId &&
+    grant.status === 'ACTIVE' &&
+    (!grant.expiresAt || new Date(grant.expiresAt).getTime() > now)
+  );
+}
+
 function validateProductionPolicy(request, environment, context, options) {
   const isProduction = PRODUCTION_KINDS.has(environment.kind);
   if (!isProduction) return { allowed: true };
-  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteProduction)) {
-    return { allowed: false, category: 'AUTHENTICATION_ERROR', message: 'Production execution requires elevated permission.' };
+  const orgPolicies = store.orgPolicies || defaultOrgPolicies();
+  const hasJit = Array.isArray(store.jitAccessGrants) && store.jitAccessGrants.some(grant =>
+    grant.userId === context.userId &&
+    grant.applicationId === (request.applicationId || context.applicationId) &&
+    grant.status === 'ACTIVE' &&
+    grant.expiresAt &&
+    new Date(grant.expiresAt).getTime() > Date.now()
+  );
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteProduction) && !hasJit) {
+    return { allowed: false, category: 'AUTHENTICATION_ERROR', message: 'Production execution requires elevated permission یا JIT access فعال.' };
   }
   if (request.classification.type === 'CORE_COMMAND') {
-    if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteProductionCommand)) {
-      return { allowed: false, category: 'AUTHENTICATION_ERROR', message: 'Production Core Command execution requires elevated permission.' };
+    if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteProductionCommand) && !hasJit) {
+      return { allowed: false, category: 'AUTHENTICATION_ERROR', message: 'Production Core Command execution requires elevated permission یا JIT access فعال.' };
     }
     if (!options?.productionCommandConfirmed || !options.businessJustification?.trim()) {
       return { allowed: false, category: 'CORE_VALIDATION_ERROR', message: 'Production Core Command requires confirmation and business justification.' };
     }
+    if (dualApprovalRequired() && !findActiveDualApproval(request.id, context.userId)) {
+      return {
+        allowed: false,
+        category: 'CORE_VALIDATION_ERROR',
+        message: 'Production Core Command requires an approved dual-approval grant for this request and user.',
+      };
+    }
   }
-  if (!request.tls.verifyCertificate) {
+  const forbidInsecureTls = orgPolicies.forbidInsecureTlsInProduction !== false;
+  if (forbidInsecureTls && !request.tls.verifyCertificate) {
     return { allowed: false, category: 'TLS_ERROR', message: 'Insecure TLS is prohibited in production environments.' };
+  }
+  const executionMode = options?.executionMode || request.executionMode;
+  if (orgPolicies.forbidExactModeInProduction !== false && executionMode === 'EXACT') {
+    return { allowed: false, category: 'CORE_VALIDATION_ERROR', message: 'EXACT execution mode is prohibited in production environments.' };
   }
   return { allowed: true };
 }
@@ -3335,6 +3994,31 @@ function postmanItemFromRequest(request) {
   };
 }
 
+function nestPostmanItemsByFolder(requests) {
+  const root = [];
+  const folderNodes = new Map();
+
+  function ensureFolder(pathParts) {
+    if (!pathParts.length) return root;
+    const key = pathParts.join('\u0000');
+    if (folderNodes.has(key)) return folderNodes.get(key).item;
+    const node = { name: pathParts[pathParts.length - 1], item: [] };
+    folderNodes.set(key, node);
+    const parentItems = ensureFolder(pathParts.slice(0, -1));
+    parentItems.push(node);
+    return node.item;
+  }
+
+  requests.forEach(request => {
+    const pathParts = Array.isArray(request.folderPath)
+      ? request.folderPath.map(part => String(part || '').trim()).filter(Boolean)
+      : [];
+    const bucket = ensureFolder(pathParts);
+    bucket.push(postmanItemFromRequest(request));
+  });
+  return root;
+}
+
 function postmanIdFromCollection(collection) {
   const match = String(collection.id || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
   return match ? match[0] : randomUUID();
@@ -3357,7 +4041,7 @@ function buildPostmanCollectionExport(collection, requests) {
         _exporter_id: 'UTMS-Online-API-Console',
         _collection_link: `utms://api-console/collections/${collection.id}`,
       },
-      item: requests.map(postmanItemFromRequest),
+      item: nestPostmanItemsByFolder(requests),
     },
   };
 }
@@ -4010,11 +4694,12 @@ function buildDocxDocumentXml(templateXml, request, markdownResult, executions, 
   return `${start}${content}${sectPr}</w:body></w:document>`;
 }
 
-function buildDocxFromTemplate(request, markdownResult, executions, manualExamples) {
-  if (!fs.existsSync(DOCX_TEMPLATE_FILE)) {
-    throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', `DOCX template not found: ${DOCX_TEMPLATE_FILE}`);
+function buildDocxFromTemplate(request, markdownResult, executions, manualExamples, templateFile = DOCX_TEMPLATE_FILE) {
+  const templatePath = templateFile || DOCX_TEMPLATE_FILE;
+  if (!fs.existsSync(templatePath)) {
+    throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', `DOCX template not found: ${templatePath}`);
   }
-  const templateBuffer = fs.readFileSync(DOCX_TEMPLATE_FILE);
+  const templateBuffer = fs.readFileSync(templatePath);
   const entries = readZipEntries(templateBuffer);
   const documentEntry = entries.find(entry => entry.name === 'word/document.xml');
   if (!documentEntry) throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', 'DOCX template does not contain word/document.xml.');
@@ -4093,9 +4778,122 @@ async function executeRequest(requestId, context, options = {}) {
   }
 
   const startedAt = nowIso();
+  const preferredRunnerId = options.runnerId || request.runnerId;
+  let runner;
+  try {
+    runner = selectRunner(environment, null, preferredRunnerId, resolved.snapshot?.url || resolved.transport?.url);
+  } catch (error) {
+    const execution = createBlockedExecution(
+      request,
+      resolved.snapshot,
+      environment,
+      context.userId,
+      error.category || 'DESTINATION_NOT_ALLOWED',
+      error.message || 'Runner zone unavailable.',
+      options.businessJustification,
+      preScript.results
+    );
+    execution.runnerHost = runnerHostTag();
+    store.executions.unshift(execution);
+    audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: execution.errorCategory });
+    saveStore(store);
+    return safeClone(execution);
+  }
+
+  if (String(process.env.API_CONSOLE_ZONE_WORKER || '').toLowerCase() === 'true') {
+    if (!zoneWorkerHeartbeatFresh()) {
+      const execution = createBlockedExecution(
+        request,
+        resolved.snapshot,
+        environment,
+        context.userId,
+        'ZONE_WORKER_UNAVAILABLE',
+        'Zone worker is not running. Start with: npm run zone-worker -w @api-console/api',
+        options.businessJustification,
+        preScript.results
+      );
+      execution.runnerId = runner.id;
+      execution.networkZone = runner.networkZone;
+      execution.runnerHost = runnerHostTag();
+      store.executions.unshift(execution);
+      audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: 'ZONE_WORKER_UNAVAILABLE' });
+      saveStore(store);
+      return safeClone(execution);
+    }
+    const queueJobId = makeId('zq');
+    const job = {
+      id: queueJobId,
+      status: 'PENDING',
+      requestId: request.id,
+      collectionId: request.collectionId,
+      environmentId: environment.id,
+      environmentName: environment.name,
+      runnerId: runner.id,
+      networkZone: runner.networkZone,
+      runnerHost: runnerHostTag(),
+      executedBy: context.userId,
+      startedAt,
+      businessJustification: options.businessJustification,
+      requestSnapshot: resolved.snapshot,
+      transport: resolved.transport,
+      assertions: request.assertions || [],
+      scripts: executionRequest.scripts,
+      preScriptResults: preScript.results,
+      createdAt: nowIso(),
+    };
+    if (!Array.isArray(store.executionQueue)) store.executionQueue = [];
+    store.executionQueue.push(job);
+    saveStore(store);
+    const deadline = Date.now() + Number(process.env.API_CONSOLE_ZONE_WORKER_WAIT_MS || 15000);
+    while (Date.now() < deadline) {
+      await sleep(250);
+      reloadStoreFromDisk();
+      const done = (store.executions || []).find(item => item.queueJobId === queueJobId);
+      if (done) return safeClone(done);
+      const current = (store.executionQueue || []).find(item => item.id === queueJobId);
+      if (current?.status === 'FAILED') {
+        const failed = createBlockedExecution(
+          request,
+          resolved.snapshot,
+          environment,
+          context.userId,
+          current.errorCategory || 'INTERNAL_EXECUTION_ERROR',
+          current.errorMessage || 'Zone worker failed to execute request.',
+          options.businessJustification,
+          preScript.results
+        );
+        failed.queueJobId = queueJobId;
+        failed.runnerId = runner.id;
+        failed.networkZone = runner.networkZone;
+        failed.runnerHost = runnerHostTag();
+        store.executions.unshift(failed);
+        store.executionQueue = (store.executionQueue || []).filter(item => item.id !== queueJobId);
+        saveStore(store);
+        return safeClone(failed);
+      }
+    }
+    const timedOut = createBlockedExecution(
+      request,
+      resolved.snapshot,
+      environment,
+      context.userId,
+      'ZONE_WORKER_TIMEOUT',
+      'Zone worker did not complete the queued execution in time.',
+      options.businessJustification,
+      preScript.results
+    );
+    timedOut.queueJobId = queueJobId;
+    timedOut.runnerId = runner.id;
+    timedOut.networkZone = runner.networkZone;
+    timedOut.runnerHost = runnerHostTag();
+    store.executions.unshift(timedOut);
+    saveStore(store);
+    return safeClone(timedOut);
+  }
+
   try {
     const response = await executeWithRedirects(resolved.transport);
-    const runner = selectRunner(environment, response.resolvedIpAddress);
+    runner = selectRunner(environment, response.resolvedIpAddress, preferredRunnerId, resolved.snapshot?.url || resolved.transport?.url);
     const assertionResults = evaluateAssertions(request, response);
     const postScriptResults = runPostResponseScript(executionRequest.scripts, response);
     const scriptAssertionResults = postScriptResults.map(result => ({
@@ -4112,6 +4910,8 @@ async function executeRequest(requestId, context, options = {}) {
       collectionId: request.collectionId,
       environmentId: environment.id,
       runnerId: runner.id,
+      networkZone: runner.networkZone,
+      runnerHost: runnerHostTag(),
       executedBy: context.userId,
       startedAt,
       completedAt: nowIso(),
@@ -4140,11 +4940,16 @@ async function executeRequest(requestId, context, options = {}) {
       correlationId: execution.correlationId,
       referenceId: request.referenceId,
     });
-    audit('API_REQUEST_EXECUTED', context, { requestId, statusCode: execution.statusCode, runnerId: runner.id });
+    audit('API_REQUEST_EXECUTED', context, { requestId, statusCode: execution.statusCode, runnerId: runner.id, runnerHost: execution.runnerHost });
     saveStore(store);
     return safeClone(execution);
   } catch (error) {
     const execution = createExecutionFromError(request, resolved, environment, context, error, options.businessJustification, preScript.results);
+    execution.runnerHost = runnerHostTag();
+    if (runner) {
+      execution.runnerId = runner.id;
+      execution.networkZone = runner.networkZone;
+    }
     store.executions.unshift(execution);
     audit('API_REQUEST_EXECUTION_FAILED', context, { requestId, category: execution.errorCategory });
     saveStore(store);
@@ -4155,7 +4960,7 @@ async function executeRequest(requestId, context, options = {}) {
 function contextFromRequest(req, body) {
   if (req.utmsContext) return req.utmsContext;
   if (req.consoleContext) return req.consoleContext;
-  if (!LEGACY_CONTEXT_ENABLED) return null;
+  if (!isLegacyContextEnabled()) return null;
   if (body?.context) return body.context;
   const encoded = req.headers['x-api-console-context'] || req.headers['x-utms-context'];
   if (!encoded) return null;
@@ -4268,9 +5073,9 @@ function assertRuntimeProjectAccess(projectKey, context) {
   return key;
 }
 
-function latestDiscovery(projectKey) {
+function latestDiscovery(projectKey, originFilter) {
   return store.discoverySnapshots
-    .filter(snapshot => snapshot.projectKey === projectKey)
+    .filter(snapshot => snapshot.projectKey === projectKey && matchesOriginId(snapshot, originFilter === undefined ? null : originFilter))
     .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)))[0] || null;
 }
 
@@ -4355,6 +5160,7 @@ function normalizeRuntimeProfileInput(data, context, current = null) {
     name: String(data.name ?? current?.name ?? `${applicationId} ${runtimeKindLabel(kind)}`).trim(),
     kind,
     origin: normalized.origin,
+    originId: data.originId || current?.originId || resolveOriginId(context),
     coreBasePath: normalized.coreBasePath,
     loginPath: normalized.loginPath,
     appRefererPath: normalized.appRefererPath,
@@ -4414,6 +5220,125 @@ function findRuntimeProfile(profileId, context, options = {}) {
   return profile;
 }
 
+function assertCanPromoteRuntimeProfile(context) {
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canManageProtectedEnvironments)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Protected environments require System Admin, Tech Lead or QA Lead.', 403);
+  }
+}
+
+function promoteRuntimeProfile(profileId, targetKindInput, context) {
+  assertCanPromoteRuntimeProfile(context);
+  const targetKind = String(targetKindInput || '').trim().toUpperCase();
+  if (!RUNTIME_KINDS.has(targetKind)) {
+    throw new ApiConsoleError('RUNTIME_PROFILE_INVALID', 'Runtime environment kind is invalid.', 422);
+  }
+  const source = findRuntimeProfile(profileId, context);
+  if (source.kind === targetKind) {
+    throw new ApiConsoleError('RUNTIME_PROFILE_INVALID', 'Target kind must differ from the source Runtime Profile kind.', 422);
+  }
+
+  const hadSecret = Boolean(
+    source.dataService?.authSecretRef
+    || source.dataService?.clientSecret
+    || source.dataService?.password
+    || source.dataService?.authSecret
+  );
+  const dataServiceInput = {
+    baseUrl: source.dataService?.baseUrl || '',
+    authMode: source.dataService?.authMode || 'NONE',
+    username: source.dataService?.username || '',
+    tokenPath: source.dataService?.tokenPath || '/auth/getToken',
+  };
+
+  const existingTarget = store.runtimeProfiles.find(item =>
+    item.id !== source.id
+    && item.applicationId === source.applicationId
+    && item.kind === targetKind
+    && item.origin === source.origin
+    && item.enabled !== false
+  );
+
+  const payload = {
+    applicationId: source.applicationId,
+    name: String(source.name || `${source.applicationId} ${runtimeKindLabel(source.kind)}`)
+      .replace(new RegExp(`\\b${runtimeKindLabel(source.kind)}\\b`, 'i'), runtimeKindLabel(targetKind))
+      .trim() || `${source.applicationId} ${runtimeKindLabel(targetKind)}`,
+    kind: targetKind,
+    origin: source.origin,
+    coreBasePath: source.coreBasePath,
+    loginPath: source.loginPath,
+    appRefererPath: source.appRefererPath,
+    runtimeServiceId: source.runtimeServiceId,
+    projectServiceId: source.projectServiceId,
+    serviceIdEvidence: safeClone(source.serviceIdEvidence || []),
+    userSource: source.userSource,
+    prostage: targetKind === 'DEVELOPMENT' ? (source.prostage || 'develop') : (source.prostage || undefined),
+    dataService: dataServiceInput,
+    enabled: true,
+  };
+
+  // Never carry secrets into the promoted profile; force re-entry when a secret existed.
+  const sanitizedCurrent = existingTarget
+    ? {
+      ...existingTarget,
+      dataService: existingTarget.dataService
+        ? {
+          ...existingTarget.dataService,
+          authSecretRef: undefined,
+          authSecret: undefined,
+          clientSecret: undefined,
+          password: undefined,
+        }
+        : undefined,
+    }
+    : null;
+
+  const promoted = normalizeRuntimeProfileInput(payload, context, sanitizedCurrent);
+  if (promoted.dataService) {
+    promoted.dataService.authSecretRef = undefined;
+    delete promoted.dataService.authSecret;
+    delete promoted.dataService.clientSecret;
+    delete promoted.dataService.password;
+    if (hadSecret) {
+      promoted.dataService.executionEnabled = false;
+    } else {
+      promoted.dataService.executionEnabled = Boolean(
+        promoted.dataService.baseUrl
+        && (promoted.dataService.authMode === 'NONE' || promoted.dataService.authSecretRef)
+        && (promoted.dataService.authMode !== 'TOKEN_ENDPOINT' || String(promoted.dataService.username || '').trim())
+      );
+    }
+  }
+
+  const duplicate = store.runtimeProfiles.some(item =>
+    item.id !== promoted.id
+    && item.applicationId === promoted.applicationId
+    && item.origin === promoted.origin
+    && item.kind === promoted.kind
+    && item.enabled !== false
+  );
+  if (duplicate) {
+    throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project, origin, and kind already exists.', 409);
+  }
+
+  if (existingTarget) {
+    store.runtimeProfiles[store.runtimeProfiles.indexOf(existingTarget)] = promoted;
+  } else {
+    store.runtimeProfiles.unshift(promoted);
+  }
+
+  audit('RUNTIME_PROFILE_PROMOTED', context, {
+    profileId: promoted.id,
+    sourceProfileId: source.id,
+    applicationId: promoted.applicationId,
+    sourceKind: source.kind,
+    targetKind: promoted.kind,
+    origin: promoted.origin,
+  });
+  saveStore(store);
+  return runtimeProfileView(promoted);
+}
+
 function runtimeSessionIdentity(req, context) {
   const appSession = requireSession(req);
   const phone = normalizeCdeLoginName(context.user?.phoneNumber || appSession.userLoginName);
@@ -4447,6 +5372,13 @@ function discoveryPreview(current, previous) {
   };
 }
 
+function discoverySourceFingerprint(operations) {
+  const fingerprints = (Array.isArray(operations) ? operations : [])
+    .map(item => String(item?.sourceFingerprint || ''))
+    .sort();
+  return createHash('sha256').update(JSON.stringify(fingerprints)).digest('hex');
+}
+
 async function scanRuntimeDiscovery(req, projectKey, context) {
   assertCsrf(req);
   assertRuntimeProjectAccess(projectKey, context);
@@ -4458,6 +5390,7 @@ async function scanRuntimeDiscovery(req, projectKey, context) {
     id: makeId('discovery'),
     projectKey,
     applicationId: projectKey,
+    originId: resolveOriginId(context),
     status: discovered.serviceIdStatus === 'RESOLVED' ? 'READY' : 'BLOCKED_SERVICE_ID',
     parserVersion: discovered.parserVersion,
     serviceIdStatus: discovered.serviceIdStatus,
@@ -4468,7 +5401,7 @@ async function scanRuntimeDiscovery(req, projectKey, context) {
     stats: { ...discovered.stats, ...preview.counts },
     scannedBy: context.userId,
     createdAt: nowIso(),
-    sourceFingerprint: createHash('sha256').update(JSON.stringify(discovered.operations.map(item => item.sourceFingerprint).sort())).digest('hex'),
+    sourceFingerprint: discoverySourceFingerprint(discovered.operations),
   };
   store.discoverySnapshots.unshift(snapshot);
   const keepIds = new Set(store.discoverySnapshots.filter(item => item.projectKey === projectKey).slice(0, 20).map(item => item.id));
@@ -4676,6 +5609,14 @@ function syncDiscoverySnapshot(snapshot, body, context) {
     request.sourceSync = { ...(request.sourceSync || {}), status: 'STALE', staleAt: nowIso(), syncedBy: context.userId };
     request.updatedAt = nowIso();
     result.stale.push(request.id);
+    notifyUser(
+      request.createdBy || request.ownerId,
+      'منبع Discovery حذف شد',
+      `${request.name} به‌خاطر حذف منبع در CDE به وضعیت STALE رفت.`,
+      'API_REQUEST',
+      request.id,
+      makeId('api-corr')
+    );
   });
   audit('CDE_API_DISCOVERY_SYNCED', context, { snapshotId: snapshot.id, collectionId, profileId: profile.id, counts: Object.fromEntries(Object.entries(result).map(([key, value]) => [key, value.length])) });
   saveStore(store);
@@ -4780,6 +5721,16 @@ async function executeRuntimeDiscoveredOperation(req, operationId, body, context
   let response;
   if (operation.sourceKind === 'DATA_SERVICE') {
     response = await executeDataServiceOperation(profile, operation, body.input);
+    try {
+      const parsedBody = JSON.parse(String(response.bodyPreview || '').replace(/^\uFEFF/, ''));
+      response = {
+        ...response,
+        bodyPreview: prettyJsonPreview(parsedBody),
+        safePreviewMode: 'JSON',
+      };
+    } catch {
+      // Keep original text preview when the body is not JSON.
+    }
   } else {
     const { appSession, phone } = runtimeSessionIdentity(req, context);
     const state = await getRuntimeSession(appSession.id, profile.id);
@@ -4787,18 +5738,24 @@ async function executeRuntimeDiscoveredOperation(req, operationId, body, context
       throw new ApiConsoleError('RUNTIME_SESSION_REQUIRED', 'Connect this Runtime Profile with the same CDE cellphone before execution.', 401);
     }
     const call = await executeCoreOperation(state, profile, operation, body.input || {});
-    if (call.response?.Result?.IsUserLogin === false) {
-      await deleteRuntimeSession(appSession.id, profile.id);
-      throw new ApiConsoleError('RUNTIME_SESSION_EXPIRED', 'Runtime session expired. Connect again.', 401);
+    let runtimeState = call.state;
+    // Business ds/fr payloads often omit IsUserLogin or leave it false even while the
+    // cookie session is still valid. Only drop the Runtime session after who-am-i confirms logout.
+    if (call.response?.Result && typeof call.response.Result === 'object' && !Array.isArray(call.response.Result) && call.response.Result.IsUserLogin === false) {
+      const probe = await ensureRuntimeSessionStillConnected(appSession.id, profile, runtimeState);
+      if (!probe.connected) {
+        throw new ApiConsoleError('RUNTIME_SESSION_EXPIRED', 'Runtime session expired. Connect again.', 401);
+      }
+      runtimeState = probe.state;
     }
-    await setRuntimeSession(appSession.id, profile.id, call.state);
-    const serialized = JSON.stringify(call.response);
+    await setRuntimeSession(appSession.id, profile.id, runtimeState);
+    const serialized = prettyJsonPreview(call.response);
     response = {
       statusCode: 200,
       statusText: 'OK',
       headers: [{ name: 'content-type', value: 'application/json; charset=utf-8' }],
       cookies: [],
-      bodyPreview: sanitizeText(serialized),
+      bodyPreview: serialized,
       contentType: 'application/json; charset=utf-8',
       responseSize: Buffer.byteLength(serialized),
       durationMs: Date.now() - new Date(startedAt).getTime(),
@@ -5097,6 +6054,13 @@ function upsertRequestWithPatch(existing, data, context) {
     updatedBy: context.userId,
     updatedAt: nowIso(),
   };
+  if (Object.prototype.hasOwnProperty.call(data, 'folderPath')) {
+    merged.folderPath = Array.isArray(data.folderPath)
+      ? data.folderPath.map(part => String(part || '').trim()).filter(Boolean)
+      : [];
+  } else if (!Array.isArray(merged.folderPath)) {
+    merged.folderPath = [];
+  }
   merged.documentation = refreshDocumentationMetadata(merged);
   return protectRequestSecrets(merged);
 }
@@ -5131,7 +6095,7 @@ function consumerCandidates(context) {
 }
 
 function filterUsageEvents(context, parsedUrl) {
-  if (!roleAllowed(context.role, ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'])) {
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canViewUsageReports)) {
     throw new ApiConsoleError('AUTHENTICATION_ERROR', 'API usage report requires System Admin, Tech Lead or QA Lead role.', 403);
   }
   const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
@@ -5172,11 +6136,86 @@ function filterUsageEvents(context, parsedUrl) {
   };
 }
 
+function filterAuditEvents(context, parsedUrl) {
+  assertSystemAdministrator(context);
+  const filters = {
+    page: Number(parsedUrl.searchParams.get('page') || 1),
+    limit: Number(parsedUrl.searchParams.get('limit') || 30),
+    userId: parsedUrl.searchParams.get('userId') || '',
+    action: parsedUrl.searchParams.get('action') || parsedUrl.searchParams.get('eventType') || '',
+    applicationId: parsedUrl.searchParams.get('applicationId') || '',
+    correlationId: parsedUrl.searchParams.get('correlationId') || '',
+    dateFrom: parsedUrl.searchParams.get('dateFrom') || '',
+    dateTo: parsedUrl.searchParams.get('dateTo') || '',
+  };
+  let rows = Array.isArray(store.auditLog) ? [...store.auditLog] : [];
+  if (filters.userId) rows = rows.filter(item => item.actorUserId === filters.userId);
+  if (filters.action) {
+    const action = filters.action.toLowerCase();
+    rows = rows.filter(item => String(item.eventType || '').toLowerCase().includes(action));
+  }
+  if (filters.correlationId) {
+    rows = rows.filter(item => String(item.details?.correlationId || '') === filters.correlationId);
+  }
+  if (filters.applicationId && filters.applicationId !== 'ALL') {
+    rows = rows.filter(item => {
+      const appId = item.details?.applicationId || item.details?.scopeApplicationId;
+      return !appId || matchesApplicationScope(appId, filters.applicationId);
+    });
+  }
+  if (filters.dateFrom) rows = rows.filter(item => new Date(item.createdAt) >= new Date(filters.dateFrom));
+  if (filters.dateTo) rows = rows.filter(item => new Date(item.createdAt) <= new Date(`${filters.dateTo}T23:59:59`));
+  rows = rows.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return paginate(rows, filters.page, filters.limit);
+}
+
+function listNotificationsForUser(context, parsedUrl) {
+  const filters = {
+    page: Number(parsedUrl.searchParams.get('page') || 1),
+    limit: Number(parsedUrl.searchParams.get('limit') || 20),
+    unreadOnly: parsedUrl.searchParams.get('unreadOnly') === 'true',
+  };
+  let rows = store.notifications.filter(item => item.userId === context.userId);
+  if (filters.unreadOnly) rows = rows.filter(item => item.isRead !== true);
+  rows = rows.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const unreadCount = store.notifications.filter(item => item.userId === context.userId && item.isRead !== true).length;
+  return {
+    unreadCount,
+    ...paginate(rows, filters.page, filters.limit),
+  };
+}
+
+function markNotificationRead(notificationId, context) {
+  const item = store.notifications.find(row => row.id === notificationId && row.userId === context.userId);
+  if (!item) throw new ApiConsoleError('INVALID_URL', 'Notification not found.', 404);
+  item.isRead = true;
+  item.readAt = nowIso();
+  saveStore(store);
+  return item;
+}
+
+function markAllNotificationsRead(context) {
+  const now = nowIso();
+  let changed = 0;
+  store.notifications.forEach(item => {
+    if (item.userId === context.userId && item.isRead !== true) {
+      item.isRead = true;
+      item.readAt = now;
+      changed += 1;
+    }
+  });
+  if (changed) saveStore(store);
+  return { updated: changed };
+}
+
 async function routeRequest(req, parsedUrl, body) {
   const parts = getPathParts(parsedUrl.pathname);
   const [first, second, third, fourth, fifth] = parts;
 
   if (!parts.length || first === 'health') {
+    if (second === 'config' && req.method === 'GET') {
+      return inspectProductionSecrets();
+    }
     return { ok: true, service: 'api-console', parserVersion: PARSER_VERSION, now: nowIso() };
   }
 
@@ -5196,13 +6235,20 @@ async function routeRequest(req, parsedUrl, body) {
 
   if (first === 'policy' && req.method === 'GET') return API_CONSOLE_POLICY;
 
+  const phase2Result = await tryHandlePhase2(req, parsedUrl, body, parts);
+  if (phase2Result !== undefined) return phase2Result;
+
+  const phase3Result = await tryHandlePhase3(req, parsedUrl, body, parts);
+  if (phase3Result !== undefined) return phase3Result;
+
   if (first === 'runtime-profiles' && !second && req.method === 'GET') {
     const context = requireContext(req, body);
     const applicationId = String(parsedUrl.searchParams.get('applicationId') || context.applicationId || '');
     assertRuntimeProjectAccess(applicationId, context);
     ensureDefaultRuntimeProfiles(applicationId, context);
+    const originFilter = resolveListOriginFilter(context, parsedUrl);
     return safeClone(store.runtimeProfiles
-      .filter(profile => profile.applicationId === applicationId && profile.enabled !== false)
+      .filter(profile => profile.applicationId === applicationId && profile.enabled !== false && matchesOriginId(profile, originFilter))
       .map(runtimeProfileView)
       .sort((left, right) => left.name.localeCompare(right.name, 'fa')));
   }
@@ -5260,12 +6306,17 @@ async function routeRequest(req, parsedUrl, body) {
 
   if (first === 'admin' && second === 'runtime-profiles') {
     const context = requireContext(req, body);
+    if (third && fourth === 'promote' && req.method === 'POST') {
+      assertCsrf(req);
+      const targetKind = body.targetKind ?? body.data?.targetKind;
+      return safeClone(promoteRuntimeProfile(third, targetKind, context));
+    }
     assertSystemAdministrator(context);
     if (!third && req.method === 'POST') {
       assertCsrf(req);
       const profile = normalizeRuntimeProfileInput(body.data || body, context);
-      if (store.runtimeProfiles.some(item => item.applicationId === profile.applicationId && item.origin === profile.origin && item.enabled !== false)) {
-        throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project and origin already exists.', 409);
+      if (store.runtimeProfiles.some(item => item.applicationId === profile.applicationId && item.origin === profile.origin && item.kind === profile.kind && item.enabled !== false)) {
+        throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project, origin, and kind already exists.', 409);
       }
       store.runtimeProfiles.unshift(profile);
       audit('RUNTIME_PROFILE_CREATED', context, { profileId: profile.id, applicationId: profile.applicationId, origin: profile.origin });
@@ -5279,8 +6330,8 @@ async function routeRequest(req, parsedUrl, body) {
       assertCsrf(req);
       if (body.rowVersion && body.rowVersion !== profile.rowVersion) throw new ApiConsoleError('RUNTIME_PROFILE_CONFLICT', 'Runtime Profile changed in another session.', 409);
       const next = normalizeRuntimeProfileInput(body.data || body, context, profile);
-      if (store.runtimeProfiles.some(item => item.id !== next.id && item.applicationId === next.applicationId && item.origin === next.origin && item.enabled !== false)) {
-        throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project and origin already exists.', 409);
+      if (store.runtimeProfiles.some(item => item.id !== next.id && item.applicationId === next.applicationId && item.origin === next.origin && item.kind === next.kind && item.enabled !== false)) {
+        throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project, origin, and kind already exists.', 409);
       }
       store.runtimeProfiles[store.runtimeProfiles.indexOf(profile)] = next;
       audit('RUNTIME_PROFILE_UPDATED', context, { profileId: next.id, applicationId: next.applicationId, origin: next.origin });
@@ -5319,7 +6370,8 @@ async function routeRequest(req, parsedUrl, body) {
     assertRuntimeProjectAccess(projectKey, context);
     if (fourth === 'scan' && req.method === 'POST') return scanRuntimeDiscovery(req, projectKey, context);
     if (fourth === 'latest' && req.method === 'GET') {
-      const snapshot = latestDiscovery(projectKey);
+      const originFilter = resolveListOriginFilter(context, parsedUrl);
+      const snapshot = latestDiscovery(projectKey, originFilter);
       if (!snapshot) throw new ApiConsoleError('DISCOVERY_NOT_FOUND', 'No discovery snapshot exists for this project.', 404);
       return safeClone(snapshot);
     }
@@ -5367,14 +6419,79 @@ async function routeRequest(req, parsedUrl, body) {
     if (third && fourth === 'system-admin' && req.method === 'PUT') {
       return safeClone(setManagedSystemAdministrator(decodeURIComponent(third), body.enabled === true, context));
     }
+    if (third && fourth === 'roles' && req.method === 'PUT') {
+      return safeClone(setManagedDirectoryRole(
+        decodeURIComponent(third),
+        body.role,
+        body.enabled === true,
+        context,
+        {
+          applicationId: body.applicationId,
+          applicationIds: body.applicationIds,
+        }
+      ));
+    }
     throw new ApiConsoleError('INVALID_URL', 'User management endpoint not found.', 404);
+  }
+
+  if (first === 'admin' && second === 'sessions' && req.method === 'GET') {
+    const context = requireContext(req, body);
+    assertSystemAdministrator(context);
+    return { data: await listActiveSessions() };
+  }
+
+  if (first === 'admin' && second === 'audit' && req.method === 'GET') {
+    const context = requireContext(req, body);
+    return safeClone(filterAuditEvents(context, parsedUrl));
+  }
+
+  if (first === 'notifications') {
+    const context = requireContext(req, body);
+    if (!second && req.method === 'GET') {
+      return safeClone(listNotificationsForUser(context, parsedUrl));
+    }
+    if (second === 'read-all' && req.method === 'POST') {
+      assertCsrf(req);
+      return markAllNotificationsRead(context);
+    }
+    if (second && third === 'read' && req.method === 'POST') {
+      assertCsrf(req);
+      return safeClone(markNotificationRead(decodeURIComponent(second), context));
+    }
+    throw new ApiConsoleError('INVALID_URL', 'Notifications endpoint not found.', 404);
   }
 
   if (first === 'documentation' && second === 'authentication-profiles' && req.method === 'GET') {
     return safeClone(AUTHENTICATION_DOCUMENTATION_PROFILES);
   }
 
-  if (first === 'environments' && req.method === 'GET') return safeClone(store.environments);
+  if (first === 'environments') {
+    if (req.method === 'GET') {
+      const includeArchived = parsedUrl.searchParams.get('includeArchived') === 'true';
+      const rows = includeArchived ? store.environments : listActiveEnvironments();
+      return safeClone(rows);
+    }
+    const context = requireContext(req, body);
+    if (!second && req.method === 'POST') {
+      assertCsrf(req);
+      return safeClone(createEnvironment(body.data || body, context));
+    }
+    if (second && !third && req.method === 'PUT') {
+      assertCsrf(req);
+      return safeClone(updateEnvironment(decodeURIComponent(second), body.data || body, context));
+    }
+    if (second && third === 'clone' && req.method === 'POST') {
+      assertCsrf(req);
+      return safeClone(cloneEnvironment(decodeURIComponent(second), context));
+    }
+    if (second && !third && req.method === 'DELETE') {
+      assertCsrf(req);
+      return safeClone(archiveEnvironment(decodeURIComponent(second), context, {
+        force: body.force === true || parsedUrl.searchParams.get('force') === 'true',
+      }));
+    }
+    throw new ApiConsoleError('INVALID_URL', 'Environments endpoint not found.', 404);
+  }
   if (first === 'runners' && req.method === 'GET') return safeClone(store.runners);
 
   if (first === 'self-check' && req.method === 'GET') return runSelfCheck();
@@ -5396,7 +6513,7 @@ async function routeRequest(req, parsedUrl, body) {
 
   if (first === 'share-reviews') {
     const context = requireContext(req, body);
-    assertSystemAdministrator(context);
+    assertCanReviewShares(context);
     if (!second && req.method === 'GET') {
       const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
       const filters = {
@@ -5451,6 +6568,18 @@ async function routeRequest(req, parsedUrl, body) {
       if (!consumers.length) {
         throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'انتخاب حداقل یک مصرف‌کننده الزامی است.');
       }
+      const checklist = {
+        docsComplete: false,
+        noSecrets: false,
+        classificationOk: false,
+        consumersSpecified: true,
+        ...(share.checklist || {}),
+        ...(body.checklist || body.data?.checklist || {}),
+      };
+      share.checklist = checklist;
+      if (!REVIEW_CHECKLIST_KEYS.every(key => checklist[key] === true)) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'تأیید بدون تکمیل چک‌لیست Review ممکن نیست (docs/secret/classification/consumers).');
+      }
       const revision = share.revisions.find(item => item.revisionNumber === share.currentRevisionNumber) || share.revisions[share.revisions.length - 1];
       if (revision) {
         revision.status = 'APPROVED';
@@ -5485,6 +6614,32 @@ async function routeRequest(req, parsedUrl, body) {
       });
       audit('API_SHARE_APPROVED', context, { shareRequestId: share.id, apiId: share.apiId, version: share.version, consumers });
       saveStore(store);
+      void deliverItsmWebhook(
+        process.env.API_CONSOLE_ITSM_WEBHOOK_URL || '',
+        process.env.API_CONSOLE_ITSM_WEBHOOK_SECRET || '',
+        {
+          event: 'API_SHARE_APPROVED',
+          shareRequestId: share.id,
+          apiId: share.apiId,
+          version: share.version,
+          ticketId: share.ticketId,
+          ticketUrl: share.ticketUrl,
+          applicationId: share.applicationId,
+          reviewedBy: context.userId,
+          at: nowIso(),
+        }
+      ).then(delivery => {
+        if (!Array.isArray(store.itsmWebhookQueue)) store.itsmWebhookQueue = [];
+        store.itsmWebhookQueue.unshift({
+          id: makeId('itsm'),
+          eventType: 'API_SHARE_APPROVED',
+          status: delivery.ok ? 'DELIVERED' : (delivery.skipped ? 'SKIPPED' : 'FAILED'),
+          lastError: delivery.error || null,
+          createdAt: nowIso(),
+        });
+        store.itsmWebhookQueue = store.itsmWebhookQueue.slice(0, 200);
+        saveStore(store);
+      }).catch(() => {});
       return safeClone({ ...share, consumers });
     }
 
@@ -5520,6 +6675,22 @@ async function routeRequest(req, parsedUrl, body) {
       notifyUser(share.submittedBy, 'درخواست اشتراک API بازگردانده شد', reason, 'API_REQUEST', share.requestId, makeId('api-corr'));
       audit('API_SHARE_RETURNED', context, { shareRequestId: share.id, apiId: share.apiId, version: share.version, reason });
       saveStore(store);
+      void deliverItsmWebhook(
+        process.env.API_CONSOLE_ITSM_WEBHOOK_URL || '',
+        process.env.API_CONSOLE_ITSM_WEBHOOK_SECRET || '',
+        {
+          event: 'API_SHARE_RETURNED',
+          shareRequestId: share.id,
+          apiId: share.apiId,
+          version: share.version,
+          ticketId: share.ticketId,
+          ticketUrl: share.ticketUrl,
+          reason,
+          applicationId: share.applicationId,
+          reviewedBy: context.userId,
+          at: nowIso(),
+        }
+      ).catch(() => {});
       return safeClone(share);
     }
   }
@@ -5532,7 +6703,7 @@ async function routeRequest(req, parsedUrl, body) {
       let rows = store.requests
         .filter(request =>
           request.sourceType !== 'REFERENCE' &&
-          request.sharingStatus === 'APPROVED' &&
+          ['APPROVED', 'DEPRECATED'].includes(request.sharingStatus) &&
           request.status !== 'ARCHIVED' &&
           matchesApplicationScope(request.applicationId, scope) &&
           canAccessRepositoryRequest(request, context)
@@ -5553,7 +6724,7 @@ async function routeRequest(req, parsedUrl, body) {
         .filter(request =>
           request.apiId === apiId &&
           request.sourceType !== 'REFERENCE' &&
-          request.sharingStatus === 'APPROVED' &&
+          ['APPROVED', 'DEPRECATED'].includes(request.sharingStatus) &&
           request.status !== 'ARCHIVED' &&
           canAccessRepositoryRequest(request, context)
         )
@@ -5568,7 +6739,7 @@ async function routeRequest(req, parsedUrl, body) {
         request.apiId === apiId &&
         semanticVersionOf(request) === version &&
         request.sourceType !== 'REFERENCE' &&
-        request.sharingStatus === 'APPROVED' &&
+        ['APPROVED', 'DEPRECATED'].includes(request.sharingStatus) &&
         request.status !== 'ARCHIVED'
       );
       if (!sourceRequest || !canAccessRepositoryRequest(sourceRequest, context)) {
@@ -5584,6 +6755,9 @@ async function routeRequest(req, parsedUrl, body) {
         });
       }
       if (fifth === 'add-to-console' && req.method === 'POST') {
+        if (sourceRequest.sharingStatus === 'DEPRECATED' && !(context.role === 'SYSTEM_ADMIN' && (body.force === true || body.data?.force === true))) {
+          throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'نسخه منسوخ‌شده را نمی‌توان به Console اضافه کرد (ادمین می‌تواند با force=true عبور کند).', 409);
+        }
         const existing = store.references.find(reference =>
           reference.createdBy === context.userId &&
           reference.apiId === apiId &&
@@ -5740,11 +6914,13 @@ async function routeRequest(req, parsedUrl, body) {
       const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
       const context = requireContext(req, body);
       if (!roleAllowed(context.role, API_CONSOLE_POLICY.canView)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to view API collections.', 403);
+      const originFilter = resolveListOriginFilter(context, parsedUrl);
       return safeClone(store.collections.filter(collection =>
         collection.status === 'ACTIVE' &&
         matchesApplicationScope(collection.applicationId, scope) &&
         contextApplicationIds(context).includes(collection.applicationId) &&
-        belongsToUser(collection, context)
+        belongsToUser(collection, context) &&
+        matchesOriginId(collection, originFilter)
       ));
     }
     if (req.method === 'POST') {
@@ -5759,6 +6935,7 @@ async function routeRequest(req, parsedUrl, body) {
         name: data.name || 'New Collection',
         description: data.description,
         ownerId: context.userId,
+        visibility: data.visibility === 'PROJECT_SHARED' ? 'PROJECT_SHARED' : 'PRIVATE',
         status: 'ACTIVE',
         variables: data.variables || [],
         authenticationDocumentationProfileId: data.authenticationDocumentationProfileId,
@@ -5774,7 +6951,17 @@ async function routeRequest(req, parsedUrl, body) {
 
   if (first === 'curl' && second === 'parse' && req.method === 'POST') {
     const context = contextFromRequest(req, body) || { userId: body.userId || 'anonymous', role: 'UNKNOWN' };
-    const preview = parseCurlInternal(body.curlText || body.originalCurl || '');
+    const curlText = body.curlText || body.originalCurl || '';
+    const secretFindings = scanTextForSecrets(curlText);
+    const scanMode = String(process.env.API_CONSOLE_SECRET_SCAN_MODE || 'warn').toLowerCase();
+    if (secretFindings.length && scanMode === 'block') {
+      throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Secret patterns detected (${secretFindings.join(', ')}). Remove secrets before import.`, 422);
+    }
+    const preview = parseCurlInternal(curlText);
+    preview.secretScan = { findings: secretFindings, mode: scanMode };
+    if (secretFindings.length) {
+      preview.warnings = [...(preview.warnings || []), ...secretFindings.map(id => `Potential secret pattern detected: ${id}`)];
+    }
     store.importedCurls.unshift({
       id: preview.id,
       requestId: undefined,
@@ -5802,20 +6989,33 @@ async function routeRequest(req, parsedUrl, body) {
         collectionId: parsedUrl.searchParams.get('collectionId') || '',
         classificationType: parsedUrl.searchParams.get('classificationType') || '',
         status: parsedUrl.searchParams.get('status') || '',
+        folderPath: parsedUrl.searchParams.get('folderPath') || '',
       };
+      const originFilter = resolveListOriginFilter(context, parsedUrl);
       let rows = store.requests.filter(request =>
         matchesApplicationScope(request.applicationId, scope) &&
         contextApplicationIds(context).includes(request.applicationId) &&
         request.status !== 'ARCHIVED' &&
-        belongsToUser(request, context)
+        belongsToUser(request, context) &&
+        matchesOriginId(request, originFilter)
       );
       if (filters.collectionId) rows = rows.filter(request => request.collectionId === filters.collectionId);
       if (filters.classificationType) rows = rows.filter(request => request.classification.type === filters.classificationType);
       if (filters.status) rows = rows.filter(request => request.status === filters.status);
+      if (filters.folderPath) {
+        const wanted = filters.folderPath === '__root__'
+          ? []
+          : filters.folderPath.split('/').map(part => decodeURIComponent(part.trim())).filter(Boolean);
+        rows = rows.filter(request => {
+          const path = Array.isArray(request.folderPath) ? request.folderPath : [];
+          if (wanted.length === 0) return path.length === 0;
+          return path.length === wanted.length && path.every((part, index) => part === wanted[index]);
+        });
+      }
       if (filters.search.trim()) {
         const search = filters.search.toLowerCase();
         rows = rows.filter(request =>
-          [request.name, request.description, request.urlTemplate, request.classification.serviceId, request.classification.operationPath]
+          [request.name, request.description, request.urlTemplate, request.classification.serviceId, request.classification.operationPath, ...(request.folderPath || [])]
             .filter(Boolean)
             .some(value => String(value).toLowerCase().includes(search))
         );
@@ -5842,6 +7042,7 @@ async function routeRequest(req, parsedUrl, body) {
         environmentId: data.environmentId,
         name: data.name || 'Untitled API Request',
         description: data.description,
+        folderPath: Array.isArray(data.folderPath) ? data.folderPath : [],
         userId: context.userId,
         userName: context.user?.fullName || context.userName,
         originalImportedCurl: data.originalImportedCurl,
@@ -5850,6 +7051,7 @@ async function routeRequest(req, parsedUrl, body) {
           collection.authenticationDocumentationProfileId ||
           findEnvironment(data.environmentId)?.authenticationDocumentationProfileId,
       });
+      request.originId = resolveOriginId(context);
       store.requests.unshift(request);
       store.importedCurls = store.importedCurls.map(record => record.id === data.importedCurlId ? { ...record, requestId: request.id } : record);
       audit('API_REQUEST_CREATED', context, { requestId: request.id, classification: request.classification.type });
@@ -5868,6 +7070,7 @@ async function routeRequest(req, parsedUrl, body) {
         collectionId: data.collectionId,
         applicationId: data.applicationId,
         environmentId: data.environmentId,
+        folderPath: Array.isArray(data.folderPath) ? data.folderPath : [],
         normalizedRequest: createBlankNormalizedRequest(),
       },
       context,
@@ -5937,11 +7140,26 @@ async function routeRequest(req, parsedUrl, body) {
       const purpose = String(data.purpose || '').trim();
       const introduction = String(data.introduction || '').trim();
       const description = String(data.description || '').trim();
+      const ticketId = String(data.ticketId || '').trim();
+      const ticketUrl = String(data.ticketUrl || '').trim();
       if (!purpose || !introduction || !description) {
         throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'هدف، مقدمه و توضیحات برای اشتراک API الزامی هستند.');
       }
       if (description.length > 700) {
         throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'توضیحات اشتراک API نمی‌تواند بیشتر از ۷۰۰ کاراکتر باشد.');
+      }
+      if (ticketUrl) {
+        const allow = String(process.env.API_CONSOLE_ITSM_URL_ALLOWLIST || '').split(',').map(item => item.trim()).filter(Boolean);
+        if (allow.length) {
+          try {
+            const host = new URL(ticketUrl).hostname.toLowerCase();
+            const ok = allow.some(pattern => host === pattern.toLowerCase() || host.endsWith(`.${pattern.toLowerCase()}`));
+            if (!ok) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'ticketUrl خارج از allowlist است.', 422);
+          } catch (error) {
+            if (error instanceof ApiConsoleError) throw error;
+            throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'ticketUrl نامعتبر است.', 422);
+          }
+        }
       }
       let share = store.shareRequests.find(item => item.requestId === request.id && item.status === 'RETURNED');
       if (!share) {
@@ -5985,12 +7203,16 @@ async function routeRequest(req, parsedUrl, body) {
       share.purpose = revision.purpose;
       share.introduction = revision.introduction;
       share.description = revision.description;
+      share.ticketId = ticketId || share.ticketId;
+      share.ticketUrl = ticketUrl || share.ticketUrl;
       share.returnReason = undefined;
       share.rowVersion = makeId('row');
       share.updatedAt = nowIso();
       share.revisions = [...(share.revisions || []), revision];
       request.sharingStatus = 'PENDING_REVIEW';
       request.shareRequestId = share.id;
+      request.ticketId = share.ticketId;
+      request.ticketUrl = share.ticketUrl;
       request.latestReturnReason = undefined;
       request.updatedAt = nowIso();
       audit(revisionNumber > 1 ? 'API_SHARE_RESUBMITTED' : 'API_SHARE_SUBMITTED', context, {
@@ -6014,8 +7236,13 @@ async function routeRequest(req, parsedUrl, body) {
       const data = body.data || body;
       const nextVersion = String(data.version || '').trim();
       const changeLog = String(data.changeLog || '').trim();
+      const breakingChange = data.breakingChange === true || data.breaking === true;
+      const migrationNote = String(data.migrationNote || '').trim();
       requireSemVerGreater(nextVersion, semanticVersionOf(request));
       if (!changeLog) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Change Log برای Version جدید الزامی است.');
+      if (breakingChange && !migrationNote) {
+        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'برای Breaking Change، Migration Note الزامی است.');
+      }
       const duplicate = store.requests.some(item =>
         item.apiId === request.apiId &&
         semanticVersionOf(item) === nextVersion &&
@@ -6036,7 +7263,10 @@ async function routeRequest(req, parsedUrl, body) {
       next.sourceType = 'ORIGINAL';
       next.referenceId = undefined;
       next.sourceRequestId = undefined;
+      next.breakingChange = breakingChange;
+      next.migrationNote = migrationNote || undefined;
       next.createdBy = context.userId;
+      next.ownerId = context.userId;
       next.createdAt = nowIso();
       next.updatedBy = context.userId;
       next.updatedAt = nowIso();
@@ -6050,7 +7280,15 @@ async function routeRequest(req, parsedUrl, body) {
         ],
       };
       store.requests.unshift(protectRequestSecrets(next));
-      audit('API_VERSION_CREATED', context, { requestId: next.id, apiId: next.apiId, version: nextVersion, changeLog });
+      if (breakingChange) {
+        const correlationId = makeId('api-corr');
+        consumersForVersion(request.apiId, semanticVersionOf(request)).forEach(consumer => {
+          if (consumer.consumerType === 'USER' && consumer.userId) {
+            notifyUser(consumer.userId, 'Breaking Change در API', `${request.name} نسخه ${nextVersion}: ${migrationNote}`, 'API_REQUEST', next.id, correlationId);
+          }
+        });
+      }
+      audit('API_VERSION_CREATED', context, { requestId: next.id, apiId: next.apiId, version: nextVersion, changeLog, breakingChange, migrationNote });
       saveStore(store);
       return safeClone(next);
     }
@@ -6151,14 +7389,45 @@ async function routeRequest(req, parsedUrl, body) {
     if (third === 'documentation' && fourth === 'final' && req.method === 'POST') {
       const context = requireContext(req, body);
       if (!roleAllowed(context.role, API_CONSOLE_POLICY.canGenerateDocumentation)) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to generate documentation.', 403);
+      const language = String(body.language || body.data?.language || 'FA').toUpperCase() === 'EN' ? 'EN' : 'FA';
       const result = generateDocumentationMarkdown(request, store.executions, store.manualExamples, context.user?.fullName || context.userId);
-      const docxBuffer = buildDocxFromTemplate(request, result, store.executions, store.manualExamples);
+      if (language === 'EN') {
+        result.language = 'EN';
+        result.sectionLabels = {
+          title: 'API Operations Guide',
+          introduction: 'Introduction',
+          method: 'Method',
+          endpoint: 'Endpoint',
+          headers: 'Header parameters',
+          inputs: 'Input parameters',
+          outputs: 'Output parameters',
+          sample: 'Sample call',
+        };
+      } else {
+        result.language = 'FA';
+        result.sectionLabels = {
+          title: 'مستندات بهره‌برداری',
+          introduction: 'مقدمه',
+          method: 'متد',
+          endpoint: 'آدرس',
+          headers: 'پارامترهای سرایند',
+          inputs: 'پارامترهای ورودی',
+          outputs: 'پارامترهای خروجی',
+          sample: 'نمونه فراخوانی',
+        };
+      }
+      const activeTemplate = store.branding?.templates?.find(item => item.id === store.branding?.activeTemplateId);
+      const templatePath = activeTemplate?.filePath && fs.existsSync(activeTemplate.filePath)
+        ? activeTemplate.filePath
+        : DOCX_TEMPLATE_FILE;
+      const docxBuffer = buildDocxFromTemplate(request, result, store.executions, store.manualExamples, templatePath);
       const finalResult = { ...result, approved: roleAllowed(context.role, ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD']) };
       finalResult.wordDocumentBase64 = docxBuffer.toString('base64');
       finalResult.wordFileName = docxFileName(request);
       finalResult.wordMimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      finalResult.templateId = activeTemplate?.id || 'default';
       store.documentationResults.unshift(finalResult);
-      audit('API_DOCUMENTATION_GENERATED', context, { requestId: second, approved: finalResult.approved });
+      audit('API_DOCUMENTATION_GENERATED', context, { requestId: second, approved: finalResult.approved, language, templateId: finalResult.templateId });
       saveStore(store);
       return safeClone(finalResult);
     }
@@ -6468,6 +7737,7 @@ function runSelfCheck() {
 }
 
 function createServer() {
+  assertProductionSecrets();
   return http.createServer(async (req, res) => {
     res.setHeader('access-control-allow-origin', process.env.API_CONSOLE_CORS_ORIGIN || 'http://localhost:5173');
     res.setHeader('access-control-allow-credentials', 'true');
@@ -6516,7 +7786,10 @@ function createServer() {
       if (!parsedUrl.pathname.startsWith('/api/api-console') && !parsedUrl.pathname.startsWith('/api/reports')) {
         throw new ApiConsoleError('INVALID_URL', 'Endpoint not found.', 404);
       }
-      if (!req.utmsContext && !LEGACY_CONTEXT_ENABLED) {
+      const isPublicApiPath = /^\/api\/api-console\/portal\/shared\/[^/]+$/.test(parsedUrl.pathname)
+        || /^\/api\/api-console\/mock-serve\/[^/]+$/.test(parsedUrl.pathname)
+        || /^\/api\/api-console\/health(?:\/config)?$/.test(parsedUrl.pathname);
+      if (!req.utmsContext && !isLegacyContextEnabled() && !isPublicApiPath) {
         throw new ApiConsoleError('AUTHENTICATION_ERROR', 'CDE login and project selection are required.', 401);
       }
       const body = await readJsonBody(req);
@@ -6557,6 +7830,7 @@ module.exports = {
   buildRuntimeCurlExport,
   buildRuntimePostmanCollection,
   runtimeOpenApiDocument,
+  discoverySourceFingerprint,
   mergeDiscoveredRequest,
   sourceControlledDefinition,
   sanitizeDocumentationCurl,
@@ -6565,4 +7839,15 @@ module.exports = {
   AUTHENTICATION_DOCUMENTATION_PROFILES,
   runSelfCheck,
   API_CONSOLE_POLICY,
+  assertProductionSecrets,
+  inspectProductionSecrets,
+  // E01 persistence helpers (FILE default; SQLITE via env)
+  resolveStoreBackend,
+  createStoreAdapter,
+  loadStoreViaAdapter,
+  writeStoreViaAdapter,
+  loadStoreFromFile,
+  saveStoreToFile,
+  STORE_BACKEND,
+  SQLITE_FILE,
 };

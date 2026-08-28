@@ -15,6 +15,7 @@ npm run dev
 - Web: http://localhost:5173
 - API: http://localhost:4274
 - Swagger: http://localhost:4274/api/docs
+- Portal (read-only approved APIs): http://localhost:5173/portal
 
 ## Auth
 
@@ -26,11 +27,11 @@ Role allowlists (comma-separated CDE login names, e.g. `9121234567`):
 
 - `API_CONSOLE_ADMIN_LOGINS` → bootstrap SYSTEM_ADMIN (at least one initial administrator)
 - `API_CONSOLE_QA_LEAD_LOGINS` → QA_LEAD
-- everyone else → DEVELOPER
+- everyone else → DEVELOPER until a System Administrator assigns another directory role
 
-After a successful CDE login, the user's CDE display name and cellphone are synced into the local console directory. A System Administrator can open **مدیریت کاربران** and grant another synced CDE user the `SYSTEM_ADMIN` role. Managed assignments are persisted in `api-console-store.json`; authentication still happens only through CDE.
+After a successful CDE login, the user's CDE display name and cellphone are synced into the local console directory. A System Administrator can open **Users** and grant synced CDE users roles such as `SYSTEM_ADMIN`, `TECH_LEAD`, `QA_LEAD`, `BA`, and others. Managed assignments are persisted in `api-console-store.json`; authentication still happens only through CDE. Identity and role for API calls come from the server session — browser context headers are not trusted (opt-in legacy only via `API_CONSOLE_ALLOW_LEGACY_CONTEXT` outside production).
 
-Only `SYSTEM_ADMIN` can approve/return API sharing requests and choose the synced CDE developers who may consume the approved API. Bootstrap administrators remain controlled by `API_CONSOLE_ADMIN_LOGINS` and cannot be revoked from the UI.
+`SYSTEM_ADMIN`, `TECH_LEAD`, and `QA_LEAD` can approve/return API sharing requests. Only `SYSTEM_ADMIN` manages directory users. Bootstrap administrators remain controlled by `API_CONSOLE_ADMIN_LOGINS` and cannot be revoked from the UI.
 
 ## Data
 
@@ -40,7 +41,17 @@ Optional: copy existing UTMS `runtime/api-console/*` files into this folder to m
 
 ## CDE origin
 
-`CDE_CORE_BASE_URL` defaults to `https://cde.edus.ir`. Change this later to add other origins.
+`CDE_CORE_BASE_URL` defaults to `https://cde.edus.ir`.
+
+For multiple control-plane origins, set `API_CONSOLE_CDE_ORIGINS` to a JSON array (see `.env.example`). The login screen shows an origin picker; the selected origin is stored on the app session.
+
+## Collection runner CLI (CI)
+
+```bash
+npm run cli:run -w @api-console/api -- --collection <id> --cookie "api_console_session=..." --junit results.xml
+```
+
+Exit code `1` on failed assertions/transport. Optional webhooks: `API_CONSOLE_RUN_WEBHOOK_URL` / `API_CONSOLE_ITSM_WEBHOOK_URL`.
 
 ## Runtime discovery and execution
 
@@ -56,7 +67,10 @@ Runtime origins must match `RUNTIME_ORIGIN_ALLOWLIST` and resolve only to public
 
 Runtime Swagger uses the authenticated API Console proxy. Postman and cURL exports contain the direct login/cookie-jar flow with empty phone/password variables and never export a stored cookie or credential. Data Service execution remains blocked until an administrator supplies an HTTPS base URL and vault-backed authentication configuration.
 
+Prefilled **ds/fr** Swagger examples (curl/parse, validate-core, runtime execute) are on `GET /api/docs` after CDE login — see [OPENAPI.md](docs/OPENAPI.md).
+
 ## Docs
 
 - [ONLINE_API_CONSOLE.md](docs/ONLINE_API_CONSOLE.md)
 - [OPENAPI.md](docs/OPENAPI.md)
+- [BACKLOG.md](docs/BACKLOG.md) — epics, stories, acceptance criteria (full product backlog)

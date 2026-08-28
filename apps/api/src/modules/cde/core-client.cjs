@@ -1,10 +1,43 @@
 const { randomBytes } = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const CryptoJS = require('crypto-js');
 const { CookieJar } = require('tough-cookie');
 
+const cdeOriginAls = new AsyncLocalStorage();
+
+function parseConfiguredOrigins() {
+  const raw = process.env.API_CONSOLE_CDE_ORIGINS || '';
+  if (raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) {
+        return parsed.map((item, index) => ({
+          id: String(item.id || `origin-${index + 1}`),
+          label: String(item.label || item.baseUrl || item.id || `Origin ${index + 1}`),
+          baseUrl: String(item.baseUrl || '').replace(/\/$/, ''),
+        })).filter(item => item.baseUrl);
+      }
+    } catch {}
+  }
+  const fallback = String(process.env.CDE_CORE_BASE_URL || 'https://cde.edus.ir').replace(/\/$/, '');
+  return [{ id: 'default', label: 'Default CDE', baseUrl: fallback }];
+}
+
 function getCdeOrigin() {
+  const fromAls = cdeOriginAls.getStore()?.origin;
+  if (fromAls) return String(fromAls).replace(/\/$/, '');
   return String(process.env.CDE_CORE_BASE_URL || 'https://cde.edus.ir').replace(/\/$/, '');
 }
+
+function runWithCdeOrigin(origin, fn) {
+  return cdeOriginAls.run({ origin: String(origin || '').replace(/\/$/, '') }, fn);
+}
+
+function resolveOriginById(originId) {
+  const origins = parseConfiguredOrigins();
+  return origins.find(item => item.id === originId) || origins[0];
+}
+
 function getServiceId() {
   try {
     return new URL(getCdeOrigin()).host;
@@ -12,10 +45,6 @@ function getServiceId() {
     return 'cde.edus.ir';
   }
 }
-const CDE_ORIGIN = getCdeOrigin();
-const SERVICE_ID = getServiceId();
-const DATA_SOURCE_URL = `${CDE_ORIGIN}/core-api/v1/data-provider/get-data-source`;
-const STORE_FORM_URL = `${CDE_ORIGIN}/core-api/v1/data-provider/store-form-data`;
 const MAX_BODY_BYTES = Number(process.env.CDE_MAX_BODY_BYTES || 32 * 1024 * 1024);
 const REQUEST_TIMEOUT_MS = Number(process.env.CDE_REQUEST_TIMEOUT_MS || 60_000);
 
@@ -206,7 +235,6 @@ module.exports = {
   ALLOWED_DATA_KEYS,
   ALLOWED_FORM_IDS,
   CoreClientError,
-  SERVICE_ID,
   assertLogicalSuccess,
   createCdeState,
   decryptResponse,
@@ -214,6 +242,9 @@ module.exports = {
   getCdeOrigin,
   getDataSource,
   getServiceId,
+  parseConfiguredOrigins,
+  resolveOriginById,
+  runWithCdeOrigin,
   responseLogicalError,
   secretForClientId,
   storeFormData,

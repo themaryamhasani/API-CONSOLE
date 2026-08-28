@@ -1,18 +1,17 @@
-import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+﻿import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import {
   AlertTriangle,
-  Braces,
+  Bell,
   CheckCircle,
-  Clock,
   Copy,
   Download,
   Edit3,
   Eye,
   FileText,
-  FolderPlus,
   History,
   PlayCircle,
   Plus,
+  FolderPlus,
   RefreshCw,
   Save,
   Search,
@@ -26,7 +25,8 @@ import {
   ZoomOut,
 } from 'lucide-react';
 import { ROLE_LABELS } from '../types';
-import type { PaginatedResponse, UserRole } from '../types';
+import type { ActiveContext, ApiAuditEvent, Notification, NotificationListResponse, PaginatedResponse, UserRole } from '../types';
+import { AppShell, buildWorkspaceNav, type WorkspaceNavId } from '../components/layout/AppShell';
 import { Header } from '../components/layout/Header';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -39,18 +39,28 @@ import { Modal } from '../components/ui/Modal';
 import { Table, Pagination } from '../components/ui/Table';
 import { toast } from '../components/ui/Toast';
 import { RuntimeWorkspace } from '../components/api-console/RuntimeWorkspace';
+import { EnvironmentManagerSection } from '../components/api-console/EnvironmentManagerSection';
+import { ActivityFeedPanel } from '../components/api-console/ActivityFeedPanel';
+import { RunnersAdminSection } from '../components/api-console/RunnersAdminSection';
+import { BrandingAdminSection } from '../components/api-console/BrandingAdminSection';
+import { OrgPolicySection } from '../components/api-console/OrgPolicySection';
+import { ComplianceReportSection } from '../components/api-console/ComplianceReportSection';
+import { JitAccessSection } from '../components/api-console/JitAccessSection';
+import { MocksSection } from '../components/api-console/MocksSection';
 import { useAuthStore } from '../stores/authStore';
 import { useDataScope } from '../utils/useDataScope';
 import { useApplicationLookup } from '../utils/useApplicationLookup';
 import { apiConsoleApi } from '../services/apiConsoleApi';
 import { API_SHARING_STATUS_LABELS } from '../types/apiConsole';
 import type {
+  ApiActivityEvent,
   ApiClassification,
   ApiClassificationType,
   ApiCollection,
   ApiConsoleDirectoryUser,
   ApiConsumerCandidate,
   ApiCurlImportPreview,
+  ApiDocLanguage,
   ApiEffectiveRequestSnapshot,
   ApiEnvironmentProfile,
   ApiExecutionMode,
@@ -70,9 +80,14 @@ import type {
   ApiRequestDefinition,
   ApiRequestHeader,
   ApiRequestExecution,
+  ApiReviewChecklist,
   ApiShareRequest,
   ApiSharingStatus,
+  ApiTestRun,
+  ApiUsageReport,
+  ApiVariable,
   ApiVersionConsumer,
+  ApiVisibility,
   NormalizedApiRequest,
 } from '../types/apiConsole';
 
@@ -92,7 +107,36 @@ type EditorTab =
   | 'history';
 
 type PageMode = 'list' | 'editor';
-type WorkspaceView = 'requests' | 'repository' | 'reviews' | 'users' | 'runtime';
+type WorkspaceView =
+  | 'requests'
+  | 'repository'
+  | 'runtime'
+  | 'reports'
+  | 'environments'
+  | 'reviews'
+  | 'users'
+  | 'audit'
+  | 'activity'
+  | 'runners'
+  | 'branding'
+  | 'org-policy'
+  | 'compliance'
+  | 'jit'
+  | 'mocks';
+
+const EMPTY_REVIEW_CHECKLIST: ApiReviewChecklist = {
+  docsComplete: false,
+  noSecrets: false,
+  classificationOk: false,
+  consumersSpecified: false,
+};
+
+const REVIEW_CHECKLIST_LABELS: Array<{ key: keyof ApiReviewChecklist; label: string }> = [
+  { key: 'docsComplete', label: 'مستندات کامل است' },
+  { key: 'noSecrets', label: 'Secret خام در تعریف نیست' },
+  { key: 'classificationOk', label: 'Classification صحیح است' },
+  { key: 'consumersSpecified', label: 'مصرف‌کنندگان مشخص شده‌اند' },
+];
 type ParserSelfCheckDetail = { name: string; passed: boolean; message?: string };
 type PostmanImportRequestPreview = {
   name: string;
@@ -116,7 +160,7 @@ type PostmanCollectionImportPreview = {
   warnings: string[];
 };
 
-const METHOD_OPTIONS: ApiHttpMethod[] = ['GET', 'POST'];
+const METHOD_OPTIONS: ApiHttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
 const TAB_LABELS: Array<{ id: EditorTab; label: string }> = [
   { id: 'response', label: 'response' },
   { id: 'params', label: 'پارامترها' },
@@ -660,6 +704,21 @@ function classifyNormalizedPostmanRequest(url: string, body: NormalizedApiReques
   return { type: 'GENERIC_HTTP', serviceId: null, operationPath: null, coreOperationType: null, endpoint: null };
 }
 
+function collectPostmanScriptWarnings(item: Record<string, unknown>): string[] {
+  const warnings: string[] = [];
+  const events = asArray<Record<string, unknown>>(item.event);
+  for (const event of events) {
+    const script = asRecord(event.script);
+    const execLines = asArray(script.exec).map(line => String(line || ''));
+    const execText = execLines.join('\n');
+    if (/\bpm\./.test(execText)) {
+      warnings.push('اسکریپت Postman شامل pm.* است و در Online API Console پشتیبانی نمی‌شود؛ به Scripts امن کنسول مهاجرت دهید.');
+      break;
+    }
+  }
+  return warnings;
+}
+
 function parsePostmanRequestItem(
   item: Record<string, unknown>,
   folderPath: string[],
@@ -667,7 +726,7 @@ function parsePostmanRequestItem(
 ): PostmanImportRequestPreview | null {
   const requestValue = item.request;
   if (!requestValue) return null;
-  const warnings: string[] = [];
+  const warnings: string[] = [...collectPostmanScriptWarnings(item)];
   const request = typeof requestValue === 'string' ? { url: requestValue, method: 'GET' } : asRecord(requestValue);
   const method = normalizePostmanMethod(request.method, warnings);
   const { url, queryParameters } = splitPostmanUrl(request.url, warnings);
@@ -903,6 +962,26 @@ function downloadJsonFile(value: unknown, fileName: string) {
   URL.revokeObjectURL(url);
 }
 
+function downloadTextFile(content: string, fileName: string, mimeType = 'text/plain;charset=utf-8') {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function escapeCsvCell(value: unknown): string {
+  const text = value == null ? '' : String(value);
+  if (/[",\n\r]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+  return text;
+}
+
+function rowsToCsv(headers: string[], rows: Array<Array<unknown>>): string {
+  return [headers.map(escapeCsvCell).join(','), ...rows.map(row => row.map(escapeCsvCell).join(','))].join('\n');
+}
+
 function safeBodyPreview(execution: ApiRequestExecution | null): string {
   if (!execution?.response?.bodyPreview) return '';
   const raw = execution.response.bodyPreview;
@@ -1014,13 +1093,14 @@ const JsonResponseViewer = ({ value }: { value: string }) => {
   );
 };
 
-const Toggle = ({ checked, onChange, label }: { checked: boolean; onChange: (checked: boolean) => void; label: string }) => (
+const Toggle = ({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) => (
   <button
     type="button"
     role="switch"
     aria-checked={checked}
-    onClick={() => onChange(!checked)}
-    className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700"
+    disabled={disabled}
+    onClick={() => { if (!disabled) onChange(!checked); }}
+    className={`flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}
   >
     <span className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${checked ? 'bg-blue-600' : 'bg-gray-300'}`}>
       <span className={`theme-switch-thumb inline-block h-4 w-4 rounded-full bg-white shadow transition ${checked ? '-translate-x-4' : '-translate-x-1'}`} />
@@ -1094,7 +1174,15 @@ export const OnlineApiConsolePage: React.FC = () => {
   const [selectedRequest, setSelectedRequest] = useState<ApiRequestDefinition | null>(null);
   const [savedRequest, setSavedRequest] = useState<ApiRequestDefinition | null>(null);
   const [pageMode, setPageMode] = useState<PageMode>('list');
-  const [filters, setFilters] = useState({ page: 1, limit: 10, search: '', collectionId: '', classificationType: '' });
+  const [filters, setFilters] = useState({ page: 1, limit: 10, search: '', collectionId: '', classificationType: '', folderPath: '' });
+  const [knownFolders, setKnownFolders] = useState<string[]>([]);
+  const [folderDraft, setFolderDraft] = useState('');
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [globalSearchQuery, setGlobalSearchQuery] = useState('');
+  const [globalSearchLoading, setGlobalSearchLoading] = useState(false);
+  const [globalSearchHits, setGlobalSearchHits] = useState<Array<{ kind: 'request' | 'repository' | 'discovery'; id: string; title: string; subtitle: string }>>([]);
+  const [historyStatusFilter, setHistoryStatusFilter] = useState('');
+  const [historyCompareIds, setHistoryCompareIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [selectingRequestId, setSelectingRequestId] = useState<string | null>(null);
@@ -1130,6 +1218,8 @@ export const OnlineApiConsolePage: React.FC = () => {
   const [manualForm, setManualForm] = useState({ statusCode: 200, headersText: 'content-type: application/json', body: '{\n  "ok": true\n}', source: '', reason: '' });
   const [productionModalOpen, setProductionModalOpen] = useState(false);
   const [productionForm, setProductionForm] = useState({ confirmed: false, reason: '' });
+  const [dualApprovalStatus, setDualApprovalStatus] = useState<'UNKNOWN' | 'MISSING' | 'PENDING' | 'ACTIVE'>('UNKNOWN');
+  const [dualApprovalBusy, setDualApprovalBusy] = useState(false);
   const [corePresentationEnabled, setCorePresentationEnabled] = useState(true);
   const [selfCheckOpen, setSelfCheckOpen] = useState(false);
   const [selfCheck, setSelfCheck] = useState<{ passed: number; failed: number; details: ParserSelfCheckDetail[] } | null>(null);
@@ -1138,6 +1228,8 @@ export const OnlineApiConsolePage: React.FC = () => {
   const [collectionForm, setCollectionForm] = useState({ applicationId: '', name: '', description: '' });
   const [exportingCollectionId, setExportingCollectionId] = useState<string | null>(null);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('requests');
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [requestsMoreOpen, setRequestsMoreOpen] = useState(false);
   const [repositoryRows, setRepositoryRows] = useState<PaginatedResponse<ApiRepositoryItem> | null>(null);
   const [repositoryLoading, setRepositoryLoading] = useState(false);
   const [repositoryFilters, setRepositoryFilters] = useState({ page: 1, limit: 10, search: '' });
@@ -1156,8 +1248,14 @@ export const OnlineApiConsolePage: React.FC = () => {
   const [shareTarget, setShareTarget] = useState<ApiRequestDefinition | null>(null);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [shareConfirmOpen, setShareConfirmOpen] = useState(false);
-  const [shareForm, setShareForm] = useState({ purpose: '', introduction: '', description: '' });
+  const [shareForm, setShareForm] = useState({ purpose: '', introduction: '', description: '', ticketId: '', ticketUrl: '' });
   const [sharing, setSharing] = useState(false);
+  const [docLanguage, setDocLanguage] = useState<ApiDocLanguage>('FA');
+  const [reviewTicketForm, setReviewTicketForm] = useState({ ticketId: '', ticketUrl: '' });
+  const [reviewTicketSaving, setReviewTicketSaving] = useState(false);
+  const [creatingMock, setCreatingMock] = useState(false);
+  const [contractSuiteLoading, setContractSuiteLoading] = useState(false);
+  const [exportingOpenApiId, setExportingOpenApiId] = useState<string | null>(null);
   const [approveModalOpen, setApproveModalOpen] = useState(false);
   const [returnModalOpen, setReturnModalOpen] = useState(false);
   const [returnReason, setReturnReason] = useState('');
@@ -1165,12 +1263,50 @@ export const OnlineApiConsolePage: React.FC = () => {
   const [adminUsers, setAdminUsers] = useState<ApiConsoleDirectoryUser[]>([]);
   const [adminUsersLoading, setAdminUsersLoading] = useState(false);
   const [adminUserSearch, setAdminUserSearch] = useState('');
-  const [adminRoleTarget, setAdminRoleTarget] = useState<{ user: ApiConsoleDirectoryUser; enabled: boolean } | null>(null);
+  const [adminRoleTarget, setAdminRoleTarget] = useState<{
+    user: ApiConsoleDirectoryUser;
+    role: UserRole;
+    enabled: boolean;
+    applicationId: string;
+  } | null>(null);
   const [adminRoleSaving, setAdminRoleSaving] = useState(false);
+  const [usageReport, setUsageReport] = useState<ApiUsageReport | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageFilters, setUsageFilters] = useState({
+    page: 1,
+    limit: 10,
+    eventType: '',
+    apiId: '',
+    userId: '',
+    dateFrom: '',
+    dateTo: '',
+  });
+  const [auditRows, setAuditRows] = useState<PaginatedResponse<ApiAuditEvent> | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditFilters, setAuditFilters] = useState({ page: 1, limit: 20, action: '', userId: '' });
+  const [notificationFeed, setNotificationFeed] = useState<NotificationListResponse | null>(null);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [versionModalOpen, setVersionModalOpen] = useState(false);
-  const [versionForm, setVersionForm] = useState({ version: '', changeLog: '' });
+  const [versionForm, setVersionForm] = useState({ version: '', changeLog: '', breakingChange: false, migrationNote: '' });
   const [versioning, setVersioning] = useState(false);
   const [runtimeConnected, setRuntimeConnected] = useState(false);
+  const [activityRows, setActivityRows] = useState<PaginatedResponse<ApiActivityEvent> | null>(null);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityFilters, setActivityFilters] = useState({ page: 1, limit: 30 });
+  const [collectionRunModalOpen, setCollectionRunModalOpen] = useState(false);
+  const [collectionRunStopOnFail, setCollectionRunStopOnFail] = useState(true);
+  const [collectionRunning, setCollectionRunning] = useState(false);
+  const [latestCollectionRun, setLatestCollectionRun] = useState<ApiTestRun | null>(null);
+  const [recentTestRuns, setRecentTestRuns] = useState<ApiTestRun[]>([]);
+  const [reviewChecklist, setReviewChecklist] = useState<ApiReviewChecklist>(EMPTY_REVIEW_CHECKLIST);
+  const [reviewCommentText, setReviewCommentText] = useState('');
+  const [reviewCommentSaving, setReviewCommentSaving] = useState(false);
+  const [deprecateModalOpen, setDeprecateModalOpen] = useState(false);
+  const [deprecateForm, setDeprecateForm] = useState({ reason: '', effectiveAt: '' });
+  const [deprecating, setDeprecating] = useState(false);
+  const [ownershipTransferUserId, setOwnershipTransferUserId] = useState('');
+  const [coOwnersInput, setCoOwnersInput] = useState('');
+  const [ownershipSaving, setOwnershipSaving] = useState(false);
   const derivedRequestSeqRef = useRef(0);
   const loadAllSeqRef = useRef(0);
   const reloadRequestsSeqRef = useRef(0);
@@ -1186,18 +1322,77 @@ export const OnlineApiConsolePage: React.FC = () => {
   const canExecute = !!role && (role === 'SYSTEM_ADMIN' || policy.canExecute.includes(role));
   const canDocument = !!role && (role === 'SYSTEM_ADMIN' || policy.canGenerateDocumentation.includes(role));
   const canDelete = !!role && (role === 'SYSTEM_ADMIN' || policy.canDelete.includes(role));
-  const canManageGeneralSettings = role === 'SYSTEM_ADMIN';
-  const canReviewShares = role === 'SYSTEM_ADMIN';
+  const canManageGeneralSettings = !!role && (role === 'SYSTEM_ADMIN' || policy.canManageUsers.includes(role));
+  const canReviewShares = !!role && (role === 'SYSTEM_ADMIN' || policy.canReviewShares.includes(role));
+  const canViewUsageReports = !!role && (role === 'SYSTEM_ADMIN' || policy.canViewUsageReports.includes(role));
+  const isSystemAdmin = role === 'SYSTEM_ADMIN';
+
+  const canManageProtectedEnvironments = !!role && (role === 'SYSTEM_ADMIN' || policy.canManageProtectedEnvironments.includes(role));
+  const canManageEnvironments = canEdit;
+
+  const navGroups = useMemo(
+    () => buildWorkspaceNav({
+      canManageEnvironments,
+      canEdit,
+      canReviewShares,
+      canManageGeneralSettings,
+      isSystemAdmin,
+      canViewUsageReports,
+    }),
+    [canManageEnvironments, canEdit, canReviewShares, canManageGeneralSettings, isSystemAdmin, canViewUsageReports],
+  );
+
+  const workspaceTitle = useMemo(() => {
+    const labels: Record<WorkspaceView, string> = {
+      requests: 'درخواست‌ها',
+      repository: 'مخزن',
+      runtime: 'Runtime',
+      environments: 'محیط‌ها',
+      activity: 'فعالیت',
+      mocks: 'Mock',
+      jit: 'دسترسی JIT',
+      reports: 'گزارش‌ها',
+      reviews: 'بازبینی Share',
+      users: 'کاربران',
+      runners: 'Runnerها',
+      branding: 'برندینگ',
+      'org-policy': 'سیاست سازمان',
+      compliance: 'انطباق',
+      audit: 'ممیزی',
+    };
+    return labels[workspaceView] || 'Workspace';
+  }, [workspaceView]);
 
   const visibleTabs = useMemo(
-    () => TAB_LABELS.filter(tab => tab.id !== 'settings' || canManageGeneralSettings),
-    [canManageGeneralSettings]
+    () => TAB_LABELS.filter(tab => tab.id !== 'settings' || canEdit),
+    [canEdit]
   );
 
   const selectedEnvironment = useMemo(
     () => environments.find(environment => environment.id === selectedRequest?.environmentId) || environments[0],
     [environments, selectedRequest?.environmentId]
   );
+
+  const topUsageApis = useMemo(() => {
+    const counts = new Map<string, { apiId: string; apiTitle: string; executed: number; added: number }>();
+    for (const row of usageReport?.data || []) {
+      const key = String(row.apiId || '');
+      if (!key) continue;
+      const current = counts.get(key) || {
+        apiId: key,
+        apiTitle: row.apiTitle || key,
+        executed: 0,
+        added: 0,
+      };
+      if (row.eventType === 'API_EXECUTED') current.executed += 1;
+      if (row.eventType === 'ADDED_TO_CONSOLE') current.added += 1;
+      if (row.apiTitle) current.apiTitle = row.apiTitle;
+      counts.set(key, current);
+    }
+    return Array.from(counts.values())
+      .sort((left, right) => right.executed - left.executed || right.added - left.added)
+      .slice(0, 10);
+  }, [usageReport]);
 
   const latestExecution = selectedExecution || historyRows[0] || null;
   const hasUnsavedChanges = useMemo(() => {
@@ -1209,7 +1404,7 @@ export const OnlineApiConsolePage: React.FC = () => {
     if (activeContext) {
       loadAll();
     }
-  }, [activeContext, appId, filters.page, filters.limit, filters.collectionId, filters.classificationType]);
+  }, [activeContext, appId, filters.page, filters.limit, filters.collectionId, filters.classificationType, filters.folderPath]);
 
   useEffect(() => {
     if (!activeContext) {
@@ -1243,10 +1438,39 @@ export const OnlineApiConsolePage: React.FC = () => {
   }, [activeContext, workspaceView, canManageGeneralSettings]);
 
   useEffect(() => {
-    if (!canManageGeneralSettings && activeTab === 'settings') {
+    if (activeContext && workspaceView === 'reports' && canViewUsageReports) {
+      loadUsageReport();
+    }
+  }, [activeContext, appId, workspaceView, canViewUsageReports, usageFilters.page, usageFilters.limit, usageFilters.eventType, usageFilters.apiId, usageFilters.userId, usageFilters.dateFrom, usageFilters.dateTo]);
+
+  useEffect(() => {
+    if (activeContext && workspaceView === 'audit' && canManageGeneralSettings) {
+      loadAuditLog();
+    }
+  }, [activeContext, appId, workspaceView, canManageGeneralSettings, auditFilters.page, auditFilters.limit, auditFilters.action, auditFilters.userId]);
+
+  useEffect(() => {
+    if (activeContext && workspaceView === 'activity') {
+      void loadActivity();
+    }
+  }, [activeContext, appId, workspaceView, activityFilters.page, activityFilters.limit]);
+
+  useEffect(() => {
+    if (activeContext) {
+      loadNotifications();
+    }
+  }, [activeContext?.contextId]);
+
+  useEffect(() => {
+    if (!canEdit && activeTab === 'settings') {
       setActiveTab('params');
     }
-  }, [canManageGeneralSettings, activeTab]);
+  }, [canEdit, activeTab]);
+
+  useEffect(() => {
+    setCoOwnersInput((selectedRequest?.coOwnerIds || []).join(', '));
+    setOwnershipTransferUserId('');
+  }, [selectedRequest?.id]);
 
   useEffect(() => {
     if (!selectedRequest) {
@@ -1355,24 +1579,138 @@ export const OnlineApiConsolePage: React.FC = () => {
     }
   };
 
+  const loadActivity = async () => {
+    if (!activeContext) return;
+    setActivityLoading(true);
+    try {
+      const rows = await apiConsoleApi.getActivity({
+        applicationId: typeof appId === 'string' && appId !== 'ALL' ? appId : activeContext.applicationId,
+        page: activityFilters.page,
+        limit: activityFilters.limit,
+      }, activeContext);
+      setActivityRows(rows);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'بارگذاری Activity ناموفق بود.');
+    } finally {
+      setActivityLoading(false);
+    }
+  };
+
+  const loadRecentTestRuns = async (collectionId: string) => {
+    if (!activeContext || !collectionId) {
+      setRecentTestRuns([]);
+      return;
+    }
+    try {
+      const rows = await apiConsoleApi.getTestRuns({ collectionId, page: 1, limit: 5 }, activeContext);
+      setRecentTestRuns(rows.data || []);
+    } catch {
+      setRecentTestRuns([]);
+    }
+  };
+
   const handleSystemAdminChange = async () => {
     if (!activeContext || !adminRoleTarget) return;
     setAdminRoleSaving(true);
     try {
-      const updated = await apiConsoleApi.setSystemAdmin(
+      const updated = await apiConsoleApi.setDirectoryRole(
         adminRoleTarget.user.id,
+        adminRoleTarget.role,
         adminRoleTarget.enabled,
-        activeContext
+        activeContext,
+        adminRoleTarget.enabled
+          ? { applicationId: adminRoleTarget.applicationId || 'ALL' }
+          : {}
       );
       setAdminUsers(previous => previous.map(user => user.id === updated.id ? updated : user));
       toast.success(adminRoleTarget.enabled
-        ? `نقش مدیرسیستم برای «${updated.fullName}» فعال شد.`
-        : `نقش مدیرسیستم از «${updated.fullName}» گرفته شد.`);
+        ? `نقش «${roleLabel(adminRoleTarget.role)}» برای «${updated.fullName}» فعال شد.`
+        : `نقش «${roleLabel(adminRoleTarget.role)}» از «${updated.fullName}» گرفته شد.`);
       setAdminRoleTarget(null);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'تغییر نقش مدیرسیستم ناموفق بود.');
+      toast.error(error instanceof Error ? error.message : 'تغییر نقش کاربر ناموفق بود.');
     } finally {
       setAdminRoleSaving(false);
+    }
+  };
+
+  const loadUsageReport = async () => {
+    if (!activeContext || !canViewUsageReports) {
+      setUsageReport(null);
+      return;
+    }
+    setUsageLoading(true);
+    try {
+      const report = await apiConsoleApi.getApiUsageReport({
+        page: usageFilters.page,
+        limit: usageFilters.limit,
+        applicationId: appId,
+        eventType: usageFilters.eventType || undefined,
+        apiId: usageFilters.apiId || undefined,
+        userId: usageFilters.userId || undefined,
+        dateFrom: usageFilters.dateFrom || undefined,
+        dateTo: usageFilters.dateTo || undefined,
+      }, activeContext);
+      setUsageReport(report);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'بارگذاری گزارش مصرف ناموفق بود.');
+      setUsageReport(null);
+    } finally {
+      setUsageLoading(false);
+    }
+  };
+
+  const loadAuditLog = async () => {
+    if (!activeContext || !canManageGeneralSettings) {
+      setAuditRows(null);
+      return;
+    }
+    setAuditLoading(true);
+    try {
+      setAuditRows(await apiConsoleApi.getAuditLog({
+        page: auditFilters.page,
+        limit: auditFilters.limit,
+        action: auditFilters.action || undefined,
+        userId: auditFilters.userId || undefined,
+        applicationId: appId,
+      }, activeContext));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'بارگذاری Audit ناموفق بود.');
+      setAuditRows(null);
+    } finally {
+      setAuditLoading(false);
+    }
+  };
+
+  const loadNotifications = async () => {
+    if (!activeContext) {
+      setNotificationFeed(null);
+      return;
+    }
+    try {
+      setNotificationFeed(await apiConsoleApi.getNotifications({ page: 1, limit: 15 }, activeContext));
+    } catch {
+      setNotificationFeed(null);
+    }
+  };
+
+  const handleMarkNotificationRead = async (item: Notification) => {
+    if (!activeContext || item.isRead) return;
+    try {
+      await apiConsoleApi.markNotificationRead(item.id, activeContext);
+      await loadNotifications();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'خواندن اعلان ناموفق بود.');
+    }
+  };
+
+  const handleMarkAllNotificationsRead = async () => {
+    if (!activeContext) return;
+    try {
+      await apiConsoleApi.markAllNotificationsRead(activeContext);
+      await loadNotifications();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'خواندن همه اعلان‌ها ناموفق بود.');
     }
   };
 
@@ -1421,6 +1759,14 @@ export const OnlineApiConsolePage: React.FC = () => {
     const response = await apiConsoleApi.getRequests(appId, filters, activeContext);
     if (reloadSeq !== reloadRequestsSeqRef.current) return;
     setRequests(response);
+    setKnownFolders(prev => {
+      const next = new Set(prev);
+      response.data.forEach(item => {
+        const path = (item.folderPath || []).join('/');
+        if (path) next.add(path);
+      });
+      return Array.from(next).sort((a, b) => a.localeCompare(b, 'fa'));
+    });
     if (selectId) {
       const request = response.data.find(item => item.id === selectId) || await apiConsoleApi.getRequest(selectId, activeContext);
       if (reloadSeq !== reloadRequestsSeqRef.current) return;
@@ -1438,6 +1784,82 @@ export const OnlineApiConsolePage: React.FC = () => {
         await refreshDerivedViews(request, true);
       }
     }
+  };
+
+  const runGlobalSearch = async () => {
+    if (!activeContext || !globalSearchQuery.trim()) {
+      setGlobalSearchHits([]);
+      return;
+    }
+    setGlobalSearchLoading(true);
+    try {
+      const term = globalSearchQuery.trim();
+      const [requestRows, repoRows, profiles] = await Promise.all([
+        apiConsoleApi.getRequests(appId, { page: 1, limit: 20, search: term }, activeContext),
+        apiConsoleApi.getRepository({ page: 1, limit: 10, search: term, applicationId: appId }, activeContext).catch(() => null),
+        apiConsoleApi.getRuntimeProfiles(activeContext.applicationId, activeContext).catch(() => []),
+      ]);
+      const discovery = profiles[0]
+        ? await apiConsoleApi.getLatestProjectDiscovery(activeContext.applicationId, activeContext).catch(() => null)
+        : null;
+      const discoveryHits = (discovery?.operations || [])
+        .filter(op => [op.name, op.sourceId, op.path, op.moduleId].some(value => String(value || '').toLowerCase().includes(term.toLowerCase())))
+        .slice(0, 10)
+        .map(op => ({
+          kind: 'discovery' as const,
+          id: op.id,
+          title: op.sourceId || op.name,
+          subtitle: `${op.type} · ${op.path || op.moduleId || ''}`,
+        }));
+      setGlobalSearchHits([
+        ...requestRows.data.map(item => ({
+          kind: 'request' as const,
+          id: item.id,
+          title: item.name,
+          subtitle: `${item.method} ${item.urlTemplate}${(item.folderPath || []).length ? ` · ${(item.folderPath || []).join('/')}` : ''}`,
+        })),
+        ...(repoRows?.data || []).map(item => ({
+          kind: 'repository' as const,
+          id: item.id,
+          title: item.title,
+          subtitle: `${item.apiId} @ ${item.version}`,
+        })),
+        ...discoveryHits,
+      ]);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'جستجوی سراسری ناموفق بود.');
+      setGlobalSearchHits([]);
+    } finally {
+      setGlobalSearchLoading(false);
+    }
+  };
+
+  const moveRequestToFolder = async (request: ApiRequestDefinition, folderPath: string[]) => {
+    if (!activeContext || !canEdit) return;
+    try {
+      const updated = await apiConsoleApi.updateRequest(request.id, { folderPath }, activeContext);
+      if (updated) {
+        toast.success('Folder Request به‌روز شد.');
+        if ((folderPath || []).length) {
+          setKnownFolders(prev => Array.from(new Set([...prev, folderPath.join('/')])).sort((a, b) => a.localeCompare(b, 'fa')));
+        }
+        await reloadRequests(selectedRequest?.id === request.id ? request.id : undefined);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'جابجایی Request ناموفق بود.');
+    }
+  };
+
+  const createFolder = () => {
+    const name = folderDraft.trim();
+    if (!name) return;
+    const path = name.split('/').map(part => part.trim()).filter(Boolean);
+    if (!path.length) return;
+    const key = path.join('/');
+    setKnownFolders(prev => Array.from(new Set([...prev, key])).sort((a, b) => a.localeCompare(b, 'fa')));
+    setFilters(prev => ({ ...prev, folderPath: key, page: 1 }));
+    setFolderDraft('');
+    toast.success(`Folder «${key}» آماده است. Requestها را به آن منتقل کنید.`);
   };
 
   const updateDraft = (updater: (request: ApiRequestDefinition) => ApiRequestDefinition) => {
@@ -1527,7 +1949,10 @@ export const OnlineApiConsolePage: React.FC = () => {
       openCreateCollection();
       return;
     }
-    const request = await apiConsoleApi.createBlankRequest(selectedCollection.id, selectedCollection.applicationId, environments[0]?.id || 'env-development', activeContext);
+    const folderPath = filters.folderPath && filters.folderPath !== '__root__'
+      ? filters.folderPath.split('/').map(part => part.trim()).filter(Boolean)
+      : [];
+    const request = await apiConsoleApi.createBlankRequest(selectedCollection.id, selectedCollection.applicationId, environments[0]?.id || 'env-development', activeContext, folderPath);
     toast.success('Request جدید ساخته شد.');
     await reloadRequests(request.id);
     setPageMode('editor');
@@ -1544,10 +1969,33 @@ export const OnlineApiConsolePage: React.FC = () => {
     }
   };
 
-  const handleParsePostmanCollection = () => {
+  const handleParsePostmanCollection = async () => {
     if (!postmanText.trim()) return;
     try {
       const preview = parsePostmanCollectionImport(postmanText);
+      if (activeContext) {
+        try {
+          const scan = await apiConsoleApi.secretScan(postmanText, activeContext);
+          if (scan.findings?.length) {
+            preview.warnings = [
+              ...(preview.warnings || []),
+              ...scan.findings.map(id => `Potential secret pattern detected: ${id}`),
+            ];
+            if (scan.mode === 'block') {
+              toast.error('Secret در Collection شناسایی شد؛ Import مسدود است.');
+              setPostmanPreview({ ...preview, requestCount: 0, requests: [] });
+              return;
+            }
+            toast.warning('الگوی secret در Postman Collection پیدا شد؛ قبل از Import بررسی کنید.');
+          }
+        } catch (scanError) {
+          if (scanError instanceof Error && /Secret patterns detected/i.test(scanError.message)) {
+            toast.error(scanError.message);
+            setPostmanPreview(null);
+            return;
+          }
+        }
+      }
       setPostmanPreview(preview);
       if (preview.requestCount) {
         toast.success(`${preview.requestCount} Request از Collection خوانده شد.`);
@@ -1578,11 +2026,12 @@ export const OnlineApiConsolePage: React.FC = () => {
       const createdRequests: ApiRequestDefinition[] = [];
       for (const item of postmanPreview.requests) {
         const request = await apiConsoleApi.createRequest({
-          name: item.folderPath.length ? `${item.folderPath.join(' / ')} / ${item.name}` : item.name,
+          name: item.name,
           ...(item.description ? { description: item.description } : {}),
           collectionId: collection.id,
           applicationId: collection.applicationId,
           environmentId: environments[0]?.id || 'env-development',
+          folderPath: item.folderPath || [],
           normalizedRequest: item.normalizedRequest,
         }, activeContext);
         createdRequests.push(request);
@@ -1728,6 +2177,66 @@ export const OnlineApiConsolePage: React.FC = () => {
       toast.error(error instanceof Error ? error.message : 'خروجی Postman Collection ناموفق بود.');
     } finally {
       setExportingCollectionId(null);
+    }
+  };
+
+  const handleExportCollectionOpenApi = async (collectionId = filters.collectionId) => {
+    if (!collectionId) {
+      toast.warning('برای خروجی OpenAPI ابتدا یک Collection انتخاب کنید.');
+      return;
+    }
+    setExportingOpenApiId(collectionId);
+    try {
+      await apiConsoleApi.downloadCollectionOpenApi(collectionId);
+      toast.success('خروجی OpenAPI آماده شد.');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'خروجی OpenAPI ناموفق بود.');
+    } finally {
+      setExportingOpenApiId(null);
+    }
+  };
+
+  const handleExportRepositoryOpenApi = async (apiId: string, version: string) => {
+    setExportingOpenApiId(`${apiId}:${version}`);
+    try {
+      await apiConsoleApi.downloadRepositoryOpenApi(apiId, version);
+      toast.success('خروجی OpenAPI Repository آماده شد.');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'خروجی OpenAPI ناموفق بود.');
+    } finally {
+      setExportingOpenApiId(null);
+    }
+  };
+
+  const handleCreateContractSuite = async (collectionId = filters.collectionId) => {
+    if (!activeContext || !collectionId || !canEdit) return;
+    setContractSuiteLoading(true);
+    try {
+      const result = await apiConsoleApi.createContractSuite({ collectionId }, activeContext);
+      toast.success(`Contract Suite: ${result.assertionCount} assertion روی ${result.updatedRequests} Request اضافه شد.`);
+      await reloadRequests(selectedRequest?.id);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'ساخت Contract Suite ناموفق بود.');
+    } finally {
+      setContractSuiteLoading(false);
+    }
+  };
+
+  const handleCreateMock = async () => {
+    if (!activeContext || !selectedRequest || !canEdit) return;
+    setCreatingMock(true);
+    try {
+      const mock = await apiConsoleApi.createMock({
+        requestId: selectedRequest.id,
+        environmentId: selectedRequest.environmentId,
+      }, activeContext);
+      toast.success(`Mock ساخته شد: ${apiConsoleApi.mockServeUrl(mock.id)}`);
+      setWorkspaceView('mocks');
+      setPageMode('list');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'ساخت Mock ناموفق بود.');
+    } finally {
+      setCreatingMock(false);
     }
   };
 
@@ -1885,7 +2394,7 @@ export const OnlineApiConsolePage: React.FC = () => {
         }
       }
       const result = final
-        ? await apiConsoleApi.generateDocumentationFinal(requestForDocument.id, activeContext)
+        ? await apiConsoleApi.generateDocumentationFinal(requestForDocument.id, activeContext, docLanguage)
         : await apiConsoleApi.generateDocumentationPreview(requestForDocument.id, activeContext);
       if (final) {
         if (result.wordDocumentBase64) {
@@ -1897,7 +2406,7 @@ export const OnlineApiConsolePage: React.FC = () => {
         } else {
           downloadWordDocument(result.markdown, result.requestId ? requestForDocument.name : 'api-document');
         }
-        toast.success('سند نهایی Word بر اساس template تولید شد.');
+        toast.success(`سند نهایی Word (${docLanguage}) بر اساس template تولید شد.`);
         return;
       }
       setDocumentation(result.markdown);
@@ -1930,6 +2439,8 @@ export const OnlineApiConsolePage: React.FC = () => {
       purpose: '',
       introduction: '',
       description: request.latestReturnReason ? `دلیل بازگردانی قبلی: ${request.latestReturnReason}` : '',
+      ticketId: request.ticketId || '',
+      ticketUrl: request.ticketUrl || '',
     });
     setShareModalOpen(true);
   };
@@ -1951,7 +2462,7 @@ export const OnlineApiConsolePage: React.FC = () => {
       setShareConfirmOpen(false);
       setShareModalOpen(false);
       setShareTarget(null);
-      setShareForm({ purpose: '', introduction: '', description: '' });
+      setShareForm({ purpose: '', introduction: '', description: '', ticketId: '', ticketUrl: '' });
       await Promise.all([reloadRequests(shareTarget.id), loadShareReviews(), loadRepository()]);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'ارسال درخواست اشتراک API ناموفق بود.');
@@ -1985,6 +2496,10 @@ export const OnlineApiConsolePage: React.FC = () => {
 
   const handleAddRepositoryVersion = async () => {
     if (!activeContext || !repositoryDetail) return;
+    if (repositoryDetail.sharingStatus === 'DEPRECATED') {
+      toast.warning('نسخه منسوخ‌شده را نمی‌توان به Console اضافه کرد.');
+      return;
+    }
     try {
       const result = await apiConsoleApi.addRepositoryVersionToConsole(
         repositoryDetail.apiId,
@@ -2006,19 +2521,51 @@ export const OnlineApiConsolePage: React.FC = () => {
     if (!activeContext) return;
     setReviewModalOpen(true);
     setReviewDetail(share);
+    setReviewTicketForm({ ticketId: share.ticketId || '', ticketUrl: share.ticketUrl || '' });
     setSelectedConsumerIds([]);
+    setReviewCommentText('');
+    setReviewChecklist({
+      ...EMPTY_REVIEW_CHECKLIST,
+      ...(share.checklist || {}),
+      consumersSpecified: (share.consumers || []).length > 0 || share.checklist?.consumersSpecified === true,
+    });
     try {
       const [detail, candidates] = await Promise.all([
         apiConsoleApi.getShareReview(share.id, activeContext),
         apiConsoleApi.getConsumerCandidates(activeContext),
       ]);
       setReviewDetail(detail);
+      setReviewTicketForm({ ticketId: detail.ticketId || '', ticketUrl: detail.ticketUrl || '' });
       setConsumerCandidates(candidates);
       setSelectedConsumerIds((detail.consumers || []).map(consumer =>
         consumer.consumerType === 'USER' ? `USER:${consumer.userId}` : `ROLE:${consumer.roleKey}`
       ));
+      setReviewChecklist({
+        ...EMPTY_REVIEW_CHECKLIST,
+        ...(detail.checklist || {}),
+        consumersSpecified: (detail.consumers || []).length > 0 || detail.checklist?.consumersSpecified === true,
+      });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'بارگذاری جزئیات درخواست اشتراک ناموفق بود.');
+    }
+  };
+
+  const handleSaveReviewTicket = async () => {
+    if (!activeContext || !reviewDetail) return;
+    setReviewTicketSaving(true);
+    try {
+      const updated = await apiConsoleApi.updateShareReviewTicket(reviewDetail.id, {
+        ticketId: reviewTicketForm.ticketId.trim() || undefined,
+        ticketUrl: reviewTicketForm.ticketUrl.trim() || undefined,
+      }, activeContext);
+      setReviewDetail(updated);
+      setReviewTicketForm({ ticketId: updated.ticketId || '', ticketUrl: updated.ticketUrl || '' });
+      toast.success('اطلاعات Ticket ذخیره شد.');
+      await loadShareReviews();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'ذخیره Ticket ناموفق بود.');
+    } finally {
+      setReviewTicketSaving(false);
     }
   };
 
@@ -2087,9 +2634,17 @@ export const OnlineApiConsolePage: React.FC = () => {
       toast.warning('انتخاب حداقل یک Consumer الزامی است.');
       return;
     }
+    const checklist: ApiReviewChecklist = {
+      ...reviewChecklist,
+      consumersSpecified: true,
+    };
+    if (!REVIEW_CHECKLIST_LABELS.every(item => checklist[item.key])) {
+      toast.warning('تأیید بدون تکمیل چک‌لیست Review ممکن نیست.');
+      return;
+    }
     setReviewActionLoading(true);
     try {
-      await apiConsoleApi.approveShareReview(reviewDetail.id, consumers, reviewDetail.rowVersion, activeContext);
+      await apiConsoleApi.approveShareReview(reviewDetail.id, consumers, reviewDetail.rowVersion, activeContext, checklist);
       toast.success('درخواست اشتراک API تأیید شد و در Repository منتشر شد.');
       setApproveModalOpen(false);
       setReviewModalOpen(false);
@@ -2130,17 +2685,170 @@ export const OnlineApiConsolePage: React.FC = () => {
       toast.warning('Version جدید و Change Log الزامی هستند.');
       return;
     }
+    if (versionForm.breakingChange && !versionForm.migrationNote.trim()) {
+      toast.warning('برای Breaking Change، Migration Note الزامی است.');
+      return;
+    }
     setVersioning(true);
     try {
-      const created = await apiConsoleApi.createVersion(selectedRequest.id, versionForm, activeContext);
+      const created = await apiConsoleApi.createVersion(selectedRequest.id, {
+        version: versionForm.version.trim(),
+        changeLog: versionForm.changeLog.trim(),
+        breakingChange: versionForm.breakingChange,
+        migrationNote: versionForm.migrationNote.trim() || undefined,
+      }, activeContext);
       toast.success('Version جدید API ساخته شد و برای انتشار باید ارسال شود.');
       setVersionModalOpen(false);
-      setVersionForm({ version: '', changeLog: '' });
+      setVersionForm({ version: '', changeLog: '', breakingChange: false, migrationNote: '' });
       await reloadRequests(created.id);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'ساخت Version جدید ناموفق بود.');
     } finally {
       setVersioning(false);
+    }
+  };
+
+  const handleCollectionRun = async () => {
+    if (!activeContext || !filters.collectionId) return;
+    setCollectionRunning(true);
+    try {
+      const result = await apiConsoleApi.runCollection(filters.collectionId, {
+        stopOnFail: collectionRunStopOnFail,
+        environmentId: selectedEnvironment?.id,
+      }, activeContext);
+      setLatestCollectionRun(result);
+      toast.success(`اجرای Collection: ${result.summary.passed} موفق، ${result.summary.failed} ناموفق`);
+      await loadRecentTestRuns(filters.collectionId);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'اجرای Collection ناموفق بود.');
+    } finally {
+      setCollectionRunning(false);
+    }
+  };
+
+  const openCollectionRunModal = async () => {
+    if (!filters.collectionId) {
+      toast.warning('ابتدا یک Collection انتخاب کنید.');
+      return;
+    }
+    setLatestCollectionRun(null);
+    setCollectionRunStopOnFail(true);
+    setCollectionRunModalOpen(true);
+    await loadRecentTestRuns(filters.collectionId);
+  };
+
+  const handleRequestVisibilityChange = async (visibility: ApiVisibility) => {
+    if (!activeContext || !selectedRequest) return;
+    setOwnershipSaving(true);
+    try {
+      const updated = await apiConsoleApi.updateRequestVisibility(selectedRequest.id, visibility, activeContext);
+      setSelectedRequest(updated);
+      setSavedRequest(updated);
+      toast.success(visibility === 'PROJECT_SHARED' ? 'Visibility روی Project Shared تنظیم شد.' : 'Visibility روی Private تنظیم شد.');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'تغییر Visibility ناموفق بود.');
+    } finally {
+      setOwnershipSaving(false);
+    }
+  };
+
+  const handleTransferOwnership = async () => {
+    if (!activeContext || !selectedRequest) return;
+    if (!ownershipTransferUserId.trim()) {
+      toast.warning('شناسه کاربر مقصد الزامی است.');
+      return;
+    }
+    setOwnershipSaving(true);
+    try {
+      const updated = await apiConsoleApi.transferRequestOwnership(selectedRequest.id, ownershipTransferUserId.trim(), activeContext);
+      setSelectedRequest(updated);
+      setSavedRequest(updated);
+      setOwnershipTransferUserId('');
+      toast.success('مالکیت Request منتقل شد.');
+      await reloadRequests(updated.id);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'انتقال مالکیت ناموفق بود.');
+    } finally {
+      setOwnershipSaving(false);
+    }
+  };
+
+  const handleSaveCoOwners = async () => {
+    if (!activeContext || !selectedRequest) return;
+    const coOwnerIds = coOwnersInput.split(',').map(item => item.trim()).filter(Boolean);
+    setOwnershipSaving(true);
+    try {
+      const updated = await apiConsoleApi.setRequestCoOwners(selectedRequest.id, coOwnerIds, activeContext);
+      setSelectedRequest(updated);
+      setSavedRequest(updated);
+      setCoOwnersInput((updated.coOwnerIds || []).join(', '));
+      toast.success('لیست Co-ownerها ذخیره شد.');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'ذخیره Co-ownerها ناموفق بود.');
+    } finally {
+      setOwnershipSaving(false);
+    }
+  };
+
+  const handleAddReviewComment = async () => {
+    if (!activeContext || !reviewDetail) return;
+    if (!reviewCommentText.trim()) {
+      toast.warning('متن نظر الزامی است.');
+      return;
+    }
+    setReviewCommentSaving(true);
+    try {
+      const updated = await apiConsoleApi.addShareReviewComment(reviewDetail.id, reviewCommentText.trim(), activeContext);
+      setReviewDetail(updated);
+      setReviewCommentText('');
+      toast.success('نظر ثبت شد.');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'ثبت نظر ناموفق بود.');
+    } finally {
+      setReviewCommentSaving(false);
+    }
+  };
+
+  const handleReviewChecklistChange = async (patch: Partial<ApiReviewChecklist>) => {
+    if (!activeContext || !reviewDetail) return;
+    const next = { ...reviewChecklist, ...patch };
+    setReviewChecklist(next);
+    try {
+      const updated = await apiConsoleApi.updateShareReviewChecklist(reviewDetail.id, next, activeContext);
+      setReviewDetail(updated);
+      setReviewChecklist({ ...EMPTY_REVIEW_CHECKLIST, ...(updated.checklist || next) });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'ذخیره چک‌لیست ناموفق بود.');
+    }
+  };
+
+  const handleDeprecateVersion = async () => {
+    if (!activeContext || !repositoryDetail) return;
+    if (!deprecateForm.reason.trim()) {
+      toast.warning('دلیل منسوخ‌سازی الزامی است.');
+      return;
+    }
+    setDeprecating(true);
+    try {
+      await apiConsoleApi.deprecateRepositoryVersion(
+        repositoryDetail.apiId,
+        repositoryDetail.version,
+        {
+          reason: deprecateForm.reason.trim(),
+          effectiveAt: deprecateForm.effectiveAt.trim() || undefined,
+        },
+        activeContext
+      );
+      toast.success('نسخه API منسوخ شد.');
+      setDeprecateModalOpen(false);
+      setDeprecateForm({ reason: '', effectiveAt: '' });
+      setRepositoryModalOpen(false);
+      setRepositoryDetail(null);
+      await loadRepository();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'منسوخ‌سازی نسخه ناموفق بود.');
+    } finally {
+      setDeprecating(false);
     }
   };
 
@@ -2186,6 +2894,13 @@ export const OnlineApiConsolePage: React.FC = () => {
       title: 'Request',
       render: (item: ApiRequestDefinition) => (
         <div>
+          <div
+            draggable={canEdit}
+            onDragStart={(event) => {
+              event.dataTransfer.setData('text/request-id', item.id);
+              event.dataTransfer.effectAllowed = 'move';
+            }}
+          >
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-medium text-gray-900">{item.name}</span>
             <Badge variant={classBadgeVariant(item.classification.type)} size="sm">
@@ -2204,14 +2919,42 @@ export const OnlineApiConsolePage: React.FC = () => {
           <p className="mt-1 max-w-[18rem] truncate text-left font-mono text-xs text-gray-500" dir="ltr">
             {item.method} {item.urlTemplate}
           </p>
+          {(item.folderPath || []).length > 0 && (
+            <p className="mt-1 text-xs text-gray-500" dir="ltr">{(item.folderPath || []).join(' / ')}</p>
+          )}
+          </div>
         </div>
+      ),
+    },
+    {
+      key: 'folder',
+      title: 'Folder',
+      render: (item: ApiRequestDefinition) => (
+        <select
+          className="max-w-[10rem] rounded border border-gray-300 px-2 py-1 text-xs"
+          value={(item.folderPath || []).join('/')}
+          disabled={!canEdit}
+          onClick={(event) => event.stopPropagation()}
+          onChange={(event) => {
+            const value = event.target.value;
+            void moveRequestToFolder(item, value ? value.split('/').filter(Boolean) : []);
+          }}
+        >
+          <option value="">(root)</option>
+          {knownFolders.map(folder => (
+            <option key={folder} value={folder}>{folder}</option>
+          ))}
+        </select>
       ),
     },
     {
       key: 'apiId',
       title: 'API ID',
+      className: 'max-w-[11rem]',
       render: (item: ApiRequestDefinition) => (
-        <span className="font-mono text-xs text-gray-600" dir="ltr">{item.apiId || item.id}</span>
+        <span className="block max-w-[11rem] truncate font-mono text-xs text-gray-600" dir="ltr" title={item.apiId || item.id}>
+          {item.apiId || item.id}
+        </span>
       ),
     },
     ...(shouldShowSystemColumn ? [{
@@ -2265,99 +3008,119 @@ export const OnlineApiConsolePage: React.FC = () => {
   ];
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <>
+    <AppShell
+      activeView={workspaceView}
+      onNavigate={(id: WorkspaceNavId) => {
+        setPageMode('list');
+        setWorkspaceView(id);
+      }}
+      navGroups={navGroups}
+      mobileOpen={mobileNavOpen}
+      onMobileClose={() => setMobileNavOpen(false)}
+      topBar={(
       <Header
-        title="Online API Console"
+        title={pageMode === 'editor' ? (selectedRequest?.name || 'ویرایش درخواست') : workspaceTitle}
+        subtitle={undefined}
         onRefresh={loadAll}
         refreshing={loading}
+        onMenuClick={() => setMobileNavOpen(true)}
         actions={(
-          <div className="flex flex-wrap gap-2">
-            <Button variant={runtimeConnected ? 'secondary' : 'ghost'} size="sm" icon={<PlayCircle className="h-4 w-4" />} onClick={() => { setPageMode('list'); setWorkspaceView('runtime'); }}>
-              Runtime: {runtimeConnected ? 'متصل' : 'قطع'}
+          <div className="relative flex flex-wrap gap-2">
+            <div className="relative">
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Bell className="h-4 w-4" />}
+                onClick={() => {
+                  setNotificationsOpen(open => !open);
+                  void loadNotifications();
+                }}
+              >
+                اعلان‌ها
+                {(notificationFeed?.unreadCount || 0) > 0 && (
+                  <span className="mr-1 rounded-md bg-[var(--theme-danger)] px-1.5 text-[10px] text-white">{notificationFeed?.unreadCount}</span>
+                )}
+              </Button>
+              {notificationsOpen && (
+                <div className="absolute left-0 z-30 mt-2 w-80 rounded-[var(--theme-radius)] border border-[var(--theme-border)] bg-[var(--theme-surface-raised)] p-2 shadow-lg sm:left-auto sm:right-0">
+                  <div className="mb-2 flex items-center justify-between gap-2 px-1">
+                    <p className="text-sm font-medium text-[var(--theme-text)]">صندوق اعلان</p>
+                    <Button size="sm" variant="ghost" onClick={() => { void handleMarkAllNotificationsRead(); }}>
+                      همه خوانده
+                    </Button>
+                  </div>
+                  <div className="max-h-72 space-y-2 overflow-auto">
+                    {(notificationFeed?.data || []).length === 0 ? (
+                      <p className="px-2 py-4 text-center text-xs text-[var(--theme-text-subtle)]">اعلانی نیست</p>
+                    ) : (
+                      (notificationFeed?.data || []).map(item => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          className={`w-full rounded-md border px-2 py-2 text-right text-xs ${item.isRead ? 'border-[var(--theme-border)] bg-[var(--theme-surface)] text-[var(--theme-text-muted)]' : 'border-[var(--theme-accent)]/25 bg-[var(--theme-accent-soft)] text-[var(--theme-text)]'}`}
+                          onClick={() => { void handleMarkNotificationRead(item); }}
+                        >
+                          <p className="font-medium">{item.title}</p>
+                          <p className="mt-1 text-[var(--theme-text-muted)]">{item.message}</p>
+                          <p className="mt-1 font-mono text-[10px] text-[var(--theme-text-subtle)]" dir="ltr">{item.createdAt}</p>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+            <Button variant="secondary" size="sm" icon={<Search className="h-4 w-4" />} onClick={() => setGlobalSearchOpen(true)}>
+              جستجو
             </Button>
-            {canManageGeneralSettings && <Button variant="secondary" size="sm" icon={<ShieldCheck className="h-4 w-4" />} onClick={runSelfCheck}>تست parser</Button>}
+            <span className={`ac-chip ${runtimeConnected ? 'border-emerald-200 text-emerald-700' : ''}`}>
+              Runtime {runtimeConnected ? 'متصل' : 'قطع'}
+            </span>
+            {canManageGeneralSettings && <Button variant="ghost" size="sm" icon={<ShieldCheck className="h-4 w-4" />} onClick={runSelfCheck}>Self-check</Button>}
           </div>
         )}
       />
-
-      <main className="space-y-6 p-4 sm:p-6">
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3 xl:grid-cols-6">
-          <StatCard title="Requestهای ذخیره‌شده" value={stats.total} icon={<Braces className="h-6 w-6" />} />
-          <StatCard title="Core Query" value={stats.coreQuery} icon={<FileText className="h-6 w-6" />} variant="primary" />
-          <StatCard title="Core Command" value={stats.coreCommand} icon={<AlertTriangle className="h-6 w-6" />} variant="danger" />
-          <StatCard title="منتشرشده در Repository" value={stats.approved} icon={<ShieldCheck className="h-6 w-6" />} variant="success" />
-          <StatCard title="در انتظار تأیید مدیرسیستم" value={stats.pendingReview} icon={<Clock className="h-6 w-6" />} variant="warning" />
-          <StatCard title="History همین Request" value={stats.history} icon={<History className="h-6 w-6" />} />
-        </div>
-
+      )}
+    >
+      <main className={pageMode === 'list' && workspaceView === 'requests' ? 'ac-workspace-fill' : 'min-h-0 min-w-0 max-w-full'}>
         {pageMode === 'list' ? (
-          <section className="space-y-4">
-            <Card padding="sm">
-              <div className="flex flex-wrap items-center gap-2">
-                {[
-                  { id: 'requests' as const, label: 'Requestهای من', count: requests?.total || 0 },
-                  { id: 'repository' as const, label: 'Repository APIها', count: repositoryRows?.total || 0 },
-                  { id: 'runtime' as const, label: 'Runtime و Discovery', count: runtimeConnected ? 1 : 0 },
-                  { id: 'reviews' as const, label: 'تأیید اشتراک API', count: shareReviews?.total || 0, hidden: !canReviewShares },
-                  { id: 'users' as const, label: 'مدیریت کاربران', count: adminUsers.length, hidden: !canManageGeneralSettings },
-                ].filter(item => !item.hidden).map(item => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => setWorkspaceView(item.id)}
-                    className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition ${
-                      workspaceView === item.id ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                    }`}
-                  >
-                    <span>{item.label}</span>
-                    <span className={`min-w-6 rounded-full px-2 py-0.5 text-center text-xs ${workspaceView === item.id ? 'bg-white/20' : 'bg-white'}`}>
-                      {item.count}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </Card>
-
+          <section className={workspaceView === 'requests' ? 'ac-workspace-fill animate-fadeIn' : 'min-w-0 space-y-3 animate-fadeIn'}>
             {workspaceView === 'requests' && (
               <>
-            <Card padding="sm">
-              <div className="space-y-3">
+            <Card padding="sm" className="shrink-0">
+              <div className="space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <h2 className="text-sm font-semibold text-gray-900">Requestهای من</h2>
-                  </div>
-                  <div className="flex flex-wrap items-center justify-end gap-2">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      icon={<FolderPlus className="h-4 w-4" />}
-                      onClick={openCreateCollection}
-                      disabled={!canCreate}
-                    >
-                      Collection جدید
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      icon={<Download className="h-4 w-4" />}
-                      onClick={() => handleExportPostmanCollection()}
-                      loading={!!filters.collectionId && exportingCollectionId === filters.collectionId}
-                      disabled={!collections.length}
-                    >
-                      Export Postman
-                    </Button>
-                    <Button size="sm" variant="secondary" icon={<Upload className="h-4 w-4" />} onClick={openImportCurl} disabled={!canCreate}>
-                      Import cURL
-                    </Button>
-                    <Button size="sm" variant="secondary" icon={<Upload className="h-4 w-4" />} onClick={openImportPostmanCollection} disabled={!canCreate}>
-                      Import Collection
-                    </Button>
+                  <h2 className="text-sm font-semibold text-[var(--theme-text)]">درخواست‌ها</h2>
+                  <div className="relative flex flex-wrap items-center justify-end gap-2">
                     <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={handleNewRequest} disabled={!canCreate}>
-                      Request جدید
+                      درخواست جدید
                     </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      icon={<PlayCircle className="h-4 w-4" />}
+                      onClick={() => void openCollectionRunModal()}
+                      disabled={!filters.collectionId || !canExecute}
+                    >
+                      اجرای Collection
+                    </Button>
+                    <Button size="sm" variant="secondary" onClick={() => setRequestsMoreOpen(open => !open)}>
+                      بیشتر
+                    </Button>
+                    {requestsMoreOpen ? (
+                      <div className="absolute left-0 top-full z-20 mt-1 w-56 rounded-[var(--theme-radius)] border border-[var(--theme-border)] bg-[var(--theme-surface-raised)] p-1 shadow-lg">
+                        <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!canCreate} onClick={() => { setRequestsMoreOpen(false); openCreateCollection(); }}>Collection جدید</button>
+                        <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!canCreate} onClick={() => { setRequestsMoreOpen(false); openImportCurl(); }}>Import cURL</button>
+                        <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!canCreate} onClick={() => { setRequestsMoreOpen(false); openImportPostmanCollection(); }}>Import Collection</button>
+                        <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!collections.length} onClick={() => { setRequestsMoreOpen(false); handleExportPostmanCollection(); }}>Export Postman</button>
+                        <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!filters.collectionId} onClick={() => { setRequestsMoreOpen(false); void handleExportCollectionOpenApi(); }}>Export OpenAPI</button>
+                        <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!filters.collectionId || !canEdit} onClick={() => { setRequestsMoreOpen(false); void handleCreateContractSuite(); }}>Contract Suite</button>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
-                <div className="grid grid-cols-1 items-end gap-2 md:grid-cols-[minmax(220px,1fr)_180px_180px_auto]">
+                <div className="grid grid-cols-1 items-end gap-2 md:grid-cols-[minmax(180px,1fr)_160px_160px_auto]">
                   <Input
                     aria-label="جستجوی Request"
                     value={filters.search}
@@ -2365,13 +3128,13 @@ export const OnlineApiConsolePage: React.FC = () => {
                     onKeyDown={(event) => {
                       if (event.key === 'Enter') reloadRequests();
                     }}
-                    placeholder="جستجو در نام، URL، Service ID یا operation path"
+                    placeholder="نام، URL، serviceId…"
                     className="py-1.5 text-sm"
                   />
                   <Select
                     aria-label="Collection"
                     value={filters.collectionId}
-                    onChange={(event) => setFilters(prev => ({ ...prev, collectionId: event.target.value, page: 1 }))}
+                    onChange={(event) => setFilters(prev => ({ ...prev, collectionId: event.target.value, folderPath: '', page: 1 }))}
                     className="py-1.5 text-sm"
                     options={[
                       { value: '', label: 'همه Collectionها' },
@@ -2384,8 +3147,8 @@ export const OnlineApiConsolePage: React.FC = () => {
                     onChange={(event) => setFilters(prev => ({ ...prev, classificationType: event.target.value, page: 1 }))}
                     className="py-1.5 text-sm"
                     options={[
-                      { value: '', label: 'همه نوع‌ها' },
-                      { value: 'GENERIC_HTTP', label: 'Generic HTTP' },
+                      { value: '', label: 'همه انواع' },
+                      { value: 'GENERIC_HTTP', label: 'HTTP عمومی' },
                       { value: 'CORE_QUERY', label: 'Core Query' },
                       { value: 'CORE_COMMAND', label: 'Core Command' },
                     ]}
@@ -2397,6 +3160,73 @@ export const OnlineApiConsolePage: React.FC = () => {
               </div>
             </Card>
 
+            <div className="ac-fill-panel grid min-h-0 grid-cols-1 gap-2 lg:grid-cols-[minmax(0,12.5rem)_minmax(0,1fr)]">
+              <Card padding="sm" className="flex min-h-0 flex-col overflow-hidden">
+                <div className="mb-2 shrink-0 space-y-2">
+                  <h3 className="text-sm font-semibold text-[var(--theme-text)]">پوشه‌ها</h3>
+                  <div className="flex gap-1">
+                    <Input
+                      aria-label="Folder جدید"
+                      value={folderDraft}
+                      onChange={(event) => setFolderDraft(event.target.value)}
+                      placeholder="auth/login"
+                      className="py-1 text-xs"
+                      dir="ltr"
+                    />
+                    <Button size="sm" variant="secondary" onClick={createFolder} disabled={!canEdit}>+</Button>
+                  </div>
+                </div>
+                <div className="min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain pe-1">
+                  <button type="button" className={`w-full rounded-md px-2 py-1.5 text-right text-xs ${!filters.folderPath ? 'bg-[var(--theme-sidebar)] text-white' : 'hover:bg-[var(--theme-surface-muted)]'}`} onClick={() => setFilters(prev => ({ ...prev, folderPath: '', page: 1 }))}>همه</button>
+                  <button type="button" className={`w-full rounded-md px-2 py-1.5 text-right text-xs ${filters.folderPath === '__root__' ? 'bg-[var(--theme-sidebar)] text-white' : 'hover:bg-[var(--theme-surface-muted)]'}`} onClick={() => setFilters(prev => ({ ...prev, folderPath: '__root__', page: 1 }))}>(root)</button>
+                  {knownFolders.map(folder => (
+                    <div key={folder} className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        className={`min-w-0 flex-1 rounded-md px-2 py-1.5 text-left font-mono text-xs ${filters.folderPath === folder ? 'bg-[var(--theme-sidebar)] text-white' : 'hover:bg-[var(--theme-surface-muted)]'}`}
+                        dir="ltr"
+                        onClick={() => setFilters(prev => ({ ...prev, folderPath: folder, page: 1 }))}
+                        onDragOver={(event) => event.preventDefault()}
+                        onDrop={(event) => {
+                          event.preventDefault();
+                          const requestId = event.dataTransfer.getData('text/request-id');
+                          const request = (requests?.data || []).find(item => item.id === requestId);
+                          if (request) void moveRequestToFolder(request, folder.split('/').filter(Boolean));
+                        }}
+                      >
+                        {folder}
+                      </button>
+                      {canEdit && (
+                        <button
+                          type="button"
+                          className="rounded px-1 text-xs text-[var(--theme-text-subtle)] hover:bg-red-50 hover:text-red-600"
+                          title="حذف Folder خالی از فهرست"
+                          onClick={() => {
+                            const nextName = window.prompt('تغییرنام Folder (خالی = حذف از فهرست):', folder);
+                            if (nextName === null) return;
+                            const trimmed = nextName.trim();
+                            if (!trimmed) {
+                              setKnownFolders(prev => prev.filter(item => item !== folder));
+                              if (filters.folderPath === folder) setFilters(prev => ({ ...prev, folderPath: '', page: 1 }));
+                              return;
+                            }
+                            const parts = trimmed.split('/').map(part => part.trim()).filter(Boolean);
+                            const key = parts.join('/');
+                            setKnownFolders(prev => Array.from(new Set([...prev.filter(item => item !== folder), key])).sort((a, b) => a.localeCompare(b, 'fa')));
+                            const toMove = (requests?.data || []).filter(item => (item.folderPath || []).join('/') === folder);
+                            void Promise.all(toMove.map(item => moveRequestToFolder(item, parts)));
+                            if (filters.folderPath === folder) setFilters(prev => ({ ...prev, folderPath: key, page: 1 }));
+                          }}
+                        >
+                          ✎
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </Card>
+              <div className="ac-table-shell min-w-0">
+                <div className="ac-table-body">
             <Table
               columns={requestColumns}
               data={requests?.data || []}
@@ -2406,9 +3236,12 @@ export const OnlineApiConsolePage: React.FC = () => {
               enableClientFilter={false}
               enableColumnChooser={false}
               enableExport={false}
-              rowClassName={(item) => selectingRequestId === item.id ? 'bg-blue-50 opacity-80' : selectedRequest?.id === item.id ? 'bg-blue-50' : ''}
+              bordered={false}
+              rowClassName={(item) => selectingRequestId === item.id ? 'bg-[var(--theme-accent-soft)] opacity-80' : selectedRequest?.id === item.id ? 'bg-[var(--theme-accent-soft)]' : ''}
             />
+                </div>
             {requests && (
+              <div className="ac-table-foot">
               <Pagination
                 page={requests.page}
                 totalPages={requests.totalPages}
@@ -2417,7 +3250,10 @@ export const OnlineApiConsolePage: React.FC = () => {
                 onPageChange={(page) => setFilters(prev => ({ ...prev, page }))}
                 onLimitChange={(limit) => setFilters(prev => ({ ...prev, page: 1, limit }))}
               />
+              </div>
             )}
+              </div>
+            </div>
               </>
             )}
 
@@ -2444,6 +3280,57 @@ export const OnlineApiConsolePage: React.FC = () => {
               />
             )}
 
+            {workspaceView === 'environments' && canManageEnvironments && activeContext && (
+              <EnvironmentManagerSection
+                environments={environments}
+                canManageProtected={canManageProtectedEnvironments}
+                onChanged={async () => {
+                  const rows = await apiConsoleApi.getEnvironments();
+                  setEnvironments(rows);
+                }}
+                context={activeContext}
+              />
+            )}
+
+            {workspaceView === 'activity' && (
+              <ActivityFeedPanel
+                rows={activityRows}
+                loading={activityLoading}
+                page={activityFilters.page}
+                limit={activityFilters.limit}
+                onRefresh={() => void loadActivity()}
+                onPageChange={(page) => setActivityFilters(prev => ({ ...prev, page }))}
+                onLimitChange={(limit) => setActivityFilters(prev => ({ ...prev, page: 1, limit }))}
+              />
+            )}
+
+            {workspaceView === 'runners' && isSystemAdmin && activeContext && (
+              <RunnersAdminSection context={activeContext} />
+            )}
+
+            {workspaceView === 'branding' && isSystemAdmin && activeContext && (
+              <BrandingAdminSection context={activeContext} />
+            )}
+
+            {workspaceView === 'org-policy' && isSystemAdmin && activeContext && (
+              <OrgPolicySection context={activeContext} />
+            )}
+
+            {workspaceView === 'compliance' && (canViewUsageReports || isSystemAdmin) && activeContext && (
+              <ComplianceReportSection context={activeContext} />
+            )}
+
+            {workspaceView === 'jit' && activeContext && (
+              <JitAccessSection
+                context={activeContext}
+                canApprove={isSystemAdmin || canManageProtectedEnvironments}
+              />
+            )}
+
+            {workspaceView === 'mocks' && canEdit && activeContext && (
+              <MocksSection context={activeContext} applicationId={typeof appId === 'string' ? appId : undefined} />
+            )}
+
             {workspaceView === 'users' && canManageGeneralSettings && (
               <UserManagementSection
                 users={adminUsers}
@@ -2451,8 +3338,367 @@ export const OnlineApiConsolePage: React.FC = () => {
                 search={adminUserSearch}
                 onSearch={setAdminUserSearch}
                 onRefresh={loadAdminUsers}
-                onChangeSystemAdmin={(user, enabled) => setAdminRoleTarget({ user, enabled })}
+                onChangeRole={(user, role, enabled) => setAdminRoleTarget({
+                  user,
+                  role,
+                  enabled,
+                  applicationId: typeof appId === 'string' && appId ? appId : 'ALL',
+                })}
               />
+            )}
+
+            {workspaceView === 'audit' && canManageGeneralSettings && (
+              <Card padding="sm">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="text-sm font-semibold text-gray-900">Audit Explorer</h2>
+                    <p className="text-xs text-gray-500">رویدادهای امنیتی و عملیاتی — بدون secret خام.</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      icon={<Download className="h-4 w-4" />}
+                      disabled={!auditRows?.data?.length}
+                      onClick={() => {
+                        const rows = auditRows?.data || [];
+                        downloadJsonFile(rows, `audit-export-${new Date().toISOString().slice(0, 10)}.json`);
+                      }}
+                    >
+                      Export JSON
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      icon={<Download className="h-4 w-4" />}
+                      disabled={!auditRows?.data?.length}
+                      onClick={() => {
+                        const rows = auditRows?.data || [];
+                        const csv = rowsToCsv(
+                          ['createdAt', 'eventType', 'actorUserId', 'actorRole', 'details'],
+                          rows.map(row => [
+                            row.createdAt,
+                            row.eventType,
+                            row.actorUserId,
+                            row.actorRole,
+                            JSON.stringify(row.details || {}),
+                          ])
+                        );
+                        downloadTextFile(csv, `audit-export-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv;charset=utf-8');
+                      }}
+                    >
+                      Export CSV
+                    </Button>
+                    <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={loadAuditLog} loading={auditLoading}>
+                      Refresh
+                    </Button>
+                  </div>
+                </div>
+                <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-2">
+                  <Input
+                    label="Action"
+                    value={auditFilters.action}
+                    onChange={(event) => setAuditFilters(prev => ({ ...prev, page: 1, action: event.target.value }))}
+                    dir="ltr"
+                  />
+                  <Input
+                    label="User ID"
+                    value={auditFilters.userId}
+                    onChange={(event) => setAuditFilters(prev => ({ ...prev, page: 1, userId: event.target.value }))}
+                    dir="ltr"
+                  />
+                </div>
+                <Table
+                  columns={[
+                    {
+                      key: 'createdAt',
+                      title: 'زمان',
+                      render: (row: ApiAuditEvent) => <span className="font-mono text-xs" dir="ltr">{row.createdAt}</span>,
+                    },
+                    {
+                      key: 'eventType',
+                      title: 'Action',
+                      render: (row: ApiAuditEvent) => <Badge size="sm">{row.eventType}</Badge>,
+                    },
+                    {
+                      key: 'actor',
+                      title: 'Actor',
+                      render: (row: ApiAuditEvent) => (
+                        <div>
+                          <p className="font-mono text-xs" dir="ltr">{row.actorUserId}</p>
+                          <p className="text-xs text-gray-500">{roleLabel(row.actorRole)}</p>
+                        </div>
+                      ),
+                    },
+                    {
+                      key: 'details',
+                      title: 'Details',
+                      render: (row: ApiAuditEvent) => {
+                        const requestId = typeof row.details?.requestId === 'string' ? row.details.requestId : '';
+                        return (
+                          <div className="space-y-2">
+                            <pre className="max-w-md overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] text-gray-600" dir="ltr">
+                              {JSON.stringify(row.details || {}, null, 2)}
+                            </pre>
+                            {requestId ? (
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={async () => {
+                                  try {
+                                    setWorkspaceView('requests');
+                                    await reloadRequests(requestId);
+                                  } catch (error) {
+                                    toast.error(error instanceof Error ? error.message : 'باز کردن Request ناموفق بود.');
+                                  }
+                                }}
+                              >
+                                باز کردن Request
+                              </Button>
+                            ) : null}
+                          </div>
+                        );
+                      },
+                    },
+                  ]}
+                  data={auditRows?.data || []}
+                  loading={auditLoading}
+                  emptyMessage="رویداد Audit ثبت نشده است"
+                  enableClientFilter={false}
+                  enableColumnChooser={false}
+                  enableExport={false}
+                />
+                {auditRows && (
+                  <Pagination
+                    page={auditRows.page}
+                    totalPages={auditRows.totalPages}
+                    total={auditRows.total}
+                    limit={auditRows.limit}
+                    onPageChange={(page) => setAuditFilters(prev => ({ ...prev, page }))}
+                    onLimitChange={(limit) => setAuditFilters(prev => ({ ...prev, page: 1, limit }))}
+                  />
+                )}
+              </Card>
+            )}
+
+            {workspaceView === 'reports' && (
+              <div className="space-y-4">
+                <Card padding="sm">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h2 className="text-sm font-semibold text-gray-900">وضعیت workspace</h2>
+                      <p className="text-xs text-gray-500">متریک‌های محلی صفحه جاری — جدا از گزارش مصرف Repository.</p>
+                    </div>
+                    <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={loadAll} loading={loading}>
+                      Refresh
+                    </Button>
+                  </div>
+                  <div className="overflow-auto rounded-lg border border-gray-200" dir="ltr">
+                    <table className="min-w-full divide-y divide-gray-200 text-sm">
+                      <thead className="bg-gray-50 text-left text-xs uppercase tracking-wide text-gray-500">
+                        <tr>
+                          <th className="px-3 py-2 font-medium">Metric</th>
+                          <th className="px-3 py-2 font-medium">Value</th>
+                          <th className="px-3 py-2 font-medium">Scope</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100 bg-white font-mono text-xs text-gray-800">
+                        <tr>
+                          <td className="px-3 py-2">saved_requests</td>
+                          <td className="px-3 py-2">{stats.total}</td>
+                          <td className="px-3 py-2 text-gray-500">current project</td>
+                        </tr>
+                        <tr>
+                          <td className="px-3 py-2">core_query</td>
+                          <td className="px-3 py-2">{stats.coreQuery}</td>
+                          <td className="px-3 py-2 text-gray-500">loaded page</td>
+                        </tr>
+                        <tr>
+                          <td className="px-3 py-2">core_command</td>
+                          <td className="px-3 py-2">{stats.coreCommand}</td>
+                          <td className="px-3 py-2 text-gray-500">loaded page</td>
+                        </tr>
+                        <tr>
+                          <td className="px-3 py-2">repository_approved</td>
+                          <td className="px-3 py-2">{stats.approved}</td>
+                          <td className="px-3 py-2 text-gray-500">loaded page</td>
+                        </tr>
+                        <tr>
+                          <td className="px-3 py-2">pending_share_reviews</td>
+                          <td className="px-3 py-2">{stats.pendingReview}</td>
+                          <td className="px-3 py-2 text-gray-500">admin queue</td>
+                        </tr>
+                        <tr>
+                          <td className="px-3 py-2">runtime_session</td>
+                          <td className="px-3 py-2">{runtimeConnected ? 'connected' : 'disconnected'}</td>
+                          <td className="px-3 py-2 text-gray-500">active profile</td>
+                        </tr>
+                        <tr>
+                          <td className="px-3 py-2">role</td>
+                          <td className="px-3 py-2">{activeContext?.role || '—'}</td>
+                          <td className="px-3 py-2 text-gray-500">session</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+
+                <Card padding="sm">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h2 className="text-sm font-semibold text-gray-900">گزارش مصرف APIها</h2>
+                      <p className="text-xs text-gray-500">رویدادهای Repository از backend — فقط برای نقش‌های مجاز.</p>
+                    </div>
+                    {canViewUsageReports && (
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          icon={<Download className="h-4 w-4" />}
+                          disabled={!usageReport?.data?.length}
+                          onClick={() => {
+                            const rows = usageReport?.data || [];
+                            const csv = rowsToCsv(
+                              ['eventAt', 'eventType', 'apiId', 'apiTitle', 'version', 'userId', 'userDisplayName', 'activeRole'],
+                              rows.map(row => [
+                                row.eventAt,
+                                row.eventType,
+                                row.apiId,
+                                row.apiTitle,
+                                row.version,
+                                row.userId,
+                                row.userDisplayName,
+                                row.activeRole,
+                              ])
+                            );
+                            downloadTextFile(csv, `usage-report-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv;charset=utf-8');
+                          }}
+                        >
+                          Export CSV
+                        </Button>
+                        <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={loadUsageReport} loading={usageLoading}>
+                          Refresh
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                  {!canViewUsageReports ? (
+                    <p className="text-sm text-gray-500">برای مشاهده گزارش مصرف به نقش مدیرسیستم، سرپرست فنی یا سرپرست QA نیاز است.</p>
+                  ) : (
+                    <div className="space-y-3">
+                      <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-5">
+                        <Select
+                          label="نوع رویداد"
+                          value={usageFilters.eventType}
+                          onChange={(event) => setUsageFilters(prev => ({ ...prev, page: 1, eventType: event.target.value }))}
+                          options={[
+                            { value: '', label: 'همه' },
+                            { value: 'ADDED_TO_CONSOLE', label: 'ADDED_TO_CONSOLE' },
+                            { value: 'API_OPENED', label: 'API_OPENED' },
+                            { value: 'API_EXECUTED', label: 'API_EXECUTED' },
+                            { value: 'REMOVED_FROM_CONSOLE', label: 'REMOVED_FROM_CONSOLE' },
+                            { value: 'NEW_VERSION_VIEWED', label: 'NEW_VERSION_VIEWED' },
+                          ]}
+                        />
+                        <Input
+                          label="API ID"
+                          value={usageFilters.apiId}
+                          onChange={(event) => setUsageFilters(prev => ({ ...prev, page: 1, apiId: event.target.value }))}
+                          dir="ltr"
+                        />
+                        <Input
+                          label="User ID"
+                          value={usageFilters.userId}
+                          onChange={(event) => setUsageFilters(prev => ({ ...prev, page: 1, userId: event.target.value }))}
+                          dir="ltr"
+                        />
+                        <JalaliDateField
+                          label="از تاریخ"
+                          value={usageFilters.dateFrom}
+                          onChange={(value) => setUsageFilters(prev => ({ ...prev, page: 1, dateFrom: value }))}
+                        />
+                        <JalaliDateField
+                          label="تا تاریخ"
+                          value={usageFilters.dateTo}
+                          onChange={(value) => setUsageFilters(prev => ({ ...prev, page: 1, dateTo: value }))}
+                        />
+                      </div>
+                      {usageReport && (
+                        <div className="flex flex-wrap gap-3 text-xs text-gray-600" dir="ltr">
+                          <span>total: {usageReport.summary.total}</span>
+                          <span>uniqueApis: {usageReport.summary.uniqueApis}</span>
+                          <span>uniqueUsers: {usageReport.summary.uniqueUsers}</span>
+                        </div>
+                      )}
+                      {topUsageApis.length > 0 && (
+                        <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+                          <p className="mb-2 text-sm font-semibold text-gray-900">Top APIs (صفحه جاری)</p>
+                          <ul className="space-y-1 text-xs text-gray-700" dir="ltr">
+                            {topUsageApis.map(item => (
+                              <li key={item.apiId} className="flex flex-wrap justify-between gap-2 font-mono">
+                                <span>{item.apiTitle} ({item.apiId})</span>
+                                <span>API_EXECUTED: {item.executed} · ADDED_TO_CONSOLE: {item.added}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      <Table
+                        columns={[
+                          {
+                            key: 'eventAt',
+                            title: 'زمان',
+                            render: (row: ApiUsageReport['data'][number]) => (
+                              <span className="font-mono text-xs" dir="ltr">{row.eventAt}</span>
+                            ),
+                          },
+                          {
+                            key: 'eventType',
+                            title: 'رویداد',
+                            render: (row: ApiUsageReport['data'][number]) => <Badge size="sm">{row.eventType}</Badge>,
+                          },
+                          {
+                            key: 'apiTitle',
+                            title: 'API',
+                            render: (row: ApiUsageReport['data'][number]) => (
+                              <div>
+                                <p className="font-medium text-gray-900">{row.apiTitle || row.apiId}</p>
+                                <p className="font-mono text-xs text-gray-500" dir="ltr">{row.apiId} @ {row.version}</p>
+                              </div>
+                            ),
+                          },
+                          {
+                            key: 'user',
+                            title: 'کاربر',
+                            render: (row: ApiUsageReport['data'][number]) => (
+                              <div>
+                                <p>{row.userDisplayName || row.userId}</p>
+                                <p className="text-xs text-gray-500">{roleLabel(row.activeRole)}</p>
+                              </div>
+                            ),
+                          },
+                        ]}
+                        data={usageReport?.data || []}
+                        loading={usageLoading}
+                        emptyMessage="رویدادی برای فیلتر فعلی ثبت نشده است"
+                        enableClientFilter={false}
+                        enableColumnChooser={false}
+                        enableExport={false}
+                      />
+                      {usageReport && (
+                        <Pagination
+                          page={usageReport.page}
+                          totalPages={usageReport.totalPages}
+                          total={usageReport.total}
+                          limit={usageReport.limit}
+                          onPageChange={(page) => setUsageFilters(prev => ({ ...prev, page }))}
+                          onLimitChange={(limit) => setUsageFilters(prev => ({ ...prev, page: 1, limit }))}
+                        />
+                      )}
+                    </div>
+                  )}
+                </Card>
+              </div>
             )}
 
             {workspaceView === 'runtime' && activeContext && (
@@ -2495,8 +3741,28 @@ export const OnlineApiConsolePage: React.FC = () => {
                       Version جدید
                     </Button>
                   )}
+                  <Select
+                    aria-label="زبان سند"
+                    value={docLanguage}
+                    onChange={(event) => setDocLanguage(event.target.value as ApiDocLanguage)}
+                    className="min-w-[110px] py-1.5 text-sm"
+                    options={[
+                      { value: 'FA', label: 'سند FA' },
+                      { value: 'EN', label: 'سند EN' },
+                    ]}
+                  />
                   <Button variant="secondary" size="sm" icon={<Download className="h-4 w-4" />} onClick={() => handleGenerateDocs(true)} disabled={!canDocument}>
                     تولید سند نهایی
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    icon={<Terminal className="h-4 w-4" />}
+                    onClick={() => { void handleCreateMock(); }}
+                    loading={creatingMock}
+                    disabled={!canEdit}
+                  >
+                    ساخت Mock
                   </Button>
                   <Button
                     variant="danger"
@@ -2544,24 +3810,40 @@ export const OnlineApiConsolePage: React.FC = () => {
                       className="text-left font-mono"
                       onChange={(event) => updateDraft(request => ({ ...request, urlTemplate: event.target.value }))}
                     />
-                    <div className="flex items-end gap-2">
-                      <Button
-                        variant="secondary"
-                        icon={<Save className="h-4 w-4" />}
-                        onClick={handleSave}
-                        loading={saving}
-                        disabled={!canEdit}
-                      >
-                        ذخیره
-                      </Button>
-                      <Button
-                        icon={<PlayCircle className="h-4 w-4" />}
-                        onClick={handleSend}
-                        loading={executing}
-                        disabled={!canExecute}
-                      >
-                        ارسال
-                      </Button>
+                    <div className="flex flex-col items-stretch justify-end gap-1">
+                      <div className="flex items-end gap-2">
+                        <Button
+                          variant="secondary"
+                          icon={<Save className="h-4 w-4" />}
+                          onClick={handleSave}
+                          loading={saving}
+                          disabled={!canEdit}
+                        >
+                          ذخیره
+                        </Button>
+                        {canExecute ? (
+                          <Button
+                            icon={<PlayCircle className="h-4 w-4" />}
+                            onClick={handleSend}
+                            loading={executing}
+                          >
+                            ارسال
+                          </Button>
+                        ) : (
+                          <Button
+                            icon={<PlayCircle className="h-4 w-4" />}
+                            disabled
+                            title="نقش شما اجازه اجرای Request را ندارد"
+                          >
+                            ارسال
+                          </Button>
+                        )}
+                      </div>
+                      {!canExecute && (
+                        <p className="text-xs text-amber-700">
+                          نقش «{roleLabel(role)}» فقط‌خواندنی است و اجازه اجرای API را ندارد.
+                        </p>
+                      )}
                     </div>
                   </div>
 
@@ -2610,8 +3892,62 @@ export const OnlineApiConsolePage: React.FC = () => {
                   </div>
 
                   {selectedEnvironment?.kind === 'PRODUCTION' && selectedRequest.classification.type === 'CORE_COMMAND' && (
-                    <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                      اجرای Production Core Command نیازمند permission بالاتر، confirmation و business justification است.
+                    <div className="mt-4 space-y-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                      <p>اجرای Production Core Command نیازمند permission بالاتر، confirmation و business justification است.</p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          loading={dualApprovalBusy}
+                          onClick={() => {
+                            void (async () => {
+                              if (!activeContext || !selectedRequest) return;
+                              setDualApprovalBusy(true);
+                              try {
+                                const rows = await apiConsoleApi.getDualApprovals(selectedRequest.id, activeContext);
+                                const mine = (rows.data || []).filter(item => item.userId === activeContext.userId);
+                                const active = mine.find(item => item.status === 'ACTIVE');
+                                const pending = mine.find(item => item.status === 'PENDING');
+                                setDualApprovalStatus(active ? 'ACTIVE' : pending ? 'PENDING' : 'MISSING');
+                              } catch {
+                                setDualApprovalStatus('UNKNOWN');
+                              } finally {
+                                setDualApprovalBusy(false);
+                              }
+                            })();
+                          }}
+                        >
+                          وضعیت Dual Approval
+                        </Button>
+                        <Button
+                          size="sm"
+                          loading={dualApprovalBusy}
+                          onClick={() => {
+                            void (async () => {
+                              if (!activeContext || !selectedRequest) return;
+                              const reason = window.prompt('دلیل درخواست Dual Approval');
+                              if (!reason?.trim()) return;
+                              setDualApprovalBusy(true);
+                              try {
+                                await apiConsoleApi.requestDualApproval(selectedRequest.id, reason.trim(), activeContext);
+                                setDualApprovalStatus('PENDING');
+                                toast.success('درخواست Dual Approval ثبت شد.');
+                              } catch (error) {
+                                toast.error(error instanceof Error ? error.message : 'ثبت Dual Approval ناموفق بود.');
+                              } finally {
+                                setDualApprovalBusy(false);
+                              }
+                            })();
+                          }}
+                        >
+                          درخواست Dual Approval
+                        </Button>
+                        {dualApprovalStatus !== 'UNKNOWN' && (
+                          <Badge size="sm" variant={dualApprovalStatus === 'ACTIVE' ? 'success' : dualApprovalStatus === 'PENDING' ? 'warning' : 'secondary'}>
+                            {dualApprovalStatus}
+                          </Badge>
+                        )}
+                      </div>
                     </div>
                   )}
                   {selectedRequest.runtimeBinding && (
@@ -2638,7 +3974,7 @@ export const OnlineApiConsolePage: React.FC = () => {
                         key={tab.id}
                         onClick={() => setActiveTab(tab.id)}
                         className={`rounded-lg px-3 py-2 text-sm font-medium transition ${
-                          activeTab === tab.id ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-100'
+                          activeTab === tab.id ? 'bg-[var(--theme-accent)] text-white' : 'text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-muted)]'
                         }`}
                       >
                         {tab.label}
@@ -2660,13 +3996,49 @@ export const OnlineApiConsolePage: React.FC = () => {
                 ) : (
                   <Card>
                     {activeTab === 'params' && (
-                      <KeyValueEditor
-                        rows={selectedRequest.queryParameters}
-                        onChange={(rows) => updateDraft(request => ({ ...request, queryParameters: rows }))}
-                        onAdd={() => updateDraft(request => ({ ...request, queryParameters: [...request.queryParameters, { ...makeParam(), displayOrder: request.queryParameters.length }] }))}
-                        valueKey="value"
-                        title="Query parameters"
-                      />
+                      <div className="space-y-6">
+                        {(selectedRequest.classification.type === 'CORE_QUERY' || selectedRequest.classification.type === 'CORE_COMMAND') && (
+                          <div className="space-y-3">
+                            <div>
+                              <h3 className="font-semibold text-gray-900">
+                                {selectedRequest.classification.type === 'CORE_COMMAND' ? 'Data (fr)' : 'Params (ds)'}
+                              </h3>
+                              <p className="text-sm text-gray-500">
+                                {selectedRequest.classification.type === 'CORE_COMMAND'
+                                  ? 'این آبجکت به‌عنوان data در body درخواست store-form-data ارسال می‌شود.'
+                                  : 'این آبجکت به‌عنوان params در body درخواست get-data-source ارسال می‌شود (مثلاً viewerRole، limit، offset).'}
+                              </p>
+                            </div>
+                            <Textarea
+                              label={selectedRequest.classification.type === 'CORE_COMMAND' ? 'Data payload' : 'Params payload'}
+                              value={(() => {
+                                const parsed = parseJson(selectedRequest.bodyTemplate);
+                                const body = parsed.ok ? asRecord(parsed.value) : {};
+                                return JSON.stringify(
+                                  selectedRequest.classification.type === 'CORE_COMMAND' ? body.data || {} : body.params || {},
+                                  null,
+                                  2,
+                                );
+                              })()}
+                              onChange={(event) => updateCorePayload(
+                                selectedRequest.classification.type === 'CORE_COMMAND' ? 'data' : 'params',
+                                event.target.value,
+                              )}
+                              className="min-h-72 text-left font-mono"
+                              dir="ltr"
+                            />
+                          </div>
+                        )}
+                        <KeyValueEditor
+                          rows={selectedRequest.queryParameters}
+                          onChange={(rows) => updateDraft(request => ({ ...request, queryParameters: rows }))}
+                          onAdd={() => updateDraft(request => ({ ...request, queryParameters: [...request.queryParameters, { ...makeParam(), displayOrder: request.queryParameters.length }] }))}
+                          valueKey="value"
+                          title={(selectedRequest.classification.type === 'CORE_QUERY' || selectedRequest.classification.type === 'CORE_COMMAND')
+                            ? 'Query parameters (URL)'
+                            : 'Query parameters'}
+                        />
+                      </div>
                     )}
 
                     {activeTab === 'headers' && (
@@ -2816,11 +4188,21 @@ export const OnlineApiConsolePage: React.FC = () => {
                       />
                     )}
 
-                    {activeTab === 'settings' && canManageGeneralSettings && (
+                    {activeTab === 'settings' && canEdit && (
                       <SettingsPanel
                         request={selectedRequest}
                         environment={selectedEnvironment}
+                        collection={collections.find(item => item.id === selectedRequest.collectionId)}
                         effectiveRequest={effectiveRequest}
+                        canManageTls={canManageGeneralSettings}
+                        ownershipSaving={ownershipSaving}
+                        transferUserId={ownershipTransferUserId}
+                        coOwnersInput={coOwnersInput}
+                        onTransferUserIdChange={setOwnershipTransferUserId}
+                        onCoOwnersInputChange={setCoOwnersInput}
+                        onVisibilityChange={handleRequestVisibilityChange}
+                        onTransfer={handleTransferOwnership}
+                        onSaveCoOwners={handleSaveCoOwners}
                         onChange={(patch) => updateDraft(request => ({ ...request, ...patch }))}
                       />
                     )}
@@ -2861,6 +4243,12 @@ export const OnlineApiConsolePage: React.FC = () => {
                         selected={selectedExecution}
                         manualResponses={manualResponses}
                         loading={detailsLoading}
+                        statusFilter={historyStatusFilter}
+                        onStatusFilter={setHistoryStatusFilter}
+                        compareIds={historyCompareIds}
+                        onToggleCompare={(id) => setHistoryCompareIds(prev => (
+                          prev.includes(id) ? prev.filter(item => item !== id) : prev.length >= 2 ? [prev[1]!, id] : [...prev, id]
+                        ))}
                         onSelect={setSelectedExecution}
                         onManual={() => setManualModalOpen(true)}
                       />
@@ -2881,6 +4269,7 @@ export const OnlineApiConsolePage: React.FC = () => {
           </section>
         )}
       </main>
+    </AppShell>
 
       <ImportCurlModal
         open={curlModalOpen}
@@ -2983,6 +4372,24 @@ export const OnlineApiConsolePage: React.FC = () => {
             onChange={(event) => setShareForm(prev => ({ ...prev, description: event.target.value }))}
             className="min-h-32"
           />
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <Input
+              label="شناسه Ticket (اختیاری)"
+              value={shareForm.ticketId}
+              onChange={(event) => setShareForm(prev => ({ ...prev, ticketId: event.target.value }))}
+              dir="ltr"
+              className="text-left font-mono"
+              placeholder="INC-12345"
+            />
+            <Input
+              label="آدرس Ticket (اختیاری)"
+              value={shareForm.ticketUrl}
+              onChange={(event) => setShareForm(prev => ({ ...prev, ticketUrl: event.target.value }))}
+              dir="ltr"
+              className="text-left font-mono"
+              placeholder="https://itsm.example/ticket/123"
+            />
+          </div>
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setShareModalOpen(false)}>انصراف</Button>
             <Button icon={<Upload className="h-4 w-4" />} onClick={handleShareSubmit}>ثبت درخواست</Button>
@@ -3008,6 +4415,11 @@ export const OnlineApiConsolePage: React.FC = () => {
                 <div className="flex flex-wrap items-center gap-2">
                   <h3 className="font-semibold text-gray-900">{repositoryDetail.title}</h3>
                   <Badge variant="default">v{repositoryDetail.version}</Badge>
+                  <Badge variant={sharingBadgeVariant(repositoryDetail.sharingStatus)}>
+                    {API_SHARING_STATUS_LABELS[repositoryDetail.sharingStatus]}
+                  </Badge>
+                  {repositoryDetail.sharingStatus === 'DEPRECATED' && <Badge variant="danger">DEPRECATED</Badge>}
+                  {repositoryDetail.breakingChange || repositoryDetail.request?.breakingChange ? <Badge variant="warning">Breaking</Badge> : null}
                   {repositoryDetail.isNewForUser && <Badge variant="success">جدید</Badge>}
                   {repositoryDetail.hasNewerVersion && <Badge variant="warning">نسخه جدید موجود است</Badge>}
                 </div>
@@ -3019,10 +4431,29 @@ export const OnlineApiConsolePage: React.FC = () => {
                 <InfoTile label="Version" value={repositoryDetail.version} />
                 <InfoTile label="Classification" value={repositoryDetail.classification.type} />
                 <InfoTile label="Latest" value={repositoryDetail.latestVersion} />
+                <InfoTile label="Ticket ID" value={repositoryDetail.ticketId || repositoryDetail.shareRequest?.ticketId || '-'} />
+                <InfoTile
+                  label="Ticket URL"
+                  value={repositoryDetail.ticketUrl || repositoryDetail.shareRequest?.ticketUrl || '-'}
+                />
               </div>
               {repositoryDetail.changeLog && (
                 <div className="rounded-lg border border-blue-100 bg-blue-50 p-3 text-sm text-blue-800">
                   <span className="font-semibold">Change Log: </span>{repositoryDetail.changeLog}
+                </div>
+              )}
+                  {repositoryDetail.breakingChange || repositoryDetail.request?.breakingChange ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                  <span className="font-semibold">Breaking Change</span>
+                  {(repositoryDetail.migrationNote || repositoryDetail.request?.migrationNote) && (
+                    <p className="mt-1"><span className="font-semibold">Migration: </span>{repositoryDetail.migrationNote || repositoryDetail.request?.migrationNote}</p>
+                  )}
+                </div>
+              ) : null}
+              {repositoryDetail.sharingStatus === 'DEPRECATED' && (
+                <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                  <span className="font-semibold">منسوخ‌شده: </span>
+                  {repositoryDetail.deprecationReason || repositoryDetail.request?.deprecationReason || 'این نسخه DEPRECATED است و قابل افزودن به Console نیست.'}
                 </div>
               )}
               <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
@@ -3077,8 +4508,34 @@ export const OnlineApiConsolePage: React.FC = () => {
               </div>
               <div className="flex justify-end gap-2">
                 <Button variant="secondary" onClick={() => setRepositoryModalOpen(false)}>بستن</Button>
-                <Button onClick={handleAddRepositoryVersion} disabled={!!repositoryDetail.referenceId}>
-                  {repositoryDetail.referenceId ? 'قبلاً اضافه شده' : 'استفاده از API'}
+                <Button
+                  variant="secondary"
+                  icon={<Download className="h-4 w-4" />}
+                  loading={exportingOpenApiId === `${repositoryDetail.apiId}:${repositoryDetail.version}`}
+                  onClick={() => { void handleExportRepositoryOpenApi(repositoryDetail.apiId, repositoryDetail.version); }}
+                >
+                  OpenAPI
+                </Button>
+                {repositoryDetail.sharingStatus !== 'DEPRECATED' && canReviewShares && (
+                  <Button
+                    variant="warning"
+                    onClick={() => {
+                      setDeprecateForm({ reason: '', effectiveAt: '' });
+                      setDeprecateModalOpen(true);
+                    }}
+                  >
+                    Deprecate
+                  </Button>
+                )}
+                <Button
+                  onClick={handleAddRepositoryVersion}
+                  disabled={!!repositoryDetail.referenceId || repositoryDetail.sharingStatus === 'DEPRECATED'}
+                >
+                  {repositoryDetail.sharingStatus === 'DEPRECATED'
+                    ? 'منسوخ‌شده'
+                    : repositoryDetail.referenceId
+                      ? 'قبلاً اضافه شده'
+                      : 'استفاده از API'}
                 </Button>
               </div>
             </div>
@@ -3114,6 +4571,30 @@ export const OnlineApiConsolePage: React.FC = () => {
                 <p><span className="font-semibold">مقدمه: </span>{reviewDetail.introduction || '-'}</p>
                 <p><span className="font-semibold">توضیحات: </span>{reviewDetail.description || '-'}</p>
               </div>
+              <div className="space-y-3 rounded-lg border border-gray-200 bg-white p-3">
+                <FieldLabel>Ticket / ITSM</FieldLabel>
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                  <Input
+                    label="شناسه Ticket"
+                    value={reviewTicketForm.ticketId}
+                    onChange={(event) => setReviewTicketForm(prev => ({ ...prev, ticketId: event.target.value }))}
+                    dir="ltr"
+                    className="text-left font-mono"
+                  />
+                  <Input
+                    label="آدرس Ticket"
+                    value={reviewTicketForm.ticketUrl}
+                    onChange={(event) => setReviewTicketForm(prev => ({ ...prev, ticketUrl: event.target.value }))}
+                    dir="ltr"
+                    className="text-left font-mono"
+                  />
+                </div>
+                <div className="flex justify-end">
+                  <Button size="sm" onClick={() => { void handleSaveReviewTicket(); }} loading={reviewTicketSaving}>
+                    ذخیره Ticket
+                  </Button>
+                </div>
+              </div>
               <div>
                 <FieldLabel>Consumerها</FieldLabel>
                 <div className="max-h-60 space-y-2 overflow-y-auto rounded-lg border border-gray-200 p-2">
@@ -3137,10 +4618,60 @@ export const OnlineApiConsolePage: React.FC = () => {
                   {!consumerCandidates.length && <p className="p-3 text-sm text-gray-500">هنوز دولوپری از طریق ورود CDE در دایرکتوری این سامانه همگام نشده است.</p>}
                 </div>
               </div>
+              <div className="rounded-lg border border-gray-200 p-3">
+                <FieldLabel>چک‌لیست Review</FieldLabel>
+                <div className="mt-2 space-y-2">
+                  {REVIEW_CHECKLIST_LABELS.map(item => (
+                    <label key={item.key} className="flex items-center gap-2 text-sm text-gray-700">
+                      <input
+                        type="checkbox"
+                        checked={reviewChecklist[item.key]}
+                        disabled={reviewDetail.status !== 'PENDING_REVIEW'}
+                        onChange={(event) => void handleReviewChecklistChange({ [item.key]: event.target.checked })}
+                        className="rounded border-gray-300 text-blue-600"
+                      />
+                      {item.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="rounded-lg border border-gray-200 p-3">
+                <FieldLabel>نظرات</FieldLabel>
+                <div className="mt-2 max-h-40 space-y-2 overflow-y-auto">
+                  {(reviewDetail.comments || []).map(comment => (
+                    <div key={comment.id} className="rounded border border-gray-100 bg-gray-50 px-2 py-1.5 text-sm">
+                      <div className="flex items-center justify-between gap-2 text-xs text-gray-500">
+                        <span>{comment.authorName || comment.authorId}</span>
+                        <span dir="ltr">{formatDate(comment.createdAt)}</span>
+                      </div>
+                      <p className="mt-1 text-gray-800">{comment.text}</p>
+                    </div>
+                  ))}
+                  {!reviewDetail.comments?.length && <p className="text-xs text-gray-500">هنوز نظری ثبت نشده است.</p>}
+                </div>
+                <div className="mt-3 space-y-2">
+                  <Textarea
+                    label="نظر جدید"
+                    value={reviewCommentText}
+                    onChange={(event) => setReviewCommentText(event.target.value)}
+                    className="min-h-20"
+                  />
+                  <div className="flex justify-end">
+                    <Button size="sm" onClick={() => void handleAddReviewComment()} loading={reviewCommentSaving}>
+                      ثبت نظر
+                    </Button>
+                  </div>
+                </div>
+              </div>
               {reviewDetail.status === 'PENDING_REVIEW' && (
                 <div className="flex justify-end gap-2">
                   <Button variant="warning" onClick={() => setReturnModalOpen(true)}>بازگردانی</Button>
-                  <Button onClick={() => setApproveModalOpen(true)} disabled={!selectedConsumerIds.length}>تأیید و انتشار</Button>
+                  <Button
+                    onClick={() => setApproveModalOpen(true)}
+                    disabled={!selectedConsumerIds.length || !REVIEW_CHECKLIST_LABELS.every(item => reviewChecklist[item.key])}
+                  >
+                    تأیید و انتشار
+                  </Button>
                 </div>
               )}
             </div>
@@ -3155,7 +4686,12 @@ export const OnlineApiConsolePage: React.FC = () => {
 
       <Modal isOpen={approveModalOpen} onClose={() => setApproveModalOpen(false)} title="تأیید انتشار API" size="sm">
         <div className="space-y-4">
-          <p className="text-sm text-gray-600">Approval بدون Consumer مجاز نیست. بعد از تأیید، نسخه در Repository برای Consumerهای انتخاب‌شده قابل مشاهده می‌شود.</p>
+          <p className="text-sm text-gray-600">Approval نیازمند تکمیل چک‌لیست و انتخاب حداقل یک Consumer است. بعد از تأیید، نسخه در Repository منتشر می‌شود.</p>
+          <ul className="space-y-1 text-xs text-gray-600">
+            {REVIEW_CHECKLIST_LABELS.map(item => (
+              <li key={item.key}>{reviewChecklist[item.key] ? '✓' : '○'} {item.label}</li>
+            ))}
+          </ul>
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setApproveModalOpen(false)} disabled={reviewActionLoading}>انصراف</Button>
             <Button onClick={handleApproveReview} loading={reviewActionLoading}>تأیید</Button>
@@ -3182,15 +4718,24 @@ export const OnlineApiConsolePage: React.FC = () => {
       <Modal
         isOpen={!!adminRoleTarget}
         onClose={() => setAdminRoleTarget(null)}
-        title={adminRoleTarget?.enabled ? 'افزودن مدیرسیستم' : 'لغو نقش مدیرسیستم'}
+        title={adminRoleTarget?.enabled ? `افزودن نقش ${roleLabel(adminRoleTarget.role)}` : `لغو نقش ${roleLabel(adminRoleTarget?.role || 'DEVELOPER')}`}
         size="sm"
       >
         <div className="space-y-4">
           <p className="text-sm text-gray-600">
             {adminRoleTarget?.enabled
-              ? `آیا «${adminRoleTarget.user.fullName}» به‌عنوان مدیرسیستم تأیید شود؟ این شخص امکان تأیید اشتراک API و مدیریت کاربران را خواهد داشت.`
-              : `آیا نقش مدیرسیستم از «${adminRoleTarget?.user.fullName || ''}» گرفته شود؟`}
+              ? `آیا نقش «${roleLabel(adminRoleTarget.role)}» برای «${adminRoleTarget.user.fullName}» فعال شود؟`
+              : `آیا نقش «${roleLabel(adminRoleTarget?.role || 'DEVELOPER')}» از «${adminRoleTarget?.user.fullName || ''}» گرفته شود؟`}
           </p>
+          {adminRoleTarget?.enabled && adminRoleTarget.role !== 'SYSTEM_ADMIN' && (
+            <ApplicationSelect
+              label="محدوده سامانه"
+              value={adminRoleTarget.applicationId}
+              onChange={(applicationId) => setAdminRoleTarget(prev => prev ? { ...prev, applicationId } : prev)}
+              includeAllOption
+              hint="می‌توانید نقش را به یک سامانه محدود کنید یا ALL را برای همه نگه دارید."
+            />
+          )}
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setAdminRoleTarget(null)} disabled={adminRoleSaving}>انصراف</Button>
             <Button
@@ -3221,9 +4766,152 @@ export const OnlineApiConsolePage: React.FC = () => {
             className="min-h-32"
             showCounter
           />
+          <label className="flex items-center gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              checked={versionForm.breakingChange}
+              onChange={(event) => setVersionForm(prev => ({ ...prev, breakingChange: event.target.checked }))}
+              className="rounded border-gray-300 text-blue-600"
+            />
+            Breaking Change
+          </label>
+          {versionForm.breakingChange && (
+            <Textarea
+              label="Migration Note"
+              value={versionForm.migrationNote}
+              onChange={(event) => setVersionForm(prev => ({ ...prev, migrationNote: event.target.value }))}
+              className="min-h-24"
+              hint="برای Breaking Change الزامی است."
+            />
+          )}
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setVersionModalOpen(false)} disabled={versioning}>انصراف</Button>
             <Button onClick={handleCreateVersion} loading={versioning}>ساخت Version</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={collectionRunModalOpen} onClose={() => setCollectionRunModalOpen(false)} title="اجرای Collection" size="lg">
+        <div className="space-y-4">
+          <label className="flex items-center gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              checked={collectionRunStopOnFail}
+              onChange={(event) => setCollectionRunStopOnFail(event.target.checked)}
+              className="rounded border-gray-300 text-blue-600"
+            />
+            توقف در اولین شکست (stopOnFail)
+          </label>
+          <div className="flex justify-end">
+            <Button icon={<PlayCircle className="h-4 w-4" />} onClick={() => void handleCollectionRun()} loading={collectionRunning}>
+              Run
+            </Button>
+          </div>
+          {latestCollectionRun && (
+            <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm">
+              <p className="font-semibold text-gray-900">خلاصه اجرا</p>
+              <p className="mt-1 text-gray-700">
+                کل: {latestCollectionRun.summary.total} · موفق: {latestCollectionRun.summary.passed} · ناموفق: {latestCollectionRun.summary.failed} · ردشده: {latestCollectionRun.summary.skipped}
+              </p>
+              <div className="mt-2 max-h-40 space-y-1 overflow-auto">
+                {latestCollectionRun.results.map(result => (
+                  <div key={`${result.requestId}-${result.status}`} className="flex items-center justify-between gap-2 font-mono text-xs" dir="ltr">
+                    <span>{result.name}</span>
+                    <Badge size="sm" variant={result.status === 'PASSED' ? 'success' : result.status === 'FAILED' ? 'danger' : 'default'}>
+                      {result.status}
+                    </Badge>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div>
+            <FieldLabel>اجراهای اخیر</FieldLabel>
+            <div className="mt-2 space-y-2">
+              {recentTestRuns.map(run => (
+                <div key={run.id} className="rounded border border-gray-200 px-3 py-2 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono" dir="ltr">{run.id}</span>
+                    <span dir="ltr">{formatDate(run.createdAt)}</span>
+                  </div>
+                  <p className="mt-1 text-gray-600">
+                    passed {run.summary.passed} / failed {run.summary.failed} / skipped {run.summary.skipped}
+                  </p>
+                </div>
+              ))}
+              {!recentTestRuns.length && <p className="text-sm text-gray-500">هنوز Test Run ثبت نشده است.</p>}
+            </div>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={deprecateModalOpen} onClose={() => setDeprecateModalOpen(false)} title="منسوخ‌سازی نسخه API" size="md">
+        <div className="space-y-4">
+          <Textarea
+            label="دلیل منسوخ‌سازی"
+            value={deprecateForm.reason}
+            onChange={(event) => setDeprecateForm(prev => ({ ...prev, reason: event.target.value }))}
+            className="min-h-28"
+          />
+          <Input
+            label="تاریخ اعمال (اختیاری)"
+            value={deprecateForm.effectiveAt}
+            onChange={(event) => setDeprecateForm(prev => ({ ...prev, effectiveAt: event.target.value }))}
+            placeholder="ISO datetime"
+            dir="ltr"
+          />
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setDeprecateModalOpen(false)} disabled={deprecating}>انصراف</Button>
+            <Button variant="warning" onClick={() => void handleDeprecateVersion()} loading={deprecating}>Deprecate</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={globalSearchOpen} onClose={() => setGlobalSearchOpen(false)} title="جستجوی سراسری Workspace" size="lg">
+        <div className="space-y-4">
+          <div className="flex gap-2">
+            <Input
+              aria-label="عبارت جستجو"
+              value={globalSearchQuery}
+              onChange={(event) => setGlobalSearchQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void runGlobalSearch();
+              }}
+              placeholder="Request / Repository / Discovery"
+              dir="ltr"
+            />
+            <Button onClick={() => { void runGlobalSearch(); }} loading={globalSearchLoading}>جستجو</Button>
+          </div>
+          <div className="max-h-96 space-y-2 overflow-auto">
+            {globalSearchHits.length === 0 ? (
+              <p className="py-6 text-center text-sm text-gray-500">{globalSearchLoading ? 'در حال جستجو…' : 'نتیجه‌ای نیست'}</p>
+            ) : (
+              globalSearchHits.map(hit => (
+                <button
+                  key={`${hit.kind}-${hit.id}`}
+                  type="button"
+                  className="w-full rounded-lg border border-gray-200 px-3 py-2 text-right hover:bg-gray-50"
+                  onClick={() => {
+                    setGlobalSearchOpen(false);
+                    if (hit.kind === 'request') {
+                      setWorkspaceView('requests');
+                      void reloadRequests(hit.id);
+                    } else if (hit.kind === 'repository') {
+                      setWorkspaceView('repository');
+                      setRepositoryFilters(prev => ({ ...prev, search: hit.title, page: 1 }));
+                    } else {
+                      setWorkspaceView('runtime');
+                    }
+                  }}
+                >
+                  <div className="flex items-center gap-2">
+                    <Badge size="sm" variant={hit.kind === 'request' ? 'info' : hit.kind === 'repository' ? 'success' : 'warning'}>{hit.kind}</Badge>
+                    <span className="font-medium text-gray-900">{hit.title}</span>
+                  </div>
+                  <p className="mt-1 font-mono text-xs text-gray-500" dir="ltr">{hit.subtitle}</p>
+                </button>
+              ))
+            )}
           </div>
         </div>
       </Modal>
@@ -3356,6 +5044,43 @@ export const OnlineApiConsolePage: React.FC = () => {
             />
             تأیید می‌کنم این Core Command روی محیط انتخاب‌شده مجاز است.
           </label>
+          {selectedEnvironment?.kind === 'PRODUCTION' && selectedRequest?.classification.type === 'CORE_COMMAND' && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+              <p className="mb-2">در صورت فعال بودن Dual Approval، قبل از اجرا باید تأیید نفر دوم را داشته باشید.</p>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  loading={dualApprovalBusy}
+                  onClick={() => {
+                    void (async () => {
+                      if (!activeContext || !selectedRequest) return;
+                      const reason = productionForm.reason.trim() || window.prompt('دلیل Dual Approval') || '';
+                      if (!reason.trim()) {
+                        toast.warning('دلیل Dual Approval الزامی است.');
+                        return;
+                      }
+                      setDualApprovalBusy(true);
+                      try {
+                        await apiConsoleApi.requestDualApproval(selectedRequest.id, reason.trim(), activeContext);
+                        setDualApprovalStatus('PENDING');
+                        toast.success('درخواست Dual Approval ثبت شد.');
+                      } catch (error) {
+                        toast.error(error instanceof Error ? error.message : 'ثبت Dual Approval ناموفق بود.');
+                      } finally {
+                        setDualApprovalBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  درخواست Dual Approval
+                </Button>
+                {dualApprovalStatus !== 'UNKNOWN' && (
+                  <Badge size="sm" variant={dualApprovalStatus === 'ACTIVE' ? 'success' : 'warning'}>{dualApprovalStatus}</Badge>
+                )}
+              </div>
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setProductionModalOpen(false)}>انصراف</Button>
             <Button
@@ -3390,7 +5115,7 @@ export const OnlineApiConsolePage: React.FC = () => {
           </div>
         )}
       </Modal>
-    </div>
+    </>
   );
 };
 
@@ -3579,11 +5304,14 @@ const CoreDetailsEditor = ({
             )}
           </div>
           <Textarea
-            label={isCommand ? 'Data payload' : 'Params payload'}
+            label={isCommand ? 'Data payload (fr)' : 'Params payload (ds)'}
             value={JSON.stringify(isCommand ? body.data || {} : body.params || {}, null, 2)}
             onChange={(event) => onPayloadPatch(isCommand ? 'data' : 'params', event.target.value)}
             className="min-h-72 text-left font-mono"
             dir="ltr"
+            hint={isCommand
+              ? 'مثال: { "id": "...", "actor_role": "hq", "repositoryId": "..." }'
+              : 'مثال: { "viewerRole": "hq", "sortBy": "published_at", "sortOrder": "DESC", "limit": 20, "offset": 0 }'}
           />
         </div>
       )}
@@ -3629,6 +5357,7 @@ const ScriptsPanel = ({
                 'setHeader("x-trace-id", "{{traceId}}")',
                 'setQuery("page", "1")',
                 'setJsonBody("$.params.page", 0)',
+                'setCookie("session", "{{token}}")',
               ].join('\n')}
             />
           </div>
@@ -3653,9 +5382,11 @@ const ScriptsPanel = ({
               minHeight="min-h-20"
               value={[
                 'testStatus(200)',
+                'testStatusIn(200, 201, 204)',
                 'testResponseTimeBelow(5000)',
                 'testHeaderContains("content-type", "json")',
                 'testJsonPath("$.data")',
+                'testJsonEquals("$.status", "OK")',
                 'testBodyContains("success")',
               ].join('\n')}
             />
@@ -3669,69 +5400,181 @@ const ScriptsPanel = ({
 const SettingsPanel = ({
   request,
   environment,
+  collection,
   effectiveRequest,
+  canManageTls,
+  ownershipSaving,
+  transferUserId,
+  coOwnersInput,
+  onTransferUserIdChange,
+  onCoOwnersInputChange,
+  onVisibilityChange,
+  onTransfer,
+  onSaveCoOwners,
   onChange,
 }: {
   request: ApiRequestDefinition;
   environment?: ApiEnvironmentProfile | undefined;
+  collection?: ApiCollection | undefined;
   effectiveRequest: ApiEffectiveRequestSnapshot | null;
+  canManageTls: boolean;
+  ownershipSaving: boolean;
+  transferUserId: string;
+  coOwnersInput: string;
+  onTransferUserIdChange: (value: string) => void;
+  onCoOwnersInputChange: (value: string) => void;
+  onVisibilityChange: (visibility: ApiVisibility) => void;
+  onTransfer: () => void;
+  onSaveCoOwners: () => void;
   onChange: (patch: Partial<ApiRequestDefinition>) => void;
-}) => (
-  <div className="space-y-5">
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-      <Toggle
-        checked={request.tls.verifyCertificate}
-        onChange={(checked) => onChange({ tls: { ...request.tls, verifyCertificate: checked } })}
-        label="Verify TLS certificate"
-      />
-      <Toggle
-        checked={request.executionMode === 'EXACT'}
-        onChange={(checked) => onChange({ executionMode: checked ? 'EXACT' : 'RECOMMENDED' })}
-        label="Exact replay mode"
-      />
-      <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm text-gray-600">
-        Timeout: 30s connect، 60s read، 90s total. Max response: 1 MB در backend Runner.
+}) => {
+  const precedenceRows = [
+    { scope: 'Collection', hint: collection?.name || 'Collection', items: (collection?.variables || []).map(item => ({ key: item.key, value: item.currentValue, sensitive: item.sensitive })) },
+    { scope: 'Environment', hint: environment?.name || 'Environment', items: (environment?.variables || []).map(item => ({ key: item.key, value: item.currentValue, sensitive: item.sensitive })) },
+  ];
+  const resolvedPreview = new Map<string, { value: string; source: string }>();
+  [...precedenceRows].reverse().forEach(layer => {
+    layer.items.forEach(item => {
+      if (!item.key) return;
+      resolvedPreview.set(item.key, {
+        value: item.sensitive ? '••••••' : item.value,
+        source: layer.scope,
+      });
+    });
+  });
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        <Toggle
+          checked={request.tls.verifyCertificate}
+          onChange={(checked) => onChange({ tls: { ...request.tls, verifyCertificate: checked } })}
+          label="Verify TLS certificate"
+          disabled={!canManageTls}
+        />
+        <Toggle
+          checked={request.executionMode === 'EXACT'}
+          onChange={(checked) => onChange({ executionMode: checked ? 'EXACT' : 'RECOMMENDED' })}
+          label="Exact replay mode"
+          disabled={!canManageTls}
+        />
+        <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm text-gray-600">
+          Timeout: 30s connect، 60s read، 90s total. Max response: 1 MB در backend Runner.
+        </div>
       </div>
-    </div>
-    {!request.tls.verifyCertificate && (
-      <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700">
-        Insecure TLS در UI نمایش داده می‌شود، audit می‌شود و طبق policy برای Production execution block است.
+      <div className="rounded-lg border border-gray-200 p-4 space-y-4">
+        <div>
+          <h3 className="font-semibold text-gray-900">Visibility و مالکیت</h3>
+          <p className="text-xs text-gray-500">PRIVATE فقط مالک/همکاران؛ PROJECT_SHARED برای اعضای پروژه با نقش ویرایش.</p>
+        </div>
+        <Toggle
+          checked={(request.visibility || 'PRIVATE') === 'PROJECT_SHARED'}
+          onChange={(checked) => onVisibilityChange(checked ? 'PROJECT_SHARED' : 'PRIVATE')}
+          label="Project Shared"
+          disabled={ownershipSaving}
+        />
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto]">
+          <Input
+            label="انتقال مالکیت (User ID)"
+            value={transferUserId}
+            onChange={(event) => onTransferUserIdChange(event.target.value)}
+            dir="ltr"
+            placeholder="target-user-id"
+          />
+          <div className="flex items-end">
+            <Button size="sm" variant="secondary" onClick={onTransfer} loading={ownershipSaving}>انتقال</Button>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto]">
+          <Input
+            label="Co-owners (با کاما)"
+            value={coOwnersInput}
+            onChange={(event) => onCoOwnersInputChange(event.target.value)}
+            dir="ltr"
+            placeholder="user-1, user-2"
+            hint={`مالک فعلی: ${request.ownerId || request.createdBy}`}
+          />
+          <div className="flex items-end">
+            <Button size="sm" variant="secondary" onClick={onSaveCoOwners} loading={ownershipSaving}>ذخیره</Button>
+          </div>
+        </div>
       </div>
-    )}
-    {environment && (
+      {!request.tls.verifyCertificate && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700">
+          Insecure TLS در UI نمایش داده می‌شود، audit می‌شود و طبق policy برای Production execution block است.
+        </div>
+      )}
       <div>
-        <h3 className="mb-3 font-semibold text-gray-900">Environment variables</h3>
-        <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
-          {environment.variables.map(variable => (
-            <div key={variable.id} className="rounded-lg border border-gray-200 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-sm text-gray-900" dir="ltr">{variable.key}</span>
-                {variable.sensitive && <Badge variant="warning" size="sm">Sensitive</Badge>}
+        <h3 className="mb-1 font-semibold text-gray-900">Variable Inspector</h3>
+        <p className="mb-3 text-xs text-gray-500">اولویت: Execution → Request → Collection → Environment → Global</p>
+        <div className="mb-4 overflow-auto rounded-lg border border-gray-200">
+          <table className="min-w-full divide-y divide-gray-100 text-xs" dir="ltr">
+            <thead className="bg-gray-50 text-left text-gray-500">
+              <tr>
+                <th className="px-3 py-2">Key</th>
+                <th className="px-3 py-2">Resolved</th>
+                <th className="px-3 py-2">Source</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50 bg-white font-mono text-gray-800">
+              {Array.from(resolvedPreview.entries()).length === 0 ? (
+                <tr><td className="px-3 py-3 text-gray-400" colSpan={3}>متغیری برای foreshadow وجود ندارد</td></tr>
+              ) : (
+                Array.from(resolvedPreview.entries()).map(([key, item]) => (
+                  <tr key={key}>
+                    <td className="px-3 py-2">{key}</td>
+                    <td className="px-3 py-2 break-all">{item.value || '—'}</td>
+                    <td className="px-3 py-2 text-gray-500">{item.source}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          {precedenceRows.map(layer => (
+            <div key={layer.scope} className="rounded-lg border border-gray-200 p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <h4 className="text-sm font-semibold text-gray-900">{layer.scope}</h4>
+                <span className="text-[11px] text-gray-500">{layer.hint}</span>
               </div>
-              <p className="mt-1 break-all text-left font-mono text-xs text-gray-500" dir="ltr">
-                {variable.sensitive ? '{{secret-reference}}' : variable.currentValue}
-              </p>
-              <p className="mt-1 text-xs text-gray-500">{variable.description}</p>
+              {layer.items.length === 0 ? (
+                <p className="text-xs text-gray-400">خالی</p>
+              ) : (
+                <div className="space-y-2">
+                  {layer.items.map(item => (
+                    <div key={`${layer.scope}-${item.key}`} className="rounded border border-gray-100 bg-gray-50 px-2 py-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono text-xs text-gray-900" dir="ltr">{item.key}</span>
+                        {item.sensitive && <Badge variant="warning" size="sm">Sensitive</Badge>}
+                      </div>
+                      <p className="mt-1 break-all font-mono text-[11px] text-gray-500" dir="ltr">
+                        {item.sensitive ? '••••••' : (item.value || '—')}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ))}
         </div>
       </div>
-    )}
-    {effectiveRequest?.omittedHeaders.length ? (
-      <div>
-        <h3 className="mb-3 font-semibold text-gray-900">Headerهای تغییرکرده یا حذف‌شده توسط Runner</h3>
-        <div className="space-y-2">
-          {effectiveRequest.omittedHeaders.map((header, index) => (
-            <div key={`${header.name}-${index}`} className="rounded-lg border border-gray-200 bg-gray-50 p-2 text-sm">
-              <span className="font-mono" dir="ltr">{header.name}</span>
-              <span className="text-gray-500"> - {header.reason}</span>
-            </div>
-          ))}
+      {effectiveRequest?.omittedHeaders.length ? (
+        <div>
+          <h3 className="mb-3 font-semibold text-gray-900">Headerهای تغییرکرده یا حذف‌شده توسط Runner</h3>
+          <div className="space-y-2">
+            {effectiveRequest.omittedHeaders.map((header, index) => (
+              <div key={`${header.name}-${index}`} className="rounded-lg border border-gray-200 bg-gray-50 p-2 text-sm">
+                <span className="font-mono" dir="ltr">{header.name}</span>
+                <span className="text-gray-500"> - {header.reason}</span>
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
-    ) : null}
-  </div>
-);
+      ) : null}
+    </div>
+  );
+};
 
 const AssertionEditor = ({ rows, onChange, onAdd }: { rows: ApiRequestAssertion[]; onChange: (rows: ApiRequestAssertion[]) => void; onAdd: () => void }) => {
   const update = (id: string, patch: Partial<ApiRequestAssertion>) =>
@@ -3745,34 +5588,56 @@ const AssertionEditor = ({ rows, onChange, onAdd }: { rows: ApiRequestAssertion[
         <Button size="sm" variant="secondary" icon={<Plus className="h-4 w-4" />} onClick={onAdd}>افزودن</Button>
       </div>
       {rows.map(row => (
-        <div key={row.id} className="grid grid-cols-1 gap-2 rounded-lg border border-gray-200 p-3 lg:grid-cols-[44px_260px_1fr_44px]">
-          <input type="checkbox" checked={row.enabled} onChange={(event) => update(row.id, { enabled: event.target.checked })} className="m-auto" />
-          <Select
-            value={row.assertionType}
-            onChange={(event) => update(row.id, { assertionType: event.target.value as ApiRequestAssertion['assertionType'] })}
-            options={[
-              { value: 'EXPECTED_HTTP_STATUS', label: 'Status مورد انتظار' },
-              { value: 'MAX_RESPONSE_TIME', label: 'حداکثر زمان پاسخ' },
-              { value: 'EXPECTED_CONTENT_TYPE', label: 'Expected Content-Type' },
-              { value: 'REQUIRED_JSON_PATH', label: 'JSON path الزامی' },
-              { value: 'HEADER_VALUE', label: 'Header assertion' },
-              { value: 'BUSINESS_EXPRESSION', label: 'شرط Business success' },
-              { value: 'JSON_SCHEMA', label: 'JSON Schema validation' },
-            ]}
-          />
-          <input
-            value={JSON.stringify(row.configuration)}
-            onChange={(event) => {
-              const parsed = parseJson(event.target.value);
-              if (parsed.ok) update(row.id, { configuration: asRecord(parsed.value) });
-              else updateConfig(row.id, 'raw', event.target.value);
-            }}
-            className="rounded border border-gray-300 px-2 py-1 text-left font-mono text-sm"
-            dir="ltr"
-          />
-          <button type="button" onClick={() => onChange(rows.filter(item => item.id !== row.id))} className="rounded-lg text-red-600 hover:bg-red-50">
-            <Trash2 className="mx-auto h-4 w-4" />
-          </button>
+        <div key={row.id} className="space-y-2 rounded-lg border border-gray-200 p-3">
+          <div className="grid grid-cols-1 gap-2 lg:grid-cols-[44px_260px_1fr_44px]">
+            <input type="checkbox" checked={row.enabled} onChange={(event) => update(row.id, { enabled: event.target.checked })} className="m-auto" />
+            <Select
+              value={row.assertionType}
+              onChange={(event) => update(row.id, { assertionType: event.target.value as ApiRequestAssertion['assertionType'] })}
+              options={[
+                { value: 'EXPECTED_HTTP_STATUS', label: 'Status مورد انتظار' },
+                { value: 'MAX_RESPONSE_TIME', label: 'حداکثر زمان پاسخ' },
+                { value: 'EXPECTED_CONTENT_TYPE', label: 'Expected Content-Type' },
+                { value: 'REQUIRED_JSON_PATH', label: 'JSON path الزامی' },
+                { value: 'HEADER_VALUE', label: 'Header assertion' },
+                { value: 'BUSINESS_EXPRESSION', label: 'شرط Business success' },
+                { value: 'JSON_SCHEMA', label: 'JSON Schema validation' },
+              ]}
+            />
+            {row.assertionType === 'JSON_SCHEMA' ? (
+              <span className="self-center text-xs text-gray-500">Schema در کادر زیر ویرایش می‌شود (ارزیابی سمت سرور).</span>
+            ) : (
+              <input
+                value={JSON.stringify(row.configuration)}
+                onChange={(event) => {
+                  const parsed = parseJson(event.target.value);
+                  if (parsed.ok) update(row.id, { configuration: asRecord(parsed.value) });
+                  else updateConfig(row.id, 'raw', event.target.value);
+                }}
+                className="rounded border border-gray-300 px-2 py-1 text-left font-mono text-sm"
+                dir="ltr"
+              />
+            )}
+            <button type="button" onClick={() => onChange(rows.filter(item => item.id !== row.id))} className="rounded-lg text-red-600 hover:bg-red-50">
+              <Trash2 className="mx-auto h-4 w-4" />
+            </button>
+          </div>
+          {row.assertionType === 'JSON_SCHEMA' && (
+            <Textarea
+              label="JSON Schema"
+              value={typeof row.configuration.schema === 'string'
+                ? row.configuration.schema
+                : JSON.stringify(row.configuration.schema ?? {}, null, 2)}
+              onChange={(event) => {
+                const raw = event.target.value;
+                const parsed = parseJson(raw);
+                if (parsed.ok) updateConfig(row.id, 'schema', parsed.value);
+                else updateConfig(row.id, 'schema', raw);
+              }}
+              className="min-h-36 text-left font-mono"
+              dir="ltr"
+            />
+          )}
         </div>
       ))}
     </div>
@@ -3840,6 +5705,10 @@ const HistoryPanel = ({
   selected,
   manualResponses,
   loading,
+  statusFilter,
+  onStatusFilter,
+  compareIds,
+  onToggleCompare,
   onSelect,
   onManual,
 }: {
@@ -3847,14 +5716,55 @@ const HistoryPanel = ({
   selected: ApiRequestExecution | null;
   manualResponses: ApiManualResponseExample[];
   loading: boolean;
+  statusFilter: string;
+  onStatusFilter: (value: string) => void;
+  compareIds: string[];
+  onToggleCompare: (id: string) => void;
   onSelect: (execution: ApiRequestExecution) => void;
   onManual: () => void;
-}) => (
+}) => {
+  const filtered = statusFilter
+    ? rows.filter(row => row.transportResult === statusFilter || String(row.statusCode || '') === statusFilter)
+    : rows;
+  const compareRows = compareIds
+    .map(id => rows.find(row => row.id === id))
+    .filter((row): row is ApiRequestExecution => Boolean(row));
+
+  return (
   <div className="space-y-4">
     <div className="flex flex-wrap items-center justify-between gap-2">
       <h3 className="font-semibold text-gray-900">History اجرا</h3>
-      <Button size="sm" variant="secondary" icon={<Plus className="h-4 w-4" />} onClick={onManual}>Response دستی</Button>
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          className="rounded border border-gray-300 px-2 py-1 text-xs"
+          value={statusFilter}
+          onChange={(event) => onStatusFilter(event.target.value)}
+        >
+          <option value="">همه وضعیت‌ها</option>
+          <option value="SUCCESS">SUCCESS</option>
+          <option value="ERROR">ERROR</option>
+          <option value="TIMEOUT">TIMEOUT</option>
+          <option value="200">HTTP 200</option>
+          <option value="401">HTTP 401</option>
+          <option value="500">HTTP 500</option>
+        </select>
+        <Button size="sm" variant="secondary" icon={<Plus className="h-4 w-4" />} onClick={onManual}>Response دستی</Button>
+      </div>
     </div>
+    {compareRows.length === 2 && (
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+        {compareRows.map(row => (
+          <div key={row.id} className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs">
+            <div className="flex flex-wrap gap-2">
+              <Badge variant={resultBadgeVariant(row.transportResult)}>{row.transportResult}</Badge>
+              <span>HTTP {row.statusCode || '-'}</span>
+              <span>{row.durationMs || 0}ms</span>
+            </div>
+            <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap font-mono text-[11px]" dir="ltr">{String(row.response?.bodyPreview || row.sanitizedError || '-').slice(0, 1200)}</pre>
+          </div>
+        ))}
+      </div>
+    )}
     <Table
       columns={[
         { key: 'status', title: 'وضعیت', render: (item: ApiRequestExecution) => <Badge variant={resultBadgeVariant(item.transportResult)}>{item.transportResult}</Badge> },
@@ -3864,15 +5774,17 @@ const HistoryPanel = ({
         { key: 'runner', title: 'Runner', render: (item: ApiRequestExecution) => item.runnerId },
         { key: 'time', title: 'زمان', render: (item: ApiRequestExecution) => formatDate(item.startedAt) },
         { key: 'actions', title: '', render: (item: ApiRequestExecution) => (
-          <Button size="sm" variant={selected?.id === item.id ? 'primary' : 'ghost'} icon={<Eye className="h-4 w-4" />} onClick={(event) => {
-            event.stopPropagation();
-            onSelect(item);
-          }}>
-            مشاهده
-          </Button>
+          <div className="flex gap-1" onClick={(event) => event.stopPropagation()}>
+            <Button size="sm" variant={compareIds.includes(item.id) ? 'primary' : 'ghost'} onClick={() => onToggleCompare(item.id)}>
+              Compare
+            </Button>
+            <Button size="sm" variant={selected?.id === item.id ? 'primary' : 'ghost'} icon={<Eye className="h-4 w-4" />} onClick={() => onSelect(item)}>
+              مشاهده
+            </Button>
+          </div>
         ) },
       ]}
-      data={rows}
+      data={filtered}
       loading={loading}
       enableClientFilter={false}
       enableColumnChooser={false}
@@ -3898,7 +5810,8 @@ const HistoryPanel = ({
       </div>
     )}
   </div>
-);
+  );
+};
 
 const EffectiveRequestPanel = ({
   request,
@@ -4488,6 +6401,8 @@ const RepositorySection = ({
                 <span className="font-medium text-gray-900">{item.title}</span>
                 <Badge variant="default" size="sm">v{item.version}</Badge>
                 <Badge variant={classBadgeVariant(item.classification.type)} size="sm">{CLASSIFICATION_LABELS[item.classification.type]}</Badge>
+                {item.sharingStatus === 'DEPRECATED' && <Badge variant="danger" size="sm">DEPRECATED</Badge>}
+                {item.breakingChange && <Badge variant="warning" size="sm">Breaking</Badge>}
                 {item.isNewForUser && <Badge variant="success" size="sm">جدید</Badge>}
                 {item.hasNewerVersion && <Badge variant="warning" size="sm">نسخه جدید موجود است</Badge>}
               </div>
@@ -4639,20 +6554,31 @@ const ShareReviewSection = ({
   </div>
 );
 
+const ASSIGNABLE_DIRECTORY_ROLES: UserRole[] = [
+  'SYSTEM_ADMIN',
+  'TECH_LEAD',
+  'QA_LEAD',
+  'QA_SPECIALIST',
+  'BA',
+  'SECURITY_REVIEWER',
+  'PRODUCT_OWNER',
+  'DEVELOPER',
+];
+
 const UserManagementSection = ({
   users,
   loading,
   search,
   onSearch,
   onRefresh,
-  onChangeSystemAdmin,
+  onChangeRole,
 }: {
   users: ApiConsoleDirectoryUser[];
   loading: boolean;
   search: string;
   onSearch: (value: string) => void;
   onRefresh: () => void;
-  onChangeSystemAdmin: (user: ApiConsoleDirectoryUser, enabled: boolean) => void;
+  onChangeRole: (user: ApiConsoleDirectoryUser, role: UserRole, enabled: boolean) => void;
 }) => {
   const normalizedSearch = search.trim().toLocaleLowerCase('fa-IR');
   const filteredUsers = normalizedSearch
@@ -4669,7 +6595,7 @@ const UserManagementSection = ({
             <div>
               <h2 className="font-semibold text-gray-900">مدیریت کاربران CDE</h2>
               <p className="mt-1 text-sm text-gray-500">
-                هویت دولوپرها بعد از نخستین ورود موفق به این کنسول با حساب CDE به‌صورت خودکار همگام می‌شود.
+                هویت دولوپرها بعد از نخستین ورود موفق به این کنسول با حساب CDE به‌صورت خودکار همگام می‌شود. نقش‌های مدیریتی فقط از این صفحه قابل تخصیص هستند.
               </p>
             </div>
             <Button variant="secondary" size="sm" icon={<RefreshCw className="h-4 w-4" />} onClick={onRefresh} loading={loading}>
@@ -4712,35 +6638,51 @@ const UserManagementSection = ({
                   <Badge key={role} variant={role === 'SYSTEM_ADMIN' ? 'success' : 'secondary'} size="sm">{roleLabel(role)}</Badge>
                 ))}
                 {user.isBootstrapAdmin && <Badge variant="warning" size="sm">مدیر اولیه تنظیمات سرور</Badge>}
+                {user.isBootstrapQaLead && <Badge variant="warning" size="sm">QA Lead از env</Badge>}
               </div>
             ),
           },
           {
             key: 'actions',
             title: 'عملیات',
-            render: (user: ApiConsoleDirectoryUser) => user.isSystemAdmin ? (
-              <Button
-                size="sm"
-                variant="danger"
-                disabled={user.isBootstrapAdmin}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onChangeSystemAdmin(user, false);
-                }}
-              >
-                {user.isBootstrapAdmin ? 'مدیر اولیه' : 'لغو نقش مدیرسیستم'}
-              </Button>
-            ) : (
-              <Button
-                size="sm"
-                icon={<ShieldCheck className="h-4 w-4" />}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onChangeSystemAdmin(user, true);
-                }}
-              >
-                افزودن به‌عنوان مدیرسیستم
-              </Button>
+            render: (user: ApiConsoleDirectoryUser) => (
+              <div className="flex min-w-[220px] flex-col gap-2">
+                <Select
+                  aria-label={`نقش جدید برای ${user.fullName}`}
+                  value=""
+                  onChange={(event) => {
+                    const role = event.target.value as UserRole;
+                    if (!role || user.roles.includes(role)) return;
+                    onChangeRole(user, role, true);
+                    event.target.value = '';
+                  }}
+                  options={[
+                    { value: '', label: 'افزودن نقش…' },
+                    ...ASSIGNABLE_DIRECTORY_ROLES
+                      .filter(role => role !== 'DEVELOPER' && !user.roles.includes(role))
+                      .filter(role => !(role === 'SYSTEM_ADMIN' && user.isBootstrapAdmin))
+                      .map(role => ({ value: role, label: roleLabel(role) })),
+                  ]}
+                />
+                <div className="flex flex-wrap gap-1">
+                  {user.roles
+                    .filter(role => role !== 'DEVELOPER')
+                    .map(role => (
+                      <Button
+                        key={role}
+                        size="sm"
+                        variant="danger"
+                        disabled={(role === 'SYSTEM_ADMIN' && user.isBootstrapAdmin) || (role === 'QA_LEAD' && !!user.isBootstrapQaLead)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onChangeRole(user, role, false);
+                        }}
+                      >
+                        لغو {roleLabel(role)}
+                      </Button>
+                    ))}
+                </div>
+              </div>
             ),
           },
         ]}
@@ -4976,7 +6918,19 @@ const ImportCurlModal = ({
         ) : (
           <div className="space-y-3">
             {previewSubtab === 'summary' && (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-3">
+                {(preview.secretScan?.findings?.length || 0) > 0 && (
+                  <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                    <p className="font-semibold">هشدار Secret Scan ({preview.secretScan?.mode || 'warn'})</p>
+                    <ul className="mt-2 list-disc pr-5">
+                      {(preview.secretScan?.findings || []).map(finding => (
+                        <li key={finding}>{finding}</li>
+                      ))}
+                    </ul>
+                    <p className="mt-2 text-xs">الگوهای احتمالی Secret در cURL دیده شد؛ قبل از Import بررسی کنید.</p>
+                  </div>
+                )}
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <InfoTile label="Dialect" value={preview.detectedDialect} />
                 <InfoTile label="Method" value={preview.effectiveMethod} />
                 <InfoTile label="URL" value={preview.url} />
@@ -4989,12 +6943,18 @@ const ImportCurlModal = ({
                 <InfoTile label="Service ID" value={preview.normalizedRequest.classification.serviceId || '-'} />
                 <InfoTile label="Operation path" value={preview.normalizedRequest.classification.operationPath || '-'} />
                 <InfoTile label="Parser" value={preview.parserVersion} />
+                </div>
               </div>
             )}
             {previewSubtab === 'original' && <CodeBlock value={preview.originalCurl} minHeight="min-h-48 sm:min-h-[420px]" />}
             {previewSubtab === 'normalized' && <CodeBlock value={JSON.stringify(preview.normalizedRequest, null, 2)} minHeight="min-h-48 sm:min-h-[420px]" />}
             {previewSubtab === 'warnings' && (
               <div className="min-h-48 space-y-2 rounded-lg border border-gray-200 bg-gray-50 p-3 sm:min-h-[420px]">
+                {(preview.secretScan?.findings?.length || 0) > 0 && (
+                  <div className="rounded-lg border border-red-200 bg-red-50 p-2 text-sm text-red-700">
+                    Secret Scan: {(preview.secretScan?.findings || []).join(', ')}
+                  </div>
+                )}
                 {preview.warnings.length || preview.unsupportedOptions.length ? (
                   [...preview.warnings, ...preview.unsupportedOptions.map(option => `Unsupported option: ${option}`)].map((warning, index) => (
                     <div key={`${warning}-${index}`} className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-sm text-amber-700">

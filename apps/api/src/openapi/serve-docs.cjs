@@ -48,11 +48,26 @@ async function serveOpenApiDocs(req, res, parsedUrl) {
   <script src="/api/docs/swagger-ui-bundle.js"></script>
   <script src="/api/docs/swagger-ui-standalone-preset.js"></script>
   <script>
-    window.ui = SwaggerUIBundle({
-      url: '/api/openapi.json',
-      dom_id: '#swagger-ui',
-      presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
-      layout: 'StandaloneLayout'
+    (async function () {
+      let session = {};
+      try {
+        session = await fetch('/api/session', { credentials: 'same-origin' }).then(function (r) { return r.json(); });
+      } catch (_) {}
+      window.ui = SwaggerUIBundle({
+        url: '/api/openapi.json',
+        dom_id: '#swagger-ui',
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+        layout: 'StandaloneLayout',
+        persistAuthorization: true,
+        requestInterceptor: function (request) {
+          request.credentials = 'same-origin';
+          request.headers = request.headers || {};
+          if (session.csrfToken) request.headers['x-csrf-token'] = session.csrfToken;
+          return request;
+        },
+      });
+    })().catch(function (error) {
+      document.body.textContent = 'Swagger initialization failed: ' + error.message;
     });
   </script>
 </body>

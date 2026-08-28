@@ -23,6 +23,7 @@ const {
   buildRuntimeCurlExport,
   buildRuntimePostmanCollection,
   createServer,
+  discoverySourceFingerprint,
   mergeDiscoveredRequest,
   runtimeOpenApiDocument,
   sourceControlledDefinition,
@@ -178,6 +179,13 @@ test('static discovery reports conflicting service IDs and NEEDS_INPUT for unkno
   assert.equal(result.projectServiceIdCandidates.length, 2);
   assert.equal(result.operations[0].schemaCompleteness, 'NEEDS_INPUT');
   assert.deepEqual(result.operations[0].payloadExample, {});
+});
+
+test('discovery snapshot fingerprint is stable and available to the CDE scan path', () => {
+  const first = discoverySourceFingerprint([{ sourceFingerprint: 'b' }, { sourceFingerprint: 'a' }]);
+  const second = discoverySourceFingerprint([{ sourceFingerprint: 'a' }, { sourceFingerprint: 'b' }]);
+  assert.match(first, /^[a-f0-9]{64}$/);
+  assert.equal(first, second);
 });
 
 test('runtime OpenAPI, Postman, and cURL outputs contain bindings and placeholders but no stored secrets', () => {

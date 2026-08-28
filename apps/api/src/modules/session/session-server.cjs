@@ -134,6 +134,17 @@ function directoryUserForIdentity(store, userLoginName, userId) {
   );
 }
 
+const ROLE_PRECEDENCE = [
+  'SYSTEM_ADMIN',
+  'TECH_LEAD',
+  'QA_LEAD',
+  'SECURITY_REVIEWER',
+  'QA_SPECIALIST',
+  'BA',
+  'PRODUCT_OWNER',
+  'DEVELOPER',
+];
+
 function hasManagedSystemAdminRole(userLoginName, userId) {
   const store = readDirectoryStore();
   const user = directoryUserForIdentity(store, userLoginName, userId);
@@ -146,15 +157,67 @@ function hasManagedSystemAdminRole(userLoginName, userId) {
   );
 }
 
+function managedApprovalRoles(userLoginName, userId) {
+  const store = readDirectoryStore();
+  const user = directoryUserForIdentity(store, userLoginName, userId);
+  if (!user || user.isActive === false) return [];
+  return Array.from(new Set((Array.isArray(store.directoryRoleAssignments) ? store.directoryRoleAssignments : [])
+    .filter(assignment =>
+      assignment.userId === user.id &&
+      assignment.source === 'ADMIN_APPROVAL' &&
+      assignment.isActive !== false &&
+      ROLE_PRECEDENCE.includes(assignment.role)
+    )
+    .map(assignment => assignment.role)));
+}
+
 function isBootstrapSystemAdmin(userLoginName) {
   return loginListIncludes(process.env.API_CONSOLE_ADMIN_LOGINS, userLoginName);
 }
 
+function pickPrimaryRole(roles) {
+  const unique = Array.from(new Set((roles || []).filter(role => ROLE_PRECEDENCE.includes(role))));
+  if (!unique.length) return 'DEVELOPER';
+  return ROLE_PRECEDENCE.find(role => unique.includes(role)) || 'DEVELOPER';
+}
+
 function resolveRole(userLoginName, userId) {
   const login = String(userLoginName || '');
-  if (isBootstrapSystemAdmin(login) || hasManagedSystemAdminRole(login, userId)) return 'SYSTEM_ADMIN';
-  if (loginListIncludes(process.env.API_CONSOLE_QA_LEAD_LOGINS, login)) return 'QA_LEAD';
-  return 'DEVELOPER';
+  const roles = [];
+  if (isBootstrapSystemAdmin(login) || hasManagedSystemAdminRole(login, userId)) {
+    roles.push('SYSTEM_ADMIN');
+  }
+  if (loginListIncludes(process.env.API_CONSOLE_QA_LEAD_LOGINS, login)) {
+    roles.push('QA_LEAD');
+  }
+  roles.push(...managedApprovalRoles(login, userId));
+  return pickPrimaryRole(roles);
+}
+
+/**
+ * Application scope from managed directory role assignments.
+ * Returns null when unrestricted (bootstrap admin, ALL assignment, or no managed role).
+ * Returns a concrete app id list when roles are scoped to specific applications.
+ */
+function resolveManagedScopeApplicationIds(userLoginName, userId) {
+  const login = String(userLoginName || '');
+  if (isBootstrapSystemAdmin(login)) return null;
+  const store = readDirectoryStore();
+  const user = directoryUserForIdentity(store, userLoginName, userId);
+  if (!user || user.isActive === false) return null;
+  const assignments = (Array.isArray(store.directoryRoleAssignments) ? store.directoryRoleAssignments : [])
+    .filter(assignment =>
+      assignment.userId === user.id &&
+      assignment.source === 'ADMIN_APPROVAL' &&
+      assignment.isActive !== false &&
+      ROLE_PRECEDENCE.includes(assignment.role) &&
+      assignment.role !== 'DEVELOPER'
+    );
+  if (!assignments.length) return null;
+  if (assignments.some(assignment => !assignment.applicationId || assignment.applicationId === 'ALL')) {
+    return null;
+  }
+  return Array.from(new Set(assignments.map(assignment => String(assignment.applicationId)).filter(Boolean)));
 }
 
 function createSessionRecord(partial = {}) {
@@ -282,6 +345,8 @@ function buildConsoleContext(session) {
     phoneNumber: session.userLoginName || '',
     isActive: true,
   };
+  const managedScope = resolveManagedScopeApplicationIds(session.userLoginName, session.userId);
+  const scopeApplicationIds = managedScope?.length ? managedScope : [applicationId];
   return {
     contextId: `cde:${session.id}`,
     userId: session.userId,
@@ -289,7 +354,7 @@ function buildConsoleContext(session) {
     assignmentId: `cde:${session.userId}:${applicationId}`,
     assignmentIds: [`cde:${session.userId}:${applicationId}`],
     applicationId,
-    scopeApplicationIds: [applicationId],
+    scopeApplicationIds,
     application,
     applications,
     // Resolve on every request so an administrator assignment becomes effective
@@ -297,6 +362,8 @@ function buildConsoleContext(session) {
     role: resolveRole(session.userLoginName, session.userId),
     scope: 'SYSTEMS',
     token: session.csrfToken,
+    cdeOriginId: session.cdeOriginId || 'default',
+    cdeOriginUrl: session.cdeOriginUrl || undefined,
   };
 }
 
@@ -380,7 +447,9 @@ async function handleSession(req, parsedUrl, body, res) {
   if (pathname === '/api/session/logout' && req.method === 'POST') {
     assertCsrf(req);
     const { deleteAllRuntimeSessions } = require('../runtime/runtime-session-store.cjs');
+    const { deleteCdeSession } = require('../cde/cde-session-store.cjs');
     await deleteAllRuntimeSessions(session.id);
+    await deleteCdeSession(session.id);
     await deleteSession(session.id);
     clearSessionCookie(res);
     req.apiConsoleSession = null;
@@ -389,22 +458,95 @@ async function handleSession(req, parsedUrl, body, res) {
   throw new SessionError('ENDPOINT_NOT_FOUND', 'Session endpoint not found.', 404);
 }
 
+function summarizeSession(session) {
+  if (!session || typeof session !== 'object') return null;
+  return {
+    id: session.id,
+    userId: session.userId || null,
+    userLoginName: session.userLoginName || null,
+    displayName: session.displayName || null,
+    role: session.role || null,
+    applicationId: session.applicationId || null,
+    cdeConnected: Boolean(session.cdeConnected),
+    createdAt: session.createdAt || null,
+    updatedAt: session.updatedAt || null,
+  };
+}
+
+async function listActiveSessions() {
+  const sessions = [];
+  const seen = new Set();
+  for (const [key, entry] of memoryStore.entries()) {
+    if (!key.startsWith(REDIS_PREFIX)) continue;
+    if (!entry || entry.expiresAt <= Date.now()) {
+      memoryStore.delete(key);
+      continue;
+    }
+    try {
+      const parsed = typeof entry.value === 'string' ? JSON.parse(entry.value) : entry.value;
+      const summary = summarizeSession(parsed);
+      if (summary?.id && !seen.has(summary.id)) {
+        seen.add(summary.id);
+        sessions.push(summary);
+      }
+    } catch {
+      // skip corrupt entries
+    }
+  }
+  await withRedis(async client => {
+    let cursor = '0';
+    do {
+      const [next, keys] = await client.scan(cursor, 'MATCH', `${REDIS_PREFIX}*`, 'COUNT', 100);
+      cursor = next;
+      if (!keys.length) continue;
+      const values = await client.mget(keys);
+      values.forEach(raw => {
+        if (!raw) return;
+        try {
+          const summary = summarizeSession(JSON.parse(raw));
+          if (summary?.id && !seen.has(summary.id)) {
+            seen.add(summary.id);
+            sessions.push(summary);
+          }
+        } catch {
+          // skip corrupt entries
+        }
+      });
+    } while (cursor !== '0');
+  }, () => undefined);
+  sessions.sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+  return sessions;
+}
+
 module.exports = {
   SessionError,
   COOKIE_NAME,
-  LEGACY_CONTEXT_ENABLED: !process.env.NODE_ENV || process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test',
+  // Legacy browser context headers are opt-in only (tests / emergency). Never enable in production.
+  isLegacyContextEnabled() {
+    return process.env.API_CONSOLE_ALLOW_LEGACY_CONTEXT === 'true'
+      && process.env.NODE_ENV !== 'production';
+  },
+  get LEGACY_CONTEXT_ENABLED() {
+    return this.isLegacyContextEnabled();
+  },
+  ROLE_PRECEDENCE,
   attachSession,
   attachConsoleContext,
   assertCsrf,
   buildConsoleContext,
   canHandleSession,
   clearSessionCookie,
+  createSessionRecord,
   handleSession,
   markCdeConnected,
   markCdeDisconnected,
   isBootstrapSystemAdmin,
+  loginListIncludes,
+  pickPrimaryRole,
   requireSession,
   resolveRole,
+  resolveManagedScopeApplicationIds,
+  listActiveSessions,
   saveSession,
   setSelectedProject,
   secretMaterial,

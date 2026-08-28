@@ -1,6 +1,7 @@
 import type { ActiveContext, ApplicationScopeFilter, PaginatedResponse } from '../types';
 import { getCsrfToken } from './cdeApi';
 import type {
+  ApiActivityEvent,
   ApiCollection,
   ApiConsoleDirectoryUser,
   ApiConsolePermissionPolicy,
@@ -17,9 +18,12 @@ import type {
   ApiRepositoryItem,
   ApiRequestDefinition,
   ApiRequestExecution,
+  ApiReviewChecklist,
   ApiShareRequest,
+  ApiTestRun,
   ApiUsageReport,
   ApiVersionConsumer,
+  ApiVisibility,
   ApiDocumentationResult,
   ApiAuthenticationDocumentationProfile,
   NormalizedApiRequest,
@@ -29,6 +33,24 @@ import type {
   DiscoverySyncResult,
   RuntimeCurlExport,
   DiscoveredOperation,
+  ApiPortalItem,
+  ApiPortalDetail,
+  ApiPortalShareTokenResult,
+  ApiPublicPortalDocument,
+  ApiContractBaseline,
+  ApiContractCompareResult,
+  ApiSecretScanResult,
+  ApiBrandingState,
+  ApiBrandingTemplate,
+  ApiBrandingPreview,
+  ApiMockDefinition,
+  ApiContractSuiteResult,
+  ApiJitAccessGrant,
+  ApiComplianceReport,
+  ApiOrgPolicies,
+  ApiDualApprovalGrant,
+  ApiDocLanguage,
+  CdeOriginOption,
 } from '../types/apiConsole';
 
 const API_BASE = (import.meta.env.VITE_API_CONSOLE_BASE_URL || '/api/api-console').replace(/\/$/, '');
@@ -43,6 +65,10 @@ const API_CONSOLE_POLICY: ApiConsolePermissionPolicy = {
   canExecuteProductionCommand: ['SYSTEM_ADMIN', 'TECH_LEAD'],
   canDelete: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER', 'DEVELOPER'],
   canGenerateDocumentation: ['SYSTEM_ADMIN', 'QA_LEAD', 'QA_SPECIALIST', 'BA', 'SECURITY_REVIEWER', 'TECH_LEAD', 'PRODUCT_OWNER', 'DEVELOPER'],
+  canReviewShares: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
+  canViewUsageReports: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
+  canManageUsers: ['SYSTEM_ADMIN'],
+  canManageProtectedEnvironments: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
 };
 
 type ApiConsoleRequestOptions = {
@@ -96,6 +122,7 @@ const API_ERROR_CATEGORY_LABELS: Record<string, string> = {
   RUNTIME_SERVICE_ID_REQUIRED: 'Service ID تأیید نشده',
   DISCOVERY_NOT_FOUND: 'Discovery موجود نیست',
   DATA_SERVICE_EXECUTION_BLOCKED: 'اجرای Data Service مسدود است',
+  DATA_SERVICE_AUTH_REQUIRED: 'احراز هویت Data Service لازم است',
 };
 
 const API_ERROR_MESSAGE_TRANSLATIONS: Record<string, string> = {
@@ -161,6 +188,9 @@ const API_ERROR_MESSAGE_TRANSLATIONS: Record<string, string> = {
   'DOCX template central directory was not found.': 'ساختار مرکزی قالب DOCX پیدا نشد.',
   'Invalid DOCX central directory.': 'ساختار مرکزی قالب DOCX معتبر نیست.',
   'DOCX template does not contain word/document.xml.': 'قالب DOCX فایل word/document.xml را ندارد.',
+  'Data Service execution requires an administrator-approved base URL and authentication secret.': 'اجرای Data Service نیازمند base URL تأییدشده و secret احراز هویت است.',
+  'Data Service authentication secret is unavailable.': 'Secret احراز هویت Data Service در دسترس نیست.',
+  'Data Service token endpoint did not return a usable token.': 'endpoint توکن Data Service توکن قابل‌استفاده برنگرداند.',
 };
 
 function translateApiErrorMessage(message: string): string {
@@ -198,37 +228,9 @@ function formatApiError(category: string, message: string): Error {
   return new Error(`${categoryLabel}: ${translatedMessage}`);
 }
 
-function compactContext(context?: ActiveContext) {
-  if (!context) return undefined;
-  return {
-    userId: context.userId,
-    user: context.user ? { id: context.user.id, fullName: context.user.fullName } : undefined,
-    assignmentId: context.assignmentId,
-    applicationId: context.applicationId,
-    scopeApplicationIds: context.scopeApplicationIds,
-    role: context.role,
-    scope: context.scope,
-    automatedTestsEnabled: context.automatedTestsEnabled,
-  };
-}
-
-function encodeBase64Utf8(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let binary = '';
-  bytes.forEach(byte => {
-    binary += String.fromCharCode(byte);
-  });
-  return btoa(binary);
-}
-
-function contextHeader(context?: ActiveContext): Record<string, string> {
-  const compact = compactContext(context);
-  if (!compact) return {};
-  const encoded = encodeBase64Utf8(JSON.stringify(compact));
-  return {
-    'x-utms-context': encoded,
-    'x-api-console-context': encoded,
-  };
+function contextHeader(_context?: ActiveContext): Record<string, string> {
+  // AuthZ comes from the HttpOnly session cookie. Do not send forgeable role claims.
+  return {};
 }
 
 function applicationScopeParam(scope: ApplicationScopeFilter): string {
@@ -315,15 +317,177 @@ function makeInFlightGetKey(url: string, headers: Record<string, string>): strin
   });
 }
 
+async function downloadAuthenticatedFile(path: string, fallbackName: string): Promise<void> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'GET',
+    credentials: 'include',
+  });
+  if (!response.ok) {
+    throw await parseApiError(response);
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get('content-disposition') || '';
+  const match = disposition.match(/filename="?([^"]+)"?/i);
+  const fileName = match?.[1] || fallbackName;
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 export const apiConsoleApi = {
   policy: API_CONSOLE_POLICY,
 
-  getEnvironments(): Promise<ApiEnvironmentProfile[]> {
-    return requestJson('/environments');
+  getEnvironments(options: { includeArchived?: boolean } = {}): Promise<ApiEnvironmentProfile[]> {
+    return requestJson(withQuery('/environments', {
+      includeArchived: options.includeArchived ? 'true' : undefined,
+    }));
+  },
+
+  createEnvironment(data: Partial<ApiEnvironmentProfile>, context: ActiveContext): Promise<ApiEnvironmentProfile> {
+    return requestJson('/environments', { method: 'POST', context, body: { data } });
+  },
+
+  updateEnvironment(id: string, data: Partial<ApiEnvironmentProfile>, context: ActiveContext): Promise<ApiEnvironmentProfile> {
+    return requestJson(`/environments/${encodeURIComponent(id)}`, { method: 'PUT', context, body: { data } });
+  },
+
+  cloneEnvironment(id: string, context: ActiveContext): Promise<ApiEnvironmentProfile> {
+    return requestJson(`/environments/${encodeURIComponent(id)}/clone`, { method: 'POST', context, body: {} });
+  },
+
+  archiveEnvironment(id: string, context: ActiveContext, force = false): Promise<ApiEnvironmentProfile> {
+    return requestJson(withQuery(`/environments/${encodeURIComponent(id)}`, { force: force ? 'true' : undefined }), {
+      method: 'DELETE',
+      context,
+      body: { force },
+    });
   },
 
   getRunners(): Promise<ApiExecutionRunner[]> {
     return requestJson('/runners');
+  },
+
+  createRunner(data: Partial<ApiExecutionRunner>, context: ActiveContext): Promise<ApiExecutionRunner> {
+    return requestJson('/runners', { method: 'POST', context, body: { data } });
+  },
+
+  updateRunner(id: string, data: Partial<ApiExecutionRunner>, context: ActiveContext): Promise<ApiExecutionRunner> {
+    return requestJson(`/runners/${encodeURIComponent(id)}`, { method: 'PUT', context, body: { data } });
+  },
+
+  deleteRunner(id: string, context: ActiveContext): Promise<ApiExecutionRunner> {
+    return requestJson(`/runners/${encodeURIComponent(id)}`, { method: 'DELETE', context, body: {} });
+  },
+
+  getActivity(
+    filters: { applicationId?: string; actorUserId?: string; page?: number; limit?: number },
+    context: ActiveContext
+  ): Promise<PaginatedResponse<ApiActivityEvent>> {
+    return requestJson(withQuery('/activity', {
+      applicationId: filters.applicationId,
+      actorUserId: filters.actorUserId,
+      page: filters.page || 1,
+      limit: filters.limit || 30,
+    }), { context });
+  },
+
+  updateRequestVisibility(id: string, visibility: ApiVisibility, context: ActiveContext): Promise<ApiRequestDefinition> {
+    return requestJson(`/requests/${encodeURIComponent(id)}/visibility`, {
+      method: 'PUT',
+      context,
+      body: { visibility },
+    });
+  },
+
+  updateCollectionVisibility(id: string, visibility: ApiVisibility, context: ActiveContext): Promise<ApiCollection> {
+    return requestJson(`/collections/${encodeURIComponent(id)}/visibility`, {
+      method: 'PUT',
+      context,
+      body: { visibility },
+    });
+  },
+
+  transferRequestOwnership(id: string, targetUserId: string, context: ActiveContext): Promise<ApiRequestDefinition> {
+    return requestJson(`/requests/${encodeURIComponent(id)}/transfer`, {
+      method: 'POST',
+      context,
+      body: { targetUserId },
+    });
+  },
+
+  setRequestCoOwners(id: string, coOwnerIds: string[], context: ActiveContext): Promise<ApiRequestDefinition> {
+    return requestJson(`/requests/${encodeURIComponent(id)}/co-owners`, {
+      method: 'PUT',
+      context,
+      body: { coOwnerIds },
+    });
+  },
+
+  runCollection(
+    collectionId: string,
+    options: {
+      requestIds?: string[];
+      environmentId?: string;
+      stopOnFail?: boolean;
+      runnerId?: string;
+      webhookUrl?: string;
+      webhookSecret?: string;
+    },
+    context: ActiveContext
+  ): Promise<ApiTestRun> {
+    return requestJson(`/collections/${encodeURIComponent(collectionId)}/run`, {
+      method: 'POST',
+      context,
+      body: { options },
+    });
+  },
+
+  getTestRuns(
+    filters: { collectionId?: string; applicationId?: string; page?: number; limit?: number },
+    context: ActiveContext
+  ): Promise<PaginatedResponse<ApiTestRun>> {
+    return requestJson(withQuery('/test-runs', {
+      collectionId: filters.collectionId,
+      applicationId: filters.applicationId,
+      page: filters.page || 1,
+      limit: filters.limit || 20,
+    }), { context });
+  },
+
+  getTestRun(id: string, context: ActiveContext): Promise<ApiTestRun> {
+    return requestJson(`/test-runs/${encodeURIComponent(id)}`, { context });
+  },
+
+  deprecateRepositoryVersion(
+    apiId: string,
+    version: string,
+    data: { reason: string; effectiveAt?: string },
+    context: ActiveContext
+  ): Promise<ApiRequestDefinition> {
+    return requestJson(`/repository/${encodeURIComponent(apiId)}/versions/${encodeURIComponent(version)}/deprecate`, {
+      method: 'POST',
+      context,
+      body: data,
+    });
+  },
+
+  addShareReviewComment(id: string, text: string, context: ActiveContext): Promise<ApiShareRequest> {
+    return requestJson(`/share-reviews/${encodeURIComponent(id)}/comments`, {
+      method: 'POST',
+      context,
+      body: { text },
+    });
+  },
+
+  updateShareReviewChecklist(id: string, checklist: ApiReviewChecklist, context: ActiveContext): Promise<ApiShareRequest> {
+    return requestJson(`/share-reviews/${encodeURIComponent(id)}/checklist`, {
+      method: 'PUT',
+      context,
+      body: { checklist },
+    });
   },
 
   getRuntimeProfiles(applicationId: string, context: ActiveContext): Promise<RuntimeProfile[]> {
@@ -344,6 +508,14 @@ export const apiConsoleApi = {
 
   validateRuntimeProfile(id: string, context: ActiveContext): Promise<{ profile: RuntimeProfile; validation: { valid: boolean; addresses: string[]; checkedAt: string } }> {
     return requestJson(`/admin/runtime-profiles/${encodeURIComponent(id)}/validate`, { method: 'POST', context, body: {} });
+  },
+
+  promoteRuntimeProfile(id: string, targetKind: RuntimeProfile['kind'], context: ActiveContext): Promise<RuntimeProfile> {
+    return requestJson(`/admin/runtime-profiles/${encodeURIComponent(id)}/promote`, {
+      method: 'POST',
+      context,
+      body: { targetKind },
+    });
   },
 
   getRuntimeSession(profileId: string, context: ActiveContext): Promise<RuntimeSessionStatus> {
@@ -425,6 +597,7 @@ export const apiConsoleApi = {
       collectionId: string;
       applicationId: string;
       environmentId: string;
+      folderPath?: string[];
       normalizedRequest: NormalizedApiRequest;
       originalImportedCurl?: string;
       importedCurlId?: string;
@@ -439,11 +612,11 @@ export const apiConsoleApi = {
     });
   },
 
-  createBlankRequest(collectionId: string, applicationId: string, environmentId: string, context: ActiveContext): Promise<ApiRequestDefinition> {
+  createBlankRequest(collectionId: string, applicationId: string, environmentId: string, context: ActiveContext, folderPath?: string[]): Promise<ApiRequestDefinition> {
     return requestJson('/requests/blank', {
       method: 'POST',
       context,
-      body: { data: { collectionId, applicationId, environmentId } },
+      body: { data: { collectionId, applicationId, environmentId, folderPath: folderPath || [] } },
     });
   },
 
@@ -457,7 +630,7 @@ export const apiConsoleApi = {
 
   getRequests(
     applicationId: ApplicationScopeFilter,
-    filters: { page: number; limit: number; search?: string; collectionId?: string; classificationType?: string; status?: string },
+    filters: { page: number; limit: number; search?: string; collectionId?: string; classificationType?: string; status?: string; folderPath?: string },
     context?: ActiveContext
   ): Promise<PaginatedResponse<ApiRequestDefinition>> {
     return requestJson(withQuery('/requests', {
@@ -468,6 +641,7 @@ export const apiConsoleApi = {
       collectionId: filters.collectionId,
       classificationType: filters.classificationType,
       status: filters.status,
+      folderPath: filters.folderPath,
     }), { context });
   },
 
@@ -485,7 +659,7 @@ export const apiConsoleApi = {
 
   shareRequest(
     requestId: string,
-    data: { purpose: string; introduction: string; description: string },
+    data: { purpose: string; introduction: string; description: string; ticketId?: string; ticketUrl?: string },
     context: ActiveContext
   ): Promise<ApiShareRequest> {
     return requestJson(`/requests/${encodeURIComponent(requestId)}/share`, {
@@ -495,9 +669,21 @@ export const apiConsoleApi = {
     });
   },
 
+  updateShareReviewTicket(
+    id: string,
+    data: { ticketId?: string; ticketUrl?: string },
+    context: ActiveContext
+  ): Promise<ApiShareRequest> {
+    return requestJson(`/share-reviews/${encodeURIComponent(id)}/ticket`, {
+      method: 'PUT',
+      context,
+      body: data,
+    });
+  },
+
   createVersion(
     requestId: string,
-    data: { version: string; changeLog: string },
+    data: { version: string; changeLog: string; breakingChange?: boolean; migrationNote?: string },
     context: ActiveContext
   ): Promise<ApiRequestDefinition> {
     return requestJson(`/requests/${encodeURIComponent(requestId)}/versions`, {
@@ -526,11 +712,17 @@ export const apiConsoleApi = {
     return requestJson(`/share-reviews/${encodeURIComponent(id)}`, { context });
   },
 
-  approveShareReview(id: string, consumers: ApiVersionConsumer[], rowVersion: string, context: ActiveContext): Promise<ApiShareRequest> {
+  approveShareReview(
+    id: string,
+    consumers: ApiVersionConsumer[],
+    rowVersion: string,
+    context: ActiveContext,
+    checklist?: ApiReviewChecklist
+  ): Promise<ApiShareRequest> {
     return requestJson(`/share-reviews/${encodeURIComponent(id)}/approve`, {
       method: 'POST',
       context,
-      body: { consumers, rowVersion },
+      body: { consumers, rowVersion, checklist },
     });
   },
 
@@ -555,6 +747,77 @@ export const apiConsoleApi = {
       method: 'PUT',
       context,
       body: { enabled },
+    });
+  },
+
+  setDirectoryRole(
+    userId: string,
+    role: string,
+    enabled: boolean,
+    context: ActiveContext,
+    options: { applicationId?: string; applicationIds?: string[] } = {}
+  ): Promise<ApiConsoleDirectoryUser> {
+    return requestJson(`/admin/users/${encodeURIComponent(userId)}/roles`, {
+      method: 'PUT',
+      context,
+      body: {
+        role,
+        enabled,
+        ...(options.applicationId ? { applicationId: options.applicationId } : {}),
+        ...(options.applicationIds ? { applicationIds: options.applicationIds } : {}),
+      },
+    });
+  },
+
+  getAuditLog(
+    filters: {
+      page: number;
+      limit: number;
+      userId?: string;
+      action?: string;
+      applicationId?: ApplicationScopeFilter;
+      correlationId?: string;
+      dateFrom?: string;
+      dateTo?: string;
+    },
+    context: ActiveContext
+  ): Promise<import('../types').PaginatedResponse<import('../types').ApiAuditEvent>> {
+    return requestJson(withQuery('/admin/audit', {
+      page: filters.page,
+      limit: filters.limit,
+      userId: filters.userId,
+      action: filters.action,
+      applicationId: applicationScopeParam(filters.applicationId ?? 'ALL'),
+      correlationId: filters.correlationId,
+      dateFrom: filters.dateFrom,
+      dateTo: filters.dateTo,
+    }), { context });
+  },
+
+  getNotifications(
+    filters: { page?: number; limit?: number; unreadOnly?: boolean },
+    context: ActiveContext
+  ): Promise<import('../types').NotificationListResponse> {
+    return requestJson(withQuery('/notifications', {
+      page: filters.page || 1,
+      limit: filters.limit || 20,
+      unreadOnly: filters.unreadOnly ? 'true' : undefined,
+    }), { context });
+  },
+
+  markNotificationRead(id: string, context: ActiveContext): Promise<import('../types').Notification> {
+    return requestJson(`/notifications/${encodeURIComponent(id)}/read`, {
+      method: 'POST',
+      context,
+      body: {},
+    });
+  },
+
+  markAllNotificationsRead(context: ActiveContext): Promise<{ updated: number }> {
+    return requestJson('/notifications/read-all', {
+      method: 'POST',
+      context,
+      body: {},
     });
   },
 
@@ -739,11 +1002,15 @@ export const apiConsoleApi = {
     });
   },
 
-  generateDocumentationFinal(requestId: string, context: ActiveContext): Promise<ApiDocumentationResult> {
+  generateDocumentationFinal(
+    requestId: string,
+    context: ActiveContext,
+    language: ApiDocLanguage = 'FA'
+  ): Promise<ApiDocumentationResult> {
     return requestJson(`/requests/${encodeURIComponent(requestId)}/documentation/final`, {
       method: 'POST',
       context,
-      body: {},
+      body: { language },
     });
   },
 
@@ -756,5 +1023,204 @@ export const apiConsoleApi = {
 
   runParserSelfCheck(): Promise<ParserSelfCheckResult> {
     return requestJson('/self-check');
+  },
+
+  getPortalRepository(
+    filters: {
+      page?: number;
+      limit?: number;
+      search?: string;
+      classificationType?: string;
+      serviceId?: string;
+      applicationId?: string;
+    },
+    context: ActiveContext
+  ): Promise<PaginatedResponse<ApiPortalItem>> {
+    return requestJson(withQuery('/portal/repository', {
+      page: filters.page || 1,
+      limit: filters.limit || 30,
+      search: filters.search,
+      classificationType: filters.classificationType,
+      serviceId: filters.serviceId,
+      applicationId: filters.applicationId,
+    }), { context });
+  },
+
+  getPortalRepositoryVersion(apiId: string, version: string, context: ActiveContext): Promise<ApiPortalDetail> {
+    return requestJson(`/portal/repository/${encodeURIComponent(apiId)}/versions/${encodeURIComponent(version)}`, { context });
+  },
+
+  createPortalShareToken(
+    data: { apiId: string; version: string; ttlHours?: number },
+    context: ActiveContext
+  ): Promise<ApiPortalShareTokenResult> {
+    return requestJson('/portal/share-tokens', { method: 'POST', context, body: { data } });
+  },
+
+  getSharedPortalDocument(token: string): Promise<ApiPublicPortalDocument> {
+    return requestJson(`/portal/shared/${encodeURIComponent(token)}`);
+  },
+
+  createContractBaseline(
+    data: { collectionId: string; name?: string; openapi?: Record<string, unknown> },
+    context: ActiveContext
+  ): Promise<ApiContractBaseline> {
+    return requestJson('/contract-baselines', { method: 'POST', context, body: { data } });
+  },
+
+  listContractBaselines(collectionId: string, context: ActiveContext): Promise<PaginatedResponse<ApiContractBaseline>> {
+    return requestJson(withQuery('/contract-baselines', { collectionId }), { context });
+  },
+
+  compareContractBaseline(
+    baselineId: string,
+    data: { openapi?: Record<string, unknown> } | undefined,
+    context: ActiveContext
+  ): Promise<ApiContractCompareResult> {
+    return requestJson(`/contract-baselines/${encodeURIComponent(baselineId)}/compare`, {
+      method: 'POST',
+      context,
+      body: { data: data || {} },
+    });
+  },
+
+  downloadCollectionOpenApi(collectionId: string): Promise<void> {
+    return downloadAuthenticatedFile(
+      `/collections/${encodeURIComponent(collectionId)}/openapi.json`,
+      `${collectionId}.openapi.json`
+    );
+  },
+
+  downloadRepositoryOpenApi(apiId: string, version: string): Promise<void> {
+    return downloadAuthenticatedFile(
+      `/repository/${encodeURIComponent(apiId)}/versions/${encodeURIComponent(version)}/openapi.json`,
+      `${apiId}-${version}.openapi.json`
+    );
+  },
+
+  secretScan(text: string, context: ActiveContext): Promise<ApiSecretScanResult> {
+    return requestJson('/secret-scan', { method: 'POST', context, body: { text } });
+  },
+
+  getBrandingTemplates(context: ActiveContext): Promise<ApiBrandingState> {
+    return requestJson('/branding/templates', { context });
+  },
+
+  uploadBrandingTemplate(
+    data: { name: string; language: ApiDocLanguage; fileBase64: string },
+    context: ActiveContext
+  ): Promise<ApiBrandingTemplate> {
+    return requestJson('/branding/templates', { method: 'POST', context, body: { data } });
+  },
+
+  activateBrandingTemplate(templateId: string, context: ActiveContext): Promise<ApiBrandingState> {
+    return requestJson('/branding/templates/activate', { method: 'POST', context, body: { templateId } });
+  },
+
+  previewBrandingTemplate(language: ApiDocLanguage, context: ActiveContext): Promise<ApiBrandingPreview> {
+    return requestJson('/branding/templates/preview', { method: 'POST', context, body: { language } });
+  },
+
+  getMocks(
+    filters: { applicationId?: string; page?: number; limit?: number },
+    context: ActiveContext
+  ): Promise<PaginatedResponse<ApiMockDefinition>> {
+    return requestJson(withQuery('/mocks', {
+      applicationId: filters.applicationId,
+      page: filters.page || 1,
+      limit: filters.limit || 30,
+    }), { context });
+  },
+
+  createMock(
+    data: { requestId: string; environmentId?: string; pathMatch?: string; ttlMinutes?: number; manualExampleId?: string },
+    context: ActiveContext
+  ): Promise<ApiMockDefinition> {
+    return requestJson('/mocks', { method: 'POST', context, body: { data } });
+  },
+
+  disableMock(id: string, context: ActiveContext): Promise<ApiMockDefinition> {
+    return requestJson(`/mocks/${encodeURIComponent(id)}`, { method: 'DELETE', context, body: {} });
+  },
+
+  mockServeUrl(id: string): string {
+    return `${API_BASE}/mock-serve/${encodeURIComponent(id)}`;
+  },
+
+  createContractSuite(
+    data: { collectionId: string; requestId?: string; openapi?: Record<string, unknown> },
+    context: ActiveContext
+  ): Promise<ApiContractSuiteResult> {
+    return requestJson('/contract-suites', { method: 'POST', context, body: { data } });
+  },
+
+  getJitAccess(context: ActiveContext): Promise<PaginatedResponse<ApiJitAccessGrant>> {
+    return requestJson('/jit-access', { context });
+  },
+
+  requestJitAccess(data: { applicationId?: string; reason: string }, context: ActiveContext): Promise<ApiJitAccessGrant> {
+    return requestJson('/jit-access', { method: 'POST', context, body: { data } });
+  },
+
+  approveJitAccess(id: string, ttlMinutes: number, context: ActiveContext): Promise<ApiJitAccessGrant> {
+    return requestJson(`/jit-access/${encodeURIComponent(id)}/approve`, {
+      method: 'POST',
+      context,
+      body: { ttlMinutes },
+    });
+  },
+
+  revokeJitAccess(id: string, context: ActiveContext): Promise<ApiJitAccessGrant> {
+    return requestJson(`/jit-access/${encodeURIComponent(id)}/revoke`, { method: 'POST', context, body: {} });
+  },
+
+  getComplianceReport(
+    filters: { dateFrom?: string; dateTo?: string },
+    context: ActiveContext
+  ): Promise<ApiComplianceReport> {
+    return requestJson(withQuery('/admin/compliance-report', {
+      dateFrom: filters.dateFrom,
+      dateTo: filters.dateTo,
+    }), { context });
+  },
+
+  getOrgPolicy(context: ActiveContext): Promise<ApiOrgPolicies> {
+    return requestJson('/admin/org-policy', { context });
+  },
+
+  updateOrgPolicy(
+    data: {
+      privateDestinationAllowlist: string[];
+      dualApprovalProductionCommand: boolean;
+      forbidInsecureTlsInProduction: boolean;
+      forbidExactModeInProduction: boolean;
+    },
+    context: ActiveContext
+  ): Promise<ApiOrgPolicies> {
+    return requestJson('/admin/org-policy', { method: 'PUT', context, body: { data } });
+  },
+
+  getDualApprovals(requestId: string | undefined, context: ActiveContext): Promise<PaginatedResponse<ApiDualApprovalGrant>> {
+    return requestJson(withQuery('/dual-approvals', { requestId }), { context });
+  },
+
+  requestDualApproval(requestId: string, reason: string, context: ActiveContext): Promise<ApiDualApprovalGrant> {
+    return requestJson(`/requests/${encodeURIComponent(requestId)}/dual-approvals`, {
+      method: 'POST',
+      context,
+      body: { data: { reason } },
+    });
+  },
+
+  approveDualApproval(id: string, ttlMinutes: number, context: ActiveContext): Promise<ApiDualApprovalGrant> {
+    return requestJson(`/dual-approvals/${encodeURIComponent(id)}/approve`, {
+      method: 'POST',
+      context,
+      body: { ttlMinutes },
+    });
+  },
+
+  getCdeOrigins(): Promise<CdeOriginOption[]> {
+    return requestJson<{ data: CdeOriginOption[] }>('/cde-origins').then(payload => payload.data || []);
   },
 };

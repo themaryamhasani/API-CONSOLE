@@ -1,5 +1,5 @@
-import React from 'react';
-import { ExternalLink, LogOut, RefreshCw } from 'lucide-react';
+import React, { useState } from 'react';
+import { ExternalLink, LogOut, Menu, Moon, RefreshCw, Sun } from 'lucide-react';
 import { useSessionStore } from '../../stores/sessionStore';
 import { ROLE_LABELS } from '../../types';
 import { MinimalLoader } from '../ui/Loading';
@@ -12,9 +12,33 @@ interface HeaderProps {
   onRefresh?: (() => void) | undefined;
   refreshing?: boolean | undefined;
   actions?: React.ReactNode | undefined;
+  onMenuClick?: (() => void) | undefined;
 }
 
-export const Header: React.FC<HeaderProps> = ({ title, subtitle, onRefresh, refreshing, actions }) => {
+function toggleTheme() {
+  const root = document.documentElement;
+  const next = root.classList.contains('dark') ? 'light' : 'dark';
+  root.classList.toggle('dark', next === 'dark');
+  root.dataset.theme = next;
+  root.style.colorScheme = next;
+  try {
+    localStorage.setItem('api-console-theme', next);
+  } catch {
+    /* ignore */
+  }
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute('content', next === 'dark' ? '#0b1016' : '#eef1f4');
+}
+
+export const Header: React.FC<HeaderProps> = ({
+  title,
+  subtitle,
+  onRefresh,
+  refreshing,
+  actions,
+  onMenuClick,
+}) => {
   const {
     activeContext,
     projects,
@@ -23,55 +47,101 @@ export const Header: React.FC<HeaderProps> = ({ title, subtitle, onRefresh, refr
     disconnect,
     catalog,
   } = useSessionStore();
+  const [isDark, setIsDark] = useState(() => document.documentElement.classList.contains('dark'));
 
   const apiModule = catalog?.repositories.find(repository => repository.type === 'API_MODULE');
 
   return (
-    <header className="mb-6 flex flex-col gap-4 border-b border-[var(--theme-border)] pb-4 lg:flex-row lg:items-start lg:justify-between">
-      <div className="min-w-0">
-        <h1 className="text-2xl font-bold text-[var(--theme-text)]">{title}</h1>
-        {subtitle ? <p className="mt-1 text-sm text-[var(--theme-text-muted)]">{subtitle}</p> : null}
-        {activeContext ? (
-          <p className="mt-2 text-xs text-[var(--theme-text-subtle)]">
-            {activeContext.user.fullName || activeContext.user.displayName} · {ROLE_LABELS[activeContext.role]}
-            {apiModule ? ` · API Module: ${apiModule.repoName} (${apiModule.packages.length})` : ''}
-          </p>
-        ) : null}
-      </div>
-      <div className="flex flex-wrap items-end gap-3">
-        {projects.length > 0 ? (
-          <div className="min-w-[220px]">
-            <Select
-              label="پروژه CDE"
-              value={selectedProjectKey}
-              onChange={(event) => { void selectProject(event.target.value); }}
-              options={projects.map(project => ({
-                value: project.projectKey,
-                label: project.projectKey,
-              }))}
-            />
+    <header className="z-30 shrink-0 border-b border-[var(--theme-border)] bg-[var(--theme-surface)]/90 px-3 py-2 backdrop-blur-md sm:px-5 lg:px-6">
+      <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex min-w-0 items-center gap-3">
+          {onMenuClick ? (
+            <button
+              type="button"
+              className="rounded-lg border border-[var(--theme-border)] p-2 text-[var(--theme-text-muted)] lg:hidden"
+              onClick={onMenuClick}
+              aria-label="باز کردن منو"
+            >
+              <Menu className="h-4 w-4" />
+            </button>
+          ) : null}
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+              <h1 className="text-base font-semibold tracking-tight text-[var(--theme-text)] sm:text-lg">{title}</h1>
+              {activeContext ? (
+                <p className="text-[11px] text-[var(--theme-text-subtle)]">
+                  {activeContext.user.fullName || activeContext.user.displayName}
+                  <span className="mx-1.5 opacity-40">·</span>
+                  {ROLE_LABELS[activeContext.role]}
+                  {apiModule ? (
+                    <>
+                      <span className="mx-1.5 opacity-40">·</span>
+                      <span dir="ltr" className="font-mono text-[10px]">
+                        {apiModule.repoName}
+                      </span>
+                    </>
+                  ) : null}
+                </p>
+              ) : null}
+            </div>
+            {subtitle ? <p className="mt-0.5 hidden text-xs text-[var(--theme-text-subtle)] xl:block">{subtitle}</p> : null}
           </div>
-        ) : null}
-        <a
-          className="inline-flex items-center gap-1 rounded-lg border border-[var(--theme-border)] px-3 py-2 text-sm text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-muted)]"
-          href="/api/docs"
-          target="_blank"
-          rel="noreferrer"
-        >
-          <ExternalLink className="h-4 w-4" />
-          Swagger
-        </a>
-        {onRefresh ? (
-          <Button variant="secondary" onClick={onRefresh} disabled={refreshing}>
-            {refreshing ? <MinimalLoader size="sm" /> : <RefreshCw className="h-4 w-4" />}
-            بروزرسانی
+        </div>
+
+        <div className="ac-toolbar justify-end">
+          {projects.length > 0 ? (
+            <div className="min-w-[160px]">
+              <Select
+                aria-label="پروژه"
+                value={selectedProjectKey}
+                onChange={event => {
+                  void selectProject(event.target.value);
+                }}
+                options={projects.map(project => ({
+                  value: project.projectKey,
+                  label: project.projectKey,
+                }))}
+              />
+            </div>
+          ) : null}
+          <a
+            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--theme-border)] px-3 py-2 text-xs text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-muted)]"
+            href="/api/docs"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            Docs
+          </a>
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label="تغییر تم"
+            onClick={() => {
+              toggleTheme();
+              setIsDark(document.documentElement.classList.contains('dark'));
+            }}
+          >
+            {isDark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
           </Button>
-        ) : null}
-        <Button variant="secondary" onClick={() => { void disconnect(); }}>
-          <LogOut className="h-4 w-4" />
-          قطع CDE
-        </Button>
-        {actions}
+          {onRefresh ? (
+            <Button variant="secondary" size="sm" onClick={onRefresh} disabled={refreshing}>
+              {refreshing ? <MinimalLoader size="sm" /> : <RefreshCw className="h-4 w-4" />}
+              تازه‌سازی
+            </Button>
+          ) : null}
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              void disconnect();
+            }}
+          >
+            <LogOut className="h-4 w-4" />
+            خروج
+          </Button>
+          {actions}
+        </div>
       </div>
     </header>
   );

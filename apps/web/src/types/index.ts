@@ -72,6 +72,24 @@ export interface Notification {
   userId: string;
   title: string;
   message: string;
+  type?: string;
+  entityType?: string;
+  entityId?: string;
+  correlationId?: string;
   isRead: boolean;
+  readAt?: string;
+  createdAt: string;
+}
+
+export interface NotificationListResponse extends PaginatedResponse<Notification> {
+  unreadCount: number;
+}
+
+export interface ApiAuditEvent {
+  id: string;
+  eventType: string;
+  actorUserId: string;
+  actorRole: string;
+  details: Record<string, unknown>;
   createdAt: string;
 }

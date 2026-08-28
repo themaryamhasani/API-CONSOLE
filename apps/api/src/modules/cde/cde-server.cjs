@@ -4,6 +4,9 @@ const {
   getDataSource,
   storeFormData,
   getCdeOrigin,
+  parseConfiguredOrigins,
+  resolveOriginById,
+  runWithCdeOrigin,
 } = require('./core-client.cjs');
 const {
   createLoginChallenge,
@@ -549,16 +552,35 @@ function canHandleCde(pathname) {
 
 async function handleCde(req, parsedUrl, body) {
   const pathname = parsedUrl.pathname;
-  if (pathname === '/api/cde/session' && req.method === 'GET') return cdeStatus(req);
-  if (pathname === '/api/cde/session/start' && req.method === 'POST') return startCdeLogin(req, body);
-  if (pathname === '/api/cde/session/password' && req.method === 'POST') return finishCdePassword(req, body);
-  if (pathname === '/api/cde/session' && req.method === 'DELETE') return disconnectCde(req);
-  if (pathname === '/api/cde/projects' && req.method === 'GET') return browseProjects(req);
-  let match = routeMatch(pathname, /^\/api\/cde\/projects\/([^/]+)\/catalog$/);
-  if (match && req.method === 'GET') return browseProjectCatalog(req, decodeURIComponent(match[1]));
-  match = routeMatch(pathname, /^\/api\/cde\/projects\/([^/]+)\/package$/);
-  if (match && req.method === 'POST') return browseProjectPackage(req, decodeURIComponent(match[1]), body);
-  throw new CdeApiError('CDE_ENDPOINT_NOT_FOUND', 'CDE endpoint not found.', 404);
+  if (pathname === '/api/cde/origins' && req.method === 'GET') {
+    return { data: parseConfiguredOrigins() };
+  }
+  if (pathname === '/api/cde/origins/select' && req.method === 'POST') {
+    assertCsrf(req);
+    const session = requireSession(req);
+    const originId = String(body.originId || body.data?.originId || '').trim();
+    const origin = resolveOriginById(originId);
+    if (!origin) throw new CdeApiError('CDE_ORIGIN_INVALID', 'Selected CDE origin is invalid.', 422);
+    session.cdeOriginId = origin.id;
+    session.cdeOriginUrl = origin.baseUrl;
+    await saveSession(session);
+    return { selected: origin };
+  }
+
+  const session = req.apiConsoleSession;
+  const origin = resolveOriginById(session?.cdeOriginId)?.baseUrl || getCdeOrigin();
+  return runWithCdeOrigin(origin, async () => {
+    if (pathname === '/api/cde/session' && req.method === 'GET') return cdeStatus(req);
+    if (pathname === '/api/cde/session/start' && req.method === 'POST') return startCdeLogin(req, body);
+    if (pathname === '/api/cde/session/password' && req.method === 'POST') return finishCdePassword(req, body);
+    if (pathname === '/api/cde/session' && req.method === 'DELETE') return disconnectCde(req);
+    if (pathname === '/api/cde/projects' && req.method === 'GET') return browseProjects(req);
+    let match = routeMatch(pathname, /^\/api\/cde\/projects\/([^/]+)\/catalog$/);
+    if (match && req.method === 'GET') return browseProjectCatalog(req, decodeURIComponent(match[1]));
+    match = routeMatch(pathname, /^\/api\/cde\/projects\/([^/]+)\/package$/);
+    if (match && req.method === 'POST') return browseProjectPackage(req, decodeURIComponent(match[1]), body);
+    throw new CdeApiError('CDE_ENDPOINT_NOT_FOUND', 'CDE endpoint not found.', 404);
+  });
 }
 
 module.exports = {

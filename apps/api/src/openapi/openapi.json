@@ -3,7 +3,7 @@
   "info": {
     "title": "API Console",
     "version": "1.1.0",
-    "description": "Standalone Online API Console + CDE bridge + secure project Runtime discovery and execution"
+    "description": "Standalone Online API Console + CDE bridge + secure project Runtime discovery and execution.\n\nTry it out: log in via the web UI first, then call GET /api/session here to confirm the cookie session. Prefilled ds/fr (CDE Core Query/Command) examples are on curl/parse, validate-core, and runtime execute."
   },
   "servers": [
     {
@@ -65,13 +65,60 @@
     },
     "/api/api-console/validate-core": {
       "post": {
-        "summary": "/api/api-console/validate-core",
+        "summary": "Validate a Core ds/fr request shape",
+        "description": "Checks CORE_QUERY (ds/) and CORE_COMMAND (fr/) payloads without calling Runtime.",
         "tags": [
           "api-console"
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ValidateCoreRequest" },
+              "examples": {
+                "ds-community-list": {
+                  "summary": "ds/community/list (CORE_QUERY)",
+                  "value": {
+                    "request": {
+                      "method": "POST",
+                      "url": "https://soha.m.edus.ir/core-api/v1/data-provider/get-data-source",
+                      "body": {
+                        "type": "json",
+                        "value": {
+                          "serviceId": "YOUR_PROJECT_SERVICE_ID",
+                          "key": "community/list",
+                          "params": { "page": 1 }
+                        }
+                      },
+                      "tls": { "verifyCertificate": true }
+                    }
+                  }
+                },
+                "fr-community-save": {
+                  "summary": "fr/community/save (CORE_COMMAND)",
+                  "value": {
+                    "request": {
+                      "method": "POST",
+                      "url": "https://soha.m.edus.ir/core-api/v1/data-provider/store-form-data",
+                      "body": {
+                        "type": "json",
+                        "value": {
+                          "serviceId": "YOUR_PROJECT_SERVICE_ID",
+                          "formId": "community/save",
+                          "data": { "title": "example" }
+                        }
+                      },
+                      "tls": { "verifyCertificate": true }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "OK"
+            "description": "Validation result with valid/errors/warnings"
           }
         }
       }
@@ -130,13 +177,45 @@
     },
     "/api/api-console/curl/parse": {
       "post": {
-        "summary": "/api/api-console/curl/parse",
+        "summary": "Parse cURL into a normalized request (ds/fr aware)",
+        "description": "Detects CORE_QUERY from get-data-source (ds/) and CORE_COMMAND from store-form-data (fr/). Requires CDE login session.",
         "tags": [
           "api-console"
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CurlParseRequest" },
+              "examples": {
+                "ds-community-list": {
+                  "summary": "ds/community/list",
+                  "value": {
+                    "curlText": "curl -X POST 'https://soha.m.edus.ir/core-api/v1/data-provider/get-data-source' -H 'Content-Type: application/json' --data-raw '{\"serviceId\":\"YOUR_PROJECT_SERVICE_ID\",\"key\":\"community/list\",\"params\":{\"page\":1}}'"
+                  }
+                },
+                "fr-community-save": {
+                  "summary": "fr/community/save",
+                  "value": {
+                    "curlText": "curl -X POST 'https://soha.m.edus.ir/core-api/v1/data-provider/store-form-data' -H 'Content-Type: application/json' --data-raw '{\"serviceId\":\"YOUR_PROJECT_SERVICE_ID\",\"formId\":\"community/save\",\"data\":{\"title\":\"example\"}}'"
+                  }
+                },
+                "ds-who-am-i": {
+                  "summary": "pages-app/who-am-i sanity query",
+                  "value": {
+                    "curlText": "curl -X POST 'https://soha.m.edus.ir/core-api/v1/data-provider/get-data-source' -H 'Content-Type: application/json' --data-raw '{\"serviceId\":\"YOUR_RUNTIME_SERVICE_ID\",\"key\":\"pages-app/who-am-i\",\"params\":{}}'"
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "OK"
+            "description": "Parsed request with classification and optional secretScan warnings"
+          },
+          "401": {
+            "description": "CDE login required"
           }
         }
       }
@@ -524,9 +603,52 @@
     },
     "/api/api-console/runtime/operations/{operationId}/execute": {
       "post": {
-        "tags": ["runtime"], "summary": "Execute a registered operation through the secure Runtime proxy",
-        "parameters": [{ "name": "operationId", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "tags": ["runtime"],
+        "summary": "Execute a discovered ds/fr operation through the secure Runtime proxy",
+        "description": "Use operationId from GET .../discovery/latest. ds/ maps to get-data-source; fr/ maps to store-form-data. Core Commands require confirmed=true.",
+        "parameters": [
+          { "name": "operationId", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Discovery operation id (not the ds/fr path itself)" },
+          { "name": "x-csrf-token", "in": "header", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RuntimeExecuteRequest" },
+              "examples": {
+                "ds-community-list": {
+                  "summary": "Execute ds/community/list",
+                  "value": {
+                    "projectKey": "YOUR_PROJECT_KEY",
+                    "runtimeProfileId": "YOUR_RUNTIME_PROFILE_ID",
+                    "input": { "page": 1 }
+                  }
+                },
+                "fr-community-save": {
+                  "summary": "Execute fr/community/save",
+                  "value": {
+                    "projectKey": "YOUR_PROJECT_KEY",
+                    "runtimeProfileId": "YOUR_RUNTIME_PROFILE_ID",
+                    "confirmed": true,
+                    "input": { "title": "example" }
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": { "200": { "description": "Sanitized execution result" }, "401": { "description": "Runtime session required" }, "409": { "description": "Profile or confirmation incomplete" } }
+      }
+    },
+    "/api/api-console/health/config": {
+      "get": {
+        "tags": ["api-console"],
+        "summary": "Production secret/config health (no auth)",
+        "responses": {
+          "200": {
+            "description": "ok flag and non-secret issue list"
+          }
+        }
       }
     },
     "/api/session/logout": {
@@ -628,6 +750,208 @@
           "200": {
             "description": "OK"
           }
+        }
+      }
+    },
+    "/api/api-console/portal/repository": {
+      "get": {
+        "tags": ["portal"],
+        "summary": "List approved API portal documents",
+        "responses": { "200": { "description": "Paginated portal items" } }
+      }
+    },
+    "/api/api-console/portal/share-tokens": {
+      "post": {
+        "tags": ["portal"],
+        "summary": "Create time-boxed read-only portal share token",
+        "responses": { "200": { "description": "token, expiresAt, urlPath" } }
+      }
+    },
+    "/api/api-console/portal/shared/{token}": {
+      "get": {
+        "tags": ["portal"],
+        "summary": "Public read-only shared portal document (no login)",
+        "parameters": [{ "name": "token", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Shared document" }, "410": { "description": "Expired" } }
+      }
+    },
+    "/api/api-console/collections/{id}/openapi.json": {
+      "get": {
+        "tags": ["openapi"],
+        "summary": "Export collection as OpenAPI 3 JSON",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "OpenAPI document" } }
+      }
+    },
+    "/api/api-console/mocks": {
+      "get": {
+        "tags": ["mocks"],
+        "summary": "List mocks",
+        "responses": { "200": { "description": "Paginated mocks" } }
+      },
+      "post": {
+        "tags": ["mocks"],
+        "summary": "Create mock endpoint",
+        "responses": { "200": { "description": "Created mock" } }
+      }
+    },
+    "/api/api-console/jit-access": {
+      "get": {
+        "tags": ["jit"],
+        "summary": "List JIT production access grants",
+        "responses": { "200": { "description": "Paginated grants" } }
+      },
+      "post": {
+        "tags": ["jit"],
+        "summary": "Request JIT production access",
+        "responses": { "200": { "description": "Pending grant" } }
+      }
+    },
+    "/api/api-console/admin/compliance-report": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Compliance report samples and totals",
+        "responses": { "200": { "description": "Report" } }
+      }
+    },
+    "/api/api-console/admin/org-policy": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Get organization policy",
+        "responses": { "200": { "description": "Org policy" } }
+      },
+      "put": {
+        "tags": ["admin"],
+        "summary": "Update organization policy",
+        "responses": { "200": { "description": "Updated org policy" } }
+      }
+    },
+    "/api/api-console/activity": {
+      "get": {
+        "tags": ["activity"],
+        "summary": "Project activity feed",
+        "responses": { "200": { "description": "Paginated activity" } }
+      }
+    },
+    "/api/api-console/test-runs": {
+      "get": {
+        "tags": ["test-runs"],
+        "summary": "List collection test runs",
+        "responses": { "200": { "description": "Paginated test runs" } }
+      }
+    },
+    "/api/api-console/branding/templates": {
+      "get": {
+        "tags": ["branding"],
+        "summary": "List DOCX branding templates",
+        "responses": { "200": { "description": "Branding state" } }
+      },
+      "post": {
+        "tags": ["branding"],
+        "summary": "Upload DOCX branding template",
+        "responses": { "200": { "description": "Created template" } }
+      }
+    },
+    "/api/api-console/secret-scan": {
+      "post": {
+        "tags": ["security"],
+        "summary": "Scan text for secret patterns",
+        "responses": { "200": { "description": "Findings" } }
+      }
+    },
+    "/api/api-console/contract-suites": {
+      "post": {
+        "tags": ["contracts"],
+        "summary": "Generate contract assertions from OpenAPI/collection",
+        "responses": { "200": { "description": "Suite generation result" } }
+      }
+    },
+    "/api/api-console/contract-baselines": {
+      "get": {
+        "tags": ["contracts"],
+        "summary": "List contract baselines",
+        "parameters": [{ "name": "collectionId", "in": "query", "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Paginated baselines" } }
+      },
+      "post": {
+        "tags": ["contracts"],
+        "summary": "Store OpenAPI fingerprint baseline for a collection",
+        "responses": { "200": { "description": "Created baseline" } }
+      }
+    },
+    "/api/api-console/contract-baselines/{id}/compare": {
+      "post": {
+        "tags": ["contracts"],
+        "summary": "Compare OpenAPI/current collection against a baseline",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "breaking and nonBreaking diffs" } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CurlParseRequest": {
+        "type": "object",
+        "required": ["curlText"],
+        "properties": {
+          "curlText": { "type": "string", "description": "Raw cURL command text" },
+          "originalCurl": { "type": "string", "description": "Alias for curlText" }
+        }
+      },
+      "ValidateCoreRequest": {
+        "type": "object",
+        "required": ["request"],
+        "properties": {
+          "request": {
+            "type": "object",
+            "required": ["method", "url", "body"],
+            "properties": {
+              "method": { "type": "string", "example": "POST" },
+              "url": { "type": "string" },
+              "body": {
+                "type": "object",
+                "properties": {
+                  "type": { "type": "string", "example": "json" },
+                  "value": {
+                    "type": "object",
+                    "description": "Core payload: ds uses key+params; fr uses formId+data"
+                  }
+                }
+              },
+              "tls": {
+                "type": "object",
+                "properties": {
+                  "verifyCertificate": { "type": "boolean", "default": true }
+                }
+              }
+            }
+          }
+        }
+      },
+      "RuntimeExecuteRequest": {
+        "type": "object",
+        "required": ["projectKey", "runtimeProfileId"],
+        "properties": {
+          "projectKey": { "type": "string", "description": "CDE applicationId / project key" },
+          "runtimeProfileId": { "type": "string" },
+          "input": {
+            "type": "object",
+            "description": "Business params (ds) or data object (fr); omit for empty payload",
+            "additionalProperties": true
+          },
+          "confirmed": {
+            "type": "boolean",
+            "description": "Required true for CORE_COMMAND (fr/) execution"
+          },
+          "expectedProjectServiceId": {
+            "type": "string",
+            "description": "Optional guard when synced requests must match approved service id"
+          },
+          "businessJustification": {
+            "type": "string",
+            "description": "Required for Production Core Commands"
+          },
+          "requestId": { "type": "string" }
         }
       }
     }

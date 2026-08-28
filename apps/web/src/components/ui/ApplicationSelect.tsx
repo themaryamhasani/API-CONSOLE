@@ -12,6 +12,9 @@ export interface ApplicationSelectProps {
   error?: string | undefined;
   hint?: string | undefined;
   className?: string | undefined;
+  /** When true, adds an "ALL" option for unrestricted assignment. */
+  includeAllOption?: boolean | undefined;
+  allOptionLabel?: string | undefined;
 }
 
 export const ApplicationSelect: React.FC<ApplicationSelectProps> = ({
@@ -23,14 +26,26 @@ export const ApplicationSelect: React.FC<ApplicationSelectProps> = ({
   error,
   hint,
   className,
+  includeAllOption = false,
+  allOptionLabel = 'همه سامانه‌ها (ALL)',
 }) => {
   const { applications, loading } = useApplicationLookup();
-  const hasApplications = applications.length > 0;
+  const hasApplications = applications.length > 0 || includeAllOption;
   const placeholder = loading
     ? 'در حال بارگذاری سامانه‌ها…'
     : hasApplications
       ? 'سامانه را انتخاب کنید'
       : 'سامانه‌ای در محدوده دسترسی یافت نشد';
+
+  const options = [
+    ...(includeAllOption ? [{ value: 'ALL', label: allOptionLabel }] : []),
+    ...applications.map(application => ({
+      value: application.id,
+      label: application.code
+        ? `${application.name} (${application.code})`
+        : application.name,
+    })),
+  ];
 
   return (
     <div className={cn('w-full', className)}>
@@ -38,12 +53,7 @@ export const ApplicationSelect: React.FC<ApplicationSelectProps> = ({
         label={`${label}${required ? ' *' : ''}`}
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        options={applications.map(application => ({
-          value: application.id,
-          label: application.code
-            ? `${application.name} (${application.code})`
-            : application.name,
-        }))}
+        options={options}
         placeholder={placeholder}
         required={required}
         disabled={disabled || loading || !hasApplications}

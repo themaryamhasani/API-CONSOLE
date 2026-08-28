@@ -23,6 +23,7 @@ interface TableProps<T> {
     enableClientFilter?: boolean | undefined;
     enableExport?: boolean | undefined;
     exportFilename?: string | undefined;
+    bordered?: boolean | undefined;
 }
 function getRecordValue(item: object, key: string): unknown {
     return (item as Record<string, unknown>)[key];
@@ -62,7 +63,7 @@ function reactNodeToText(node: React.ReactNode): string {
     }
     return '';
 }
-export function Table<T extends object>({ columns, data, loading = false, emptyMessage = 'داده‌ای یافت نشد', onRowClick, sortBy, sortOrder, onSort, rowClassName, enableColumnChooser = true, enableClientFilter = true, enableExport = true, exportFilename = 'table-export', }: TableProps<T>) {
+export function Table<T extends object>({ columns, data, loading = false, emptyMessage = 'داده‌ای یافت نشد', onRowClick, sortBy, sortOrder, onSort, rowClassName, enableColumnChooser = true, enableClientFilter = true, enableExport = true, exportFilename = 'table-export', bordered = true, }: TableProps<T>) {
     const columnKeySignature = columns.map(c => c.key).join('|');
     const [visibleColumnKeys, setVisibleColumnKeys] = React.useState<string[]>(() => columns.map(c => c.key));
     const [clientFilter, setClientFilter] = React.useState('');
@@ -108,11 +109,11 @@ export function Table<T extends object>({ columns, data, loading = false, emptyM
         return <ChevronsUpDown className="w-4 h-4 opacity-50"/>;
     };
     if (loading) {
-        return (<div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+        return (<div className={cn(bordered ? 'rounded-xl border border-gray-200 bg-white overflow-hidden' : 'bg-transparent')}>
         <LoadingState className="m-4"/>
       </div>);
     }
-    return (<div className="min-w-0 max-w-full overflow-hidden rounded-xl border border-gray-200 bg-white">
+    return (<div className={cn('min-w-0 max-w-full bg-white', bordered && 'rounded-xl border border-gray-200')}>
       {(enableClientFilter || enableColumnChooser || enableExport) && (<div className="flex flex-wrap items-start justify-between gap-3 border-b border-gray-100 bg-white px-3 py-3">
           {enableClientFilter && (<label className="relative min-w-0 basis-full flex-1 sm:basis-auto sm:min-w-[220px] sm:max-w-md">
               <Search className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400"/>
@@ -144,8 +145,8 @@ export function Table<T extends object>({ columns, data, loading = false, emptyM
               </details>)}
           </div>
         </div>)}
-      <div className="responsive-scroll max-w-full overflow-x-auto" role="region" aria-label="جدول داده‌ها؛ برای مشاهده ستون‌های بیشتر به طرفین پیمایش کنید" tabIndex={0}>
-        <table className="w-max min-w-full">
+      <div className="responsive-scroll max-w-full overflow-x-auto overscroll-x-contain" role="region" aria-label="جدول داده‌ها؛ برای مشاهده ستون‌های بیشتر به طرفین پیمایش کنید" tabIndex={0}>
+        <table className="w-max min-w-full border-collapse">
           <thead>
             <tr className="bg-gray-50 border-b border-gray-200">
               {visibleColumns.map((column) => (<th key={column.key} className={cn('px-3 py-3 text-right text-sm font-semibold text-gray-700 sm:px-4', isActionColumn(column) && 'w-px whitespace-nowrap', column.sortable && 'cursor-pointer hover:bg-gray-100', column.className)} onClick={() => column.sortable && onSort?.(column.key)}>
@@ -155,7 +156,7 @@ export function Table<T extends object>({ columns, data, loading = false, emptyM
           </thead>
           <tbody className="divide-y divide-gray-100">
             {visibleData.length === 0 ? (<tr><td colSpan={visibleColumns.length} className="px-4 py-8 text-center text-gray-500">{emptyMessage}</td></tr>) : (visibleData.map((item, index) => (<tr key={getStableRowKey(item, index)} className={cn('hover:bg-gray-50 transition-colors', onRowClick && 'cursor-pointer', rowClassName?.(item))} onClick={() => onRowClick?.(item)}>
-                  {visibleColumns.map((column) => (<td key={column.key} className={cn(isActionColumn(column) ? 'w-px whitespace-nowrap px-3 py-3 text-sm text-gray-900 sm:px-4' : 'max-w-[20rem] px-3 py-3 text-sm text-gray-900 sm:px-4', column.className)}>
+                  {visibleColumns.map((column) => (<td key={column.key} className={cn(isActionColumn(column) ? 'w-px whitespace-nowrap px-3 py-3 text-sm text-gray-900 sm:px-4' : 'max-w-[16rem] truncate px-3 py-3 text-sm text-gray-900 sm:px-4', column.className)}>
                       {column.render ? column.render(item, index) : flattenSearchValue(getRecordValue(item, column.key))}
                     </td>))}
                 </tr>)))}

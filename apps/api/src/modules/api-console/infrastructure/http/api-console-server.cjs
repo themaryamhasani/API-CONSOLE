@@ -20,6 +20,7 @@ const {
   requireSession,
 } = require('../../../session/session-server.cjs');
 const { canHandleCde, collectProjectSourceFiles, handleCde, normalizeCdeLoginName } = require('../../../cde/cde-server.cjs');
+const { canHandleIs, handleIs } = require('../../../is/is-auth-server.cjs');
 const { discoverProjectSources } = require('../../../cde/api-discovery.cjs');
 const { createPhase2Router, REVIEW_CHECKLIST_KEYS } = require('./phase2-routes.cjs');
 const { createPhase3Router, deliverWebhook: deliverItsmWebhook, scanTextForSecrets, parseConfiguredOrigins } = require('./phase3-routes.cjs');
@@ -50,7 +51,7 @@ const {
 
 const REPOSITORY_ROOT = path.resolve(__dirname, '../../../../../../..');
 const resolveRepositoryPath = value => path.isAbsolute(value) ? value : path.join(REPOSITORY_ROOT, value);
-const PORT = Number(process.env.API_CONSOLE_PORT || 4274);
+const PORT = Number(process.env.API_CONSOLE_PORT || 5281);
 const DATA_DIR = resolveRepositoryPath(process.env.API_CONSOLE_DATA_DIR || path.join('runtime', 'api-console'));
 const STORE_FILE = process.env.API_CONSOLE_STORE_FILE || path.join(DATA_DIR, 'api-console-store.json');
 const STORE_BACKEND = resolveStoreBackend();
@@ -2004,6 +2005,9 @@ const tryHandlePhase3 = createPhase3Router({
   assertCanReviewShares,
   DATA_DIR,
   DOCX_TEMPLATE_FILE,
+  generateDocumentationMarkdown,
+  buildDocxFromTemplate,
+  docxFileName,
 });
 
 function audit(eventType, actor, details = {}) {
@@ -2036,7 +2040,7 @@ function trackDirectoryContext(context) {
     fullName,
     email: context.user?.email,
     phoneNumber: context.user?.phoneNumber,
-    source: 'CDE',
+    source: context.authApproach || context.identitySource || 'CDE',
     isActive: context.user?.isActive !== false,
   };
   if (userIndex >= 0) {
@@ -2682,19 +2686,29 @@ function matchesApplicationScope(applicationId, scopeValue) {
   return ids.includes(applicationId);
 }
 
+const PERSONAL_APPLICATION_ID = 'PERSONAL';
+
 function contextApplicationIds(context) {
   const ids = Array.isArray(context?.scopeApplicationIds)
     ? context.scopeApplicationIds
     : parseApplicationScope(context?.scopeApplicationIds);
-  if (ids?.length) return [...new Set(ids.map(String).filter(id => id && id !== 'ALL'))];
-  if (context?.applicationId && context.applicationId !== 'ALL') return [String(context.applicationId)];
-  return [];
+  let scoped = [];
+  if (ids?.length) scoped = [...new Set(ids.map(String).filter(id => id && id !== 'ALL'))];
+  else if (context?.applicationId && context.applicationId !== 'ALL') scoped = [String(context.applicationId)];
+  // Free-form / personal collections are always in scope for the signed-in user.
+  return [...new Set([...scoped, PERSONAL_APPLICATION_ID])];
 }
 
 function assertApplicationInContext(applicationId, context) {
   const normalized = String(applicationId || '').trim();
   if (!normalized || normalized === 'ALL' || normalized.includes(',')) {
     throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'انتخاب یک سامانه معتبر الزامی است.', 422);
+  }
+  // Free-form / Postman-like collections are always allowed for authenticated users.
+  if (normalized.toUpperCase() === PERSONAL_APPLICATION_ID) return PERSONAL_APPLICATION_ID;
+  // IS systems discovered after login may not yet be in the initial session project list.
+  if ((context.authApproach === 'IS' || context.identitySource === 'IS') && normalized.startsWith('is:')) {
+    return normalized;
   }
   if (!contextApplicationIds(context).includes(normalized)) {
     throw new ApiConsoleError('AUTHENTICATION_ERROR', 'سامانه خارج از محدوده دسترسی فعال است.', 403);
@@ -2994,59 +3008,125 @@ function normalizedIPv6(host) {
 
 function isAllowlistEligiblePrivateIPv6(host) {
   const lower = normalizedIPv6(host);
-  return lower.startsWith('fc') || lower.startsWith('fd');
+  // Unique local (fc00::/7) and deprecated site-local (fec0::/10)
+  return lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fec0:');
+}
+
+function extractEmbeddedIpv4FromIpv6(host) {
+  const lower = normalizedIPv6(host);
+  const mapped = lower.match(/::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (mapped) return mapped[1];
+  // Corporate DNS often encodes private IPv4 as decimal-looking trailing hextets, e.g.
+  // 2001:4188:2:600:10:10:34:35 → 10.10.34.35 (NOT hex 0x10 → 16).
+  const parts = lower.split(':').filter(Boolean);
+  if (parts.length >= 4) {
+    const tail = parts.slice(-4);
+    if (tail.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)) {
+      return tail.map(Number).join('.');
+    }
+  }
+  return null;
+}
+
+function isPrivateNetworkAddress(host) {
+  if (isAllowlistEligiblePrivateIPv4(host) || isAllowlistEligiblePrivateIPv6(host)) return true;
+  const embedded = extractEmbeddedIpv4FromIpv6(host);
+  if (!embedded) return false;
+  return isAllowlistEligiblePrivateIPv4(embedded) || isHardBlockedIPv4(embedded);
 }
 
 function isHardBlockedIPv6(host) {
   const lower = normalizedIPv6(host);
-  return lower === '::1' ||
+  if (
+    lower === '::1' ||
     lower === '::' ||
     lower.startsWith('fe80:') ||
     lower.startsWith('ff') ||
     lower.startsWith('::ffff:') ||
-    lower.startsWith('0:0:0:0:0:ffff:');
+    lower.startsWith('0:0:0:0:0:ffff:')
+  ) {
+    return true;
+  }
+  const embedded = extractEmbeddedIpv4FromIpv6(host);
+  return Boolean(embedded && isHardBlockedIPv4(embedded));
 }
 
 function parsePrivateDestinationOrigin(candidate) {
   const text = String(candidate || '').trim();
   if (!text) return null;
   try {
-    const parsed = new URL(text);
+    const parsed = new URL(text.includes('://') ? text : `https://${text}`);
     const isOriginOnly = (parsed.pathname === '/' || parsed.pathname === '') && !parsed.search && !parsed.hash;
     if (['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password && isOriginOnly) {
       return parsed.origin.toLowerCase();
     }
   } catch {
-    // Invalid entries never grant network access.
+    // Invalid entries never grant/deny network access.
   }
   return null;
 }
 
-function configuredPrivateDestinationOrigins() {
-  const origins = new Set();
+function parseDestinationPattern(candidate) {
+  const text = String(candidate || '').trim().toLowerCase();
+  if (!text) return null;
+  const origin = parsePrivateDestinationOrigin(text);
+  if (origin) return { kind: 'origin', value: origin };
+  // hostname-only patterns (example.com or *.example.com)
+  if (/^\*?[a-z0-9.-]+(?::\d+)?$/i.test(text.replace(/^\*\./, ''))) {
+    return { kind: 'host', value: text.replace(/^\*\./, '*.') };
+  }
+  return null;
+}
+
+function configuredDestinationAllowlist() {
+  const patterns = [];
+  // Optional restrictive allowlist from env (legacy name kept).
   for (const value of String(process.env.API_CONSOLE_PRIVATE_DESTINATION_ALLOWLIST || '').split(',')) {
-    const origin = parsePrivateDestinationOrigin(value);
-    if (origin) origins.add(origin);
+    const pattern = parseDestinationPattern(value);
+    if (pattern) patterns.push(pattern);
   }
-  const orgList = store?.orgPolicies?.privateDestinationAllowlist;
-  if (Array.isArray(orgList)) {
-    for (const value of orgList) {
-      const origin = parsePrivateDestinationOrigin(value);
-      if (origin) origins.add(origin);
-    }
+  // Explicit org allowlist only. Empty = open (any public/private destination except hard blocks / blocklist).
+  const orgAllow = Array.isArray(store?.orgPolicies?.destinationAllowlist)
+    ? store.orgPolicies.destinationAllowlist
+    : [];
+  for (const value of orgAllow) {
+    const pattern = parseDestinationPattern(value);
+    if (pattern) patterns.push(pattern);
   }
-  return origins;
+  return patterns;
 }
 
-function allowAllPrivateDestinationsInDevelopment() {
-  return process.env.NODE_ENV !== 'production' && process.env.API_CONSOLE_ALLOW_PRIVATE_DESTINATIONS === 'true';
+function configuredDestinationBlocklist() {
+  const patterns = [];
+  for (const value of String(process.env.API_CONSOLE_DESTINATION_BLOCKLIST || '').split(',')) {
+    const pattern = parseDestinationPattern(value);
+    if (pattern) patterns.push(pattern);
+  }
+  const orgBlock = Array.isArray(store?.orgPolicies?.destinationBlocklist) ? store.orgPolicies.destinationBlocklist : [];
+  for (const value of orgBlock) {
+    const pattern = parseDestinationPattern(value);
+    if (pattern) patterns.push(pattern);
+  }
+  return patterns;
 }
 
-function isPrivateNetworkAddress(host) {
-  return isAllowlistEligiblePrivateIPv4(host) || isAllowlistEligiblePrivateIPv6(host);
+function destinationMatchesPattern(parsedUrl, pattern) {
+  if (!pattern) return false;
+  const origin = parsedUrl.origin.toLowerCase();
+  const host = parsedUrl.hostname.toLowerCase().replace(/\.$/, '');
+  if (pattern.kind === 'origin') return origin === pattern.value;
+  const raw = String(pattern.value || '').toLowerCase();
+  if (raw.startsWith('*.')) {
+    const suffix = raw.slice(1); // .example.com
+    return host.endsWith(suffix) || host === raw.slice(2);
+  }
+  const hostOnly = raw.split(':')[0];
+  const port = raw.includes(':') ? raw.split(':')[1] : null;
+  if (port && String(parsedUrl.port || (parsedUrl.protocol === 'https:' ? '443' : '80')) !== port) return false;
+  return host === hostOnly;
 }
 
-function assertDestinationAddressAllowed(address, privateDestinationAllowed, resolvedByDns = false) {
+function assertDestinationAddressAllowed(address, resolvedByDns = false) {
   const normalized = normalizedIPv6(address);
   if (METADATA_IPS.has(normalized) || isHardBlockedIPv4(normalized) || isHardBlockedIPv6(normalized)) {
     throw new ApiConsoleError(
@@ -3054,12 +3134,89 @@ function assertDestinationAddressAllowed(address, privateDestinationAllowed, res
       `${resolvedByDns ? 'DNS resolved to' : 'The destination is'} a blocked loopback, link-local, carrier-grade, multicast, or metadata address.`,
     );
   }
-  if (isPrivateNetworkAddress(normalized) && !privateDestinationAllowed) {
-    throw new ApiConsoleError(
-      'DESTINATION_NOT_ALLOWED',
-      `${resolvedByDns ? 'DNS resolved to a private network address' : 'Private network destinations'} require an exact approved origin in API_CONSOLE_PRIVATE_DESTINATION_ALLOWLIST.`,
-    );
+}
+
+function isLiteralIpHost(host) {
+  return /^[0-9.]+$/.test(host) || host.includes(':');
+}
+
+function isUsableDestinationAddress(address) {
+  try {
+    assertDestinationAddressAllowed(address, true);
+    return true;
+  } catch {
+    return false;
   }
+}
+
+function isCorporateRemappedAddress(address) {
+  return isPrivateNetworkAddress(address);
+}
+
+function rankDestinationAddress(address, family = 4) {
+  if (!isUsableDestinationAddress(address)) return 99;
+  if (isCorporateRemappedAddress(address)) return 50;
+  // Prefer IPv4 for outbound HTTPS from Windows/corp networks (IPv6 often ENETUNREACH).
+  if (family === 6) return 10;
+  return 1;
+}
+
+async function resolveDestinationAddresses(host) {
+  if (isLiteralIpHost(host)) {
+    const address = host.includes(':') ? normalizedIPv6(host) : host;
+    assertDestinationAddressAllowed(address);
+    return [{ address, family: host.includes(':') ? 6 : 4 }];
+  }
+
+  const safeLookup = async (fn) => {
+    try {
+      return await fn();
+    } catch {
+      return [];
+    }
+  };
+
+  const prefer = (rows) => [...rows]
+    .filter(row => isUsableDestinationAddress(row.address))
+    .sort((left, right) => rankDestinationAddress(left.address, left.family) - rankDestinationAddress(right.address, right.family)
+      || left.family - right.family);
+
+  let records = prefer(await safeLookup(() => dns.lookup(host, { all: true, verbatim: false })));
+  const onlyRemapped = records.length > 0 && records.every(row => isCorporateRemappedAddress(row.address));
+  const hasPublicV4 = records.some(row => row.family === 4 && !isCorporateRemappedAddress(row.address));
+
+  // Corporate DNS often remaps public hostnames to private/IPv6 sinkholes.
+  // Prefer public IPv4 via public resolvers whenever system DNS looks remapped or IPv6-only.
+  if (!records.length || onlyRemapped || !hasPublicV4) {
+    const servers = String(process.env.API_CONSOLE_DNS_SERVERS || '8.8.8.8,1.1.1.1')
+      .split(',')
+      .map(item => item.trim())
+      .filter(Boolean);
+    if (servers.length) {
+      const resolver = new dns.Resolver();
+      resolver.setServers(servers);
+      const [v4, v6] = await Promise.all([
+        safeLookup(async () => (await resolver.resolve4(host)).map(address => ({ address, family: 4 }))),
+        safeLookup(async () => (await resolver.resolve6(host)).map(address => ({ address, family: 6 }))),
+      ]);
+      const alternate = prefer([...v4, ...v6]);
+      const alternatePublicV4 = alternate.filter(row => row.family === 4 && !isCorporateRemappedAddress(row.address));
+      if (alternatePublicV4.length) {
+        records = alternatePublicV4;
+      } else if (alternate.length && (prefer(alternate).some(row => !isCorporateRemappedAddress(row.address)) || !records.length)) {
+        records = alternate;
+      }
+    }
+  }
+
+  // Final preference: drop remapped / IPv6-only corporate answers if any public IPv4 remains.
+  const publicV4 = records.filter(row => row.family === 4 && !isCorporateRemappedAddress(row.address));
+  if (publicV4.length) records = publicV4;
+
+  if (!records.length) {
+    throw new ApiConsoleError('DNS_ERROR', `DNS lookup for ${host} returned no usable records.`);
+  }
+  return records;
 }
 
 async function validateDestination(urlText) {
@@ -3073,29 +3230,55 @@ async function validateDestination(urlText) {
     throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', 'Only HTTP and HTTPS destinations are allowed.');
   }
   const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
-  const privateDestinationAllowed = allowAllPrivateDestinationsInDevelopment() ||
-    configuredPrivateDestinationOrigins().has(parsed.origin.toLowerCase());
+
+  // Allow the configured Integrated Systems Gateway (often localhost:4000) when IS approach is enabled.
+  try {
+    const { isEnabled: isIsEnabled, gatewayBaseUrl } = require('../../../is/is-auth-server.cjs');
+    if (isIsEnabled()) {
+      const gw = new URL(gatewayBaseUrl());
+      const normHost = value => String(value || '').toLowerCase().replace(/^\[|\]$/g, '').replace('localhost', '127.0.0.1');
+      const normPort = (url) => url.port || (url.protocol === 'https:' ? '443' : '80');
+      if (
+        parsed.protocol === gw.protocol
+        && normHost(parsed.hostname) === normHost(gw.hostname)
+        && normPort(parsed) === normPort(gw)
+      ) {
+        const address = normHost(parsed.hostname);
+        return {
+          parsed,
+          address,
+          family: address.includes(':') ? 6 : 4,
+          addresses: [{ address, family: address.includes(':') ? 6 : 4 }],
+          isIsGateway: true,
+        };
+      }
+    }
+  } catch {
+    // ignore IS config errors and continue with default policy
+  }
+
   if (PROTECTED_HOSTS.has(host) || host.endsWith('.local') || host.endsWith('.localhost')) {
     throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', 'Localhost and local-network hostnames are blocked by policy.');
   }
   if (METADATA_HOSTS.has(host)) {
     throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', 'Cloud metadata destinations are blocked by policy.');
   }
-  assertDestinationAddressAllowed(host, privateDestinationAllowed);
 
-  const records = /^[0-9.]+$/.test(host) || host.includes(':')
-    ? [{ address: host.includes(':') ? normalizedIPv6(host) : host, family: host.includes(':') ? 6 : 4 }]
-    : await dns.lookup(host, { all: true, verbatim: false });
-
-  if (!records.length) {
-    throw new ApiConsoleError('DNS_ERROR', 'DNS lookup returned no records.');
+  const blocklist = configuredDestinationBlocklist();
+  if (blocklist.some(pattern => destinationMatchesPattern(parsed, pattern))) {
+    throw new ApiConsoleError('DESTINATION_NOT_ALLOWED', `مقصد در blocklist بک‌آفیس مسدود است: ${parsed.origin}`);
   }
 
-  for (const record of records) {
-    assertDestinationAddressAllowed(record.address, privateDestinationAllowed, true);
+  const allowlist = configuredDestinationAllowlist();
+  if (allowlist.length > 0 && !allowlist.some(pattern => destinationMatchesPattern(parsed, pattern))) {
+    throw new ApiConsoleError(
+      'DESTINATION_NOT_ALLOWED',
+      `مقصد خارج از allowlist بک‌آفیس است: ${parsed.origin}`,
+    );
   }
 
-  return { parsed, address: records[0].address, family: records[0].family };
+  const records = await resolveDestinationAddresses(host);
+  return { parsed, address: records[0].address, family: records[0].family, addresses: records };
 }
 
 function responsePreviewMode(contentType) {
@@ -3249,6 +3432,15 @@ async function performHttpRequest(transport, validation, redirectHistory, signal
         reject(error);
       } else if (isTlsTransportError(error)) {
         reject(new ApiConsoleError('TLS_ERROR', tlsErrorMessage(error)));
+      } else if (/ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(error.message || '')) {
+        const target = `${validation.address}:${url.port || (isHttps ? 443 : 80)}`;
+        const remapped = isCorporateRemappedAddress(validation.address);
+        reject(new ApiConsoleError(
+          'HTTP_ERROR',
+          remapped
+            ? `${sanitizeText(error.message || 'HTTP request failed.')} — مقصد ${target} شبیه نگاشت DNS سازمانی است؛ اتصال از این شبکه برقرار نشد.`
+            : sanitizeText(error.message || `HTTP request failed (${target}).`),
+        ));
       } else {
         reject(new ApiConsoleError('HTTP_ERROR', sanitizeText(error.message || 'HTTP request failed.')));
       }
@@ -4729,6 +4921,94 @@ function createExecutionFromError(request, resolved, environment, context, error
   return createBlockedExecution(request, resolved.snapshot, environment, context.userId, category, error.message || 'Execution failed.', businessJustification, scriptResults);
 }
 
+function applyIsGatewayAuth(transport, context) {
+  if (!transport || context?.authApproach !== 'IS' || !context.isGatewayCookie) return transport;
+  const gateway = String(context.isGatewayBaseUrl || process.env.API_CONSOLE_IS_GATEWAY_URL || 'http://127.0.0.1:4000')
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
+  const url = String(transport.url || '').replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
+  if (!gateway || !url.startsWith(gateway)) return transport;
+  const headers = Array.isArray(transport.headers) ? [...transport.headers] : [];
+  const hasCookie = headers.some(header =>
+    header && header.enabled !== false && String(header.name || '').toLowerCase() === 'cookie'
+  );
+  if (!hasCookie) {
+    headers.push(createHeader('Cookie', context.isGatewayCookie, headers.length, 'SYSTEM'));
+  }
+  transport.headers = headers;
+  return transport;
+}
+
+function isIsGatewayAccessDeniedResponse(response) {
+  if (!response || Number(response.statusCode) !== 403) return false;
+  const body = String(response.bodyPreview || response.internalBody || response.bodyText || response.body || '');
+  return /دسترسی به این مسیر مجاز نیست|شما دسترسی به این مسیر را ندارید|Forbidden/i.test(body);
+}
+
+function isIsAutoEnsureAccessRulesEnabled() {
+  const raw = String(process.env.API_CONSOLE_IS_AUTO_ENSURE_ACCESS_RULES || 'true').trim().toLowerCase();
+  return !(raw === 'false' || raw === '0' || raw === 'off' || raw === 'no');
+}
+
+async function ensureIsGatewayAccessRule(context, transport) {
+  if (!isIsAutoEnsureAccessRulesEnabled()) return { ok: false, skipped: true };
+  if (!context?.isGatewayCookie) return { ok: false, error: 'missing gateway cookie' };
+  let parsed;
+  try {
+    parsed = new URL(String(transport.url || ''));
+  } catch {
+    return { ok: false, error: 'invalid url' };
+  }
+  const gateway = String(context.isGatewayBaseUrl || process.env.API_CONSOLE_IS_GATEWAY_URL || 'http://127.0.0.1:4000')
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
+  if (!gateway || !String(transport.url || '').replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1').startsWith(gateway)) {
+    return { ok: false, error: 'not gateway url' };
+  }
+  const pathPrefix = parsed.pathname || '/';
+  const method = String(transport.method || 'GET').toUpperCase();
+  const rulesUrl = `${gateway}/api/v1/iam/rules`;
+  try {
+    const response = await fetch(rulesUrl, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        cookie: context.isGatewayCookie,
+      },
+      body: JSON.stringify({
+        path_prefix: pathPrefix,
+        method,
+        allowed_roles: [],
+        is_public: true,
+      }),
+    });
+    const text = await response.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { raw: text };
+    }
+    if (response.ok || response.status === 409) {
+      return { ok: true, status: response.status, data };
+    }
+    return { ok: false, status: response.status, data, error: data?.message || response.statusText };
+  } catch (error) {
+    return { ok: false, error: error.message || 'ensure rule failed' };
+  }
+}
+
+async function executeIsTransportWithAccessRecovery(transport, context) {
+  let response = await executeWithRedirects(transport);
+  if (!isIsGatewayAccessDeniedResponse(response)) return response;
+  const ensured = await ensureIsGatewayAccessRule(context, transport);
+  if (!ensured.ok) return response;
+  return executeWithRedirects(transport);
+}
+
 async function executeRequest(requestId, context, options = {}) {
   if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecute)) {
     throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to execute API requests.', 403);
@@ -4892,7 +5172,10 @@ async function executeRequest(requestId, context, options = {}) {
   }
 
   try {
-    const response = await executeWithRedirects(resolved.transport);
+    const transport = applyIsGatewayAuth(safeClone(resolved.transport), context);
+    const response = (context?.authApproach === 'IS' || context?.identitySource === 'IS')
+      ? await executeIsTransportWithAccessRecovery(transport, context)
+      : await executeWithRedirects(transport);
     runner = selectRunner(environment, response.resolvedIpAddress, preferredRunnerId, resolved.snapshot?.url || resolved.transport?.url);
     const assertionResults = evaluateAssertions(request, response);
     const postScriptResults = runPostResponseScript(executionRequest.scripts, response);
@@ -6208,6 +6491,321 @@ function markAllNotificationsRead(context) {
   return { updated: changed };
 }
 
+function ensureIsGatewayEnvironment(gatewayUrl) {
+  const base = String(gatewayUrl || process.env.API_CONSOLE_IS_GATEWAY_URL || 'http://127.0.0.1:4000')
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
+  const envId = 'env-is-gateway';
+  let environment = store.environments.find(item => item.id === envId || item.name === 'IS Gateway');
+  if (!environment) {
+    environment = {
+      id: envId,
+      name: 'IS Gateway',
+      kind: 'DEVELOPMENT',
+      baseUrl: base,
+      variables: [
+        { id: makeId('var'), key: 'baseUrl', currentValue: base, initialValue: base, sensitive: false, scope: 'ENVIRONMENT', description: 'Integrated Systems Gateway base URL' },
+        { id: makeId('var'), key: 'gatewayBaseUrl', currentValue: base, initialValue: base, sensitive: false, scope: 'ENVIRONMENT', description: 'Alias for Gateway origin' },
+        { id: makeId('var'), key: 'stage', currentValue: 'is-local', initialValue: 'is-local', sensitive: false, scope: 'ENVIRONMENT', description: 'IS local stage label' },
+      ],
+      defaultHeaders: [
+        createHeader('accept', 'application/json', 0, 'ENVIRONMENT'),
+      ],
+      secretReferences: {},
+      productionProtected: false,
+      archived: false,
+      seeded: true,
+      sourceApproach: 'IS',
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    store.environments.unshift(environment);
+  } else {
+    environment.baseUrl = base;
+    environment.sourceApproach = 'IS';
+    environment.archived = false;
+    const upsertVar = (key, value, description) => {
+      const existing = (environment.variables || []).find(item => item.key === key);
+      if (existing) {
+        existing.currentValue = value;
+        existing.initialValue = value;
+      } else {
+        environment.variables = [
+          ...(environment.variables || []),
+          { id: makeId('var'), key, currentValue: value, initialValue: value, sensitive: false, scope: 'ENVIRONMENT', description },
+        ];
+      }
+    };
+    upsertVar('baseUrl', base, 'Integrated Systems Gateway base URL');
+    upsertVar('gatewayBaseUrl', base, 'Alias for Gateway origin');
+    environment.updatedAt = nowIso();
+  }
+  saveStore(store);
+  migrateLegacyIsRequestBindings(environment);
+  return environment;
+}
+
+function migrateLegacyIsRequestBindings(isEnvironment) {
+  let changed = 0;
+  for (const request of store.requests || []) {
+    if (request.sourceType !== 'IS_DISCOVERY') continue;
+    const legacy = request.runtimeBinding && !request.runtimeBinding.runtimeProfileId ? request.runtimeBinding : null;
+    if (!request.isGatewayBinding && legacy) {
+      request.isGatewayBinding = buildIsGatewayBinding({
+        sourceFingerprint: legacy.sourceFingerprint,
+        serviceKey: legacy.serviceKey,
+        path: legacy.gatewayPath || request.urlTemplate,
+        sourceKind: request.sourceSync?.sourceKind || 'SPEC_SERVICE',
+        controllerName: legacy.controllerName,
+        actionName: legacy.actionName,
+        specFolder: legacy.specFolder,
+      }, {
+        serviceKey: legacy.serviceKey,
+        applicationId: request.applicationId,
+        gatewayBaseUrl: isEnvironment?.baseUrl || gatewayBaseUrlFromEnv(),
+        specFolder: legacy.specFolder,
+      });
+      delete request.runtimeBinding;
+      changed += 1;
+    } else if (request.isGatewayBinding && request.runtimeBinding && !request.runtimeBinding.runtimeProfileId) {
+      delete request.runtimeBinding;
+      changed += 1;
+    }
+    if (isEnvironment?.id && request.environmentId !== isEnvironment.id) {
+      request.environmentId = isEnvironment.id;
+      changed += 1;
+    }
+  }
+  if (changed) saveStore(store);
+  return changed;
+}
+
+function buildIsGatewayBinding(operation, meta = {}) {
+  const fingerprint = operation.sourceFingerprint || operation.id;
+  const serviceKey = String(operation.serviceKey || meta.serviceKey || '');
+  const gatewayBase = String(meta.gatewayBaseUrl || gatewayBaseUrlFromEnv()).replace(/\/+$/, '');
+  return {
+    approach: 'IS',
+    sourceKind: String(operation.sourceKind || 'SPEC_SERVICE'),
+    sourceFingerprint: fingerprint,
+    serviceKey,
+    gatewayPath: String(operation.path || ''),
+    gatewayBaseUrl: gatewayBase,
+    applicationId: String(meta.applicationId || `is:${serviceKey}`),
+    specFolder: meta.specFolder || operation.specFolder || null,
+    controllerName: operation.controllerName || null,
+    actionName: operation.actionName || null,
+    requiresIsSession: true,
+    secretsInjectedAtExecute: true,
+  };
+}
+
+function gatewayBaseUrlFromEnv() {
+  return String(process.env.API_CONSOLE_IS_GATEWAY_URL || 'http://127.0.0.1:4000')
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
+}
+
+function ensureIsDiscoveryCollection(applicationId, serviceKey, label, context, meta = {}) {
+  const existing = store.collections.find(collection =>
+    collection.applicationId === applicationId
+    && collection.status === 'ACTIVE'
+    && (collection.sourceApproach === 'IS' || String(collection.name || '').startsWith('IS ·'))
+    && belongsToUser(collection, context)
+  );
+  if (existing) return existing;
+  const specHint = meta.specFolder ? ` · spec ${meta.specFolder}` : '';
+  const collection = {
+    id: makeId('api-col'),
+    applicationId,
+    workspaceName: 'Integrated Systems',
+    name: `IS · ${label || serviceKey}`,
+    description: `Synced from IS specs (${serviceKey}${specHint})`,
+    ownerId: context.userId,
+    visibility: 'PRIVATE',
+    status: 'ACTIVE',
+    sourceApproach: 'IS',
+    variables: [],
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    originId: resolveOriginId(context),
+  };
+  store.collections.unshift(collection);
+  return collection;
+}
+
+function normalizedRequestForIsOperation(operation) {
+  const { buildAbsoluteGatewayUrl } = require('../../../is/is-discovery.cjs');
+  const normalized = createBlankNormalizedRequest(buildAbsoluteGatewayUrl(operation.path));
+  normalized.method = String(operation.method || 'GET').toUpperCase();
+  normalized.headers = [
+    createHeader('accept', 'application/json', 0, 'DISCOVERY'),
+    ...(!['GET', 'HEAD'].includes(normalized.method)
+      ? [createHeader('content-type', 'application/json', 1, 'DISCOVERY')]
+      : []),
+  ];
+  if (!['GET', 'HEAD'].includes(normalized.method)) {
+    normalized.body = {
+      type: 'json',
+      contentType: 'application/json',
+      value: {},
+      raw: '{\n  \n}',
+    };
+  }
+  return normalized;
+}
+
+async function syncIsSystemDiscovery(serviceKey, body, context, session) {
+  if (context.authApproach !== 'IS' && session?.authApproach !== 'IS') {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'IS discovery sync requires IS login.', 403);
+  }
+  const key = String(serviceKey || body?.serviceKey || body?.specFolder || '').trim();
+  if (!key) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'serviceKey is required.', 422);
+
+  const { discoverSystemApis, applicationIdForService } = require('../../../is/is-discovery.cjs');
+  const discovery = await discoverSystemApis(key, session?.isGatewayCookie || '', {
+    specFolder: body?.specFolder,
+    workspaceIndex: body?.workspaceIndex,
+  });
+  const resolvedKey = discovery.serviceKey || key;
+  const applicationId = assertApplicationInContext(
+    discovery.applicationId || applicationIdForService(resolvedKey),
+    context,
+  );
+  const isEnvironment = ensureIsGatewayEnvironment(discovery.gatewayBaseUrl || gatewayBaseUrlFromEnv());
+  const label = body?.label || discovery.product?.label || resolvedKey;
+  const collection = body?.collectionId
+    ? store.collections.find(item => item.id === body.collectionId)
+    : ensureIsDiscoveryCollection(applicationId, resolvedKey, label, context, {
+      specFolder: discovery.product?.specFolder || body?.specFolder,
+    });
+  if (!collection || !belongsToUser(collection, context)) {
+    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Target collection is not accessible.', 403);
+  }
+  if (collection.applicationId !== applicationId) {
+    throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Collection application does not match IS system.', 422);
+  }
+
+  const selectedIds = Array.isArray(body?.operationIds) && body.operationIds.length
+    ? new Set(body.operationIds.map(String))
+    : null;
+  const operations = discovery.operations.filter(op => !selectedIds || selectedIds.has(op.id));
+
+  let created = 0;
+  let updated = 0;
+  let skipped = 0;
+  const syncedRequestIds = [];
+
+  for (const operation of operations) {
+    if (operation.enabled === false) {
+      skipped += 1;
+      continue;
+    }
+    const fingerprint = operation.sourceFingerprint || operation.id;
+    const existing = store.requests.find(request =>
+      request.applicationId === applicationId
+      && request.sourceType === 'IS_DISCOVERY'
+      && request.status !== 'ARCHIVED'
+      && (
+        request.sourceSync?.sourceFingerprint === fingerprint
+        || request.isGatewayBinding?.sourceFingerprint === fingerprint
+        || request.runtimeBinding?.sourceFingerprint === fingerprint
+      )
+      && belongsToUser(request, context)
+    );
+
+    const normalized = normalizedRequestForIsOperation(operation);
+    const folderPath = Array.isArray(operation.folderPath) && operation.folderPath.length
+      ? operation.folderPath
+      : ['specs'];
+    const isBinding = buildIsGatewayBinding(operation, {
+      serviceKey: resolvedKey,
+      applicationId,
+      gatewayBaseUrl: discovery.gatewayBaseUrl || gatewayBaseUrlFromEnv(),
+      specFolder: discovery.product?.specFolder || operation.specFolder || body?.specFolder,
+    });
+    if (existing) {
+      existing.name = operation.name || existing.name;
+      existing.description = operation.description || existing.description;
+      existing.method = normalized.method;
+      existing.urlTemplate = normalized.url;
+      existing.folderPath = folderPath;
+      existing.headers = normalized.headers;
+      existing.bodyType = normalized.body?.type || existing.bodyType;
+      existing.bodyTemplate = normalized.body?.raw || existing.bodyTemplate;
+      existing.collectionId = collection.id;
+      existing.environmentId = body?.environmentId || isEnvironment.id;
+      existing.sourceSync = {
+        status: 'SYNCED',
+        sourceFingerprint: fingerprint,
+        sourceKind: operation.sourceKind,
+        syncedAt: nowIso(),
+        syncedBy: context.userId,
+      };
+      existing.isGatewayBinding = isBinding;
+      // Clear CDE Runtime binding leftovers so UI/execute stay on IS path.
+      delete existing.runtimeBinding;
+      existing.updatedAt = nowIso();
+      existing.updatedBy = context.userId;
+      existing.version = Number(existing.version || 1) + 1;
+      existing.documentation = refreshDocumentationMetadata(existing);
+      updated += 1;
+      syncedRequestIds.push(existing.id);
+    } else {
+      const request = definitionFromNormalized(normalized, {
+        applicationId,
+        collectionId: collection.id,
+        environmentId: body?.environmentId || isEnvironment.id,
+        name: operation.name || `${operation.method} ${operation.path}`,
+        description: operation.description || '',
+        folderPath,
+        userId: context.userId,
+        userName: context.user?.fullName || context.userName,
+        sourceType: 'IS_DISCOVERY',
+      });
+      request.sourceSync = {
+        status: 'SYNCED',
+        sourceFingerprint: fingerprint,
+        sourceKind: operation.sourceKind,
+        syncedAt: nowIso(),
+        syncedBy: context.userId,
+      };
+      request.isGatewayBinding = isBinding;
+      request.originId = resolveOriginId(context);
+      store.requests.unshift(request);
+      created += 1;
+      syncedRequestIds.push(request.id);
+    }
+  }
+
+  audit('IS_API_DISCOVERY_SYNCED', context, {
+    serviceKey: resolvedKey,
+    specFolder: discovery.product?.specFolder || null,
+    collectionId: collection.id,
+    created,
+    updated,
+    skipped,
+    discovered: discovery.operations.length,
+  });
+  saveStore(store);
+  return {
+    serviceKey: resolvedKey,
+    applicationId,
+    collectionId: collection.id,
+    collectionName: collection.name,
+    product: discovery.product || null,
+    discovered: discovery.counts,
+    warnings: discovery.warnings,
+    created,
+    updated,
+    skipped,
+    syncedRequestIds,
+    operations: discovery.operations,
+  };
+}
+
 async function routeRequest(req, parsedUrl, body) {
   const parts = getPathParts(parsedUrl.pathname);
   const [first, second, third, fourth, fifth] = parts;
@@ -6240,6 +6838,50 @@ async function routeRequest(req, parsedUrl, body) {
 
   const phase3Result = await tryHandlePhase3(req, parsedUrl, body, parts);
   if (phase3Result !== undefined) return phase3Result;
+
+  if (first === 'is' && second === 'systems' && third && fourth === 'apis' && req.method === 'GET') {
+    const session = requireSession(req);
+    if (session.authApproach !== 'IS' && !session.cdeConnected) {
+      throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Login required.', 401);
+    }
+    const { discoverSystemApis } = require('../../../is/is-discovery.cjs');
+    return discoverSystemApis(decodeURIComponent(third), session.isGatewayCookie || '', {
+      specFolder: parsedUrl.searchParams.get('specFolder') || undefined,
+      workspaceIndex: (() => {
+        const raw = parsedUrl.searchParams.get('workspace');
+        return raw == null || raw === '' ? undefined : Number(raw);
+      })(),
+    });
+  }
+
+  if (first === 'is' && second === 'workspaces' && !third && req.method === 'GET') {
+    requireSession(req);
+    const { listWorkspaces } = require('../../../is/is-discovery.cjs');
+    const { gatewayBaseUrl } = require('../../../is/is-auth-server.cjs');
+    return {
+      gatewayBaseUrl: gatewayBaseUrl(),
+      workspaces: listWorkspaces(),
+      discoveredAt: nowIso(),
+      source: 'specs-disk',
+    };
+  }
+
+  if (first === 'is' && second === 'products' && !third && req.method === 'GET') {
+    requireSession(req);
+    const { listProductsFromDisk } = require('../../../is/is-discovery.cjs');
+    const workspaceRaw = parsedUrl.searchParams.get('workspace');
+    return listProductsFromDisk({
+      workspaceIndex: workspaceRaw == null || workspaceRaw === '' ? undefined : Number(workspaceRaw),
+      category: parsedUrl.searchParams.get('category') || undefined,
+    });
+  }
+
+  if (first === 'is' && second === 'systems' && third && fourth === 'sync' && req.method === 'POST') {
+    const context = requireContext(req, body);
+    assertCsrf(req);
+    const session = requireSession(req);
+    return syncIsSystemDiscovery(decodeURIComponent(third), body?.data || body || {}, context, session);
+  }
 
   if (first === 'runtime-profiles' && !second && req.method === 'GET') {
     const context = requireContext(req, body);
@@ -6990,6 +7632,7 @@ async function routeRequest(req, parsedUrl, body) {
         classificationType: parsedUrl.searchParams.get('classificationType') || '',
         status: parsedUrl.searchParams.get('status') || '',
         folderPath: parsedUrl.searchParams.get('folderPath') || '',
+        sourceApproach: String(parsedUrl.searchParams.get('sourceApproach') || '').toUpperCase(),
       };
       const originFilter = resolveListOriginFilter(context, parsedUrl);
       let rows = store.requests.filter(request =>
@@ -7002,6 +7645,13 @@ async function routeRequest(req, parsedUrl, body) {
       if (filters.collectionId) rows = rows.filter(request => request.collectionId === filters.collectionId);
       if (filters.classificationType) rows = rows.filter(request => request.classification.type === filters.classificationType);
       if (filters.status) rows = rows.filter(request => request.status === filters.status);
+      if (filters.sourceApproach === 'CDE') {
+        rows = rows.filter(request => request.sourceType === 'CDE_DISCOVERY');
+      } else if (filters.sourceApproach === 'IS') {
+        rows = rows.filter(request => request.sourceType === 'IS_DISCOVERY');
+      } else if (filters.sourceApproach === 'FREE') {
+        rows = rows.filter(request => request.sourceType !== 'CDE_DISCOVERY' && request.sourceType !== 'IS_DISCOVERY');
+      }
       if (filters.folderPath) {
         const wanted = filters.folderPath === '__root__'
           ? []
@@ -7294,7 +7944,13 @@ async function routeRequest(req, parsedUrl, body) {
     }
     if (third === 'execute' && req.method === 'POST') {
       const context = requireContext(req, body);
-      if (request.runtimeBinding?.operationId) {
+      // CDE Runtime path only when a full Runtime Profile binding exists (not IS Gateway bindings).
+      if (
+        request.runtimeBinding?.operationId
+        && request.runtimeBinding?.runtimeProfileId
+        && request.sourceType !== 'IS_DISCOVERY'
+        && !request.isGatewayBinding
+      ) {
         const options = body.options || body;
         if (options.runtimeProfileId && options.runtimeProfileId !== request.runtimeBinding.runtimeProfileId) {
           throw new ApiConsoleError('RUNTIME_BINDING_INVALID', 'Request execution cannot override its synced Runtime Profile binding.', 422);
@@ -7736,10 +8392,23 @@ function runSelfCheck() {
   }));
 }
 
+function resolveCorsOrigin(req) {
+  const configured = String(process.env.API_CONSOLE_CORS_ORIGIN || '').trim();
+  const requestOrigin = String(req.headers.origin || '').trim();
+  const env = process.env.NODE_ENV || 'development';
+  // In local/dev, reflect the Vite origin so auto-bumped ports (5280→5281…) keep working
+  // alongside sibling projects like Integrated Systems on 5173.
+  if ((env === 'development' || env === 'test') && requestOrigin.startsWith('http://localhost:')) {
+    return requestOrigin;
+  }
+  if (configured) return configured;
+  return `http://localhost:${Number(process.env.WEB_PORT || 5280)}`;
+}
+
 function createServer() {
   assertProductionSecrets();
   return http.createServer(async (req, res) => {
-    res.setHeader('access-control-allow-origin', process.env.API_CONSOLE_CORS_ORIGIN || 'http://localhost:5173');
+    res.setHeader('access-control-allow-origin', resolveCorsOrigin(req));
     res.setHeader('access-control-allow-credentials', 'true');
     res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
     res.setHeader('access-control-allow-headers', 'content-type,x-csrf-token,x-utms-context,x-api-console-context');
@@ -7760,7 +8429,7 @@ function createServer() {
           status: 'ok',
           service: 'api-console',
           checkedAt: nowIso(),
-          modules: ['api-console', 'cde-bridge', 'session'],
+          modules: ['api-console', 'cde-bridge', 'is-bridge', 'session'],
         });
         return;
       }
@@ -7783,14 +8452,20 @@ function createServer() {
         sendJson(res, 200, result);
         return;
       }
+      if (canHandleIs(parsedUrl.pathname)) {
+        const body = await readJsonBody(req, 1024 * 1024);
+        const result = await handleIs(req, parsedUrl, body);
+        sendJson(res, 200, result);
+        return;
+      }
       if (!parsedUrl.pathname.startsWith('/api/api-console') && !parsedUrl.pathname.startsWith('/api/reports')) {
         throw new ApiConsoleError('INVALID_URL', 'Endpoint not found.', 404);
       }
-      const isPublicApiPath = /^\/api\/api-console\/portal\/shared\/[^/]+$/.test(parsedUrl.pathname)
+      const isPublicApiPath = /^\/api\/api-console\/portal\/shared\/[^/]+(?:\/download)?$/.test(parsedUrl.pathname)
         || /^\/api\/api-console\/mock-serve\/[^/]+$/.test(parsedUrl.pathname)
         || /^\/api\/api-console\/health(?:\/config)?$/.test(parsedUrl.pathname);
       if (!req.utmsContext && !isLegacyContextEnabled() && !isPublicApiPath) {
-        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'CDE login and project selection are required.', 401);
+        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Login and workspace selection are required.', 401);
       }
       const body = await readJsonBody(req);
       const result = await routeRequest(req, parsedUrl, body);
@@ -7850,4 +8525,5 @@ module.exports = {
   saveStoreToFile,
   STORE_BACKEND,
   SQLITE_FILE,
+  ensureIsGatewayEnvironment,
 };

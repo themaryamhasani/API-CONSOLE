@@ -2,62 +2,68 @@
 
 Source-verified for standalone package: API-CONSOLE
 
-این سند از UTMS استخراج و برای پروژه مستقل `d:\AllApp\API-CONSOLE` سازگار شده است. ورود فقط از طریق CDE انجام می‌شود و وابستگی به UTMS وجود ندارد.
+سند پیاده‌سازی فنی. برای چشم‌انداز محصول، User Story/Flow و رویکردهای ورود → [`PRD.md`](./PRD.md) و [`approaches/`](./approaches/README.md).
+
+**وضعیت ورود امروز:** فقط CDE. رویکردهای **Local Directory** و **Integrated Systems (IS)** در PRD/Backlog (E34/E35) طراحی شده‌اند. وابستگی به UTMS وجود ندارد.
 
 ## Source Of Truth
 
+- Product PRD: `docs/PRD.md`
 - Frontend page: `apps/web/src/pages/OnlineApiConsolePage.tsx`
+- Runtime workspace (FREE vs CDE Discovery): `apps/web/src/components/api-console/RuntimeWorkspace.tsx`
 - Frontend API client: `apps/web/src/services/apiConsoleApi.ts`
-- Shared TypeScript types: `apps/web/src/types/apiConsole.ts`
+- Shared TypeScript types: `apps/web/src/types/apiConsole.ts` (`PERSONAL`, roles, …)
 - CDE login: `apps/web/src/pages/CdeLoginPage.tsx`
 - Backend service and Runner: `apps/api/src/modules/api-console/infrastructure/http/api-console-server.cjs`
+- Phase2/3 routes: `phase2-routes.cjs`, `phase3-routes.cjs`
 - CDE bridge: `apps/api/src/modules/cde/`
 - App session: `apps/api/src/modules/session/session-server.cjs`
-- File-backed store: `runtime/api-console/api-console-store.json`
-- Swagger UI: `http://localhost:4274/api/docs`
-
-
+- File/SQLite store: `runtime/api-console/`
+- Swagger UI: `http://localhost:5281/api/docs`
+- Kill ports script: `scripts/kill-dev-ports.cjs` → `npm run dev:kill-ports`
 
 ## Architecture
 
-Online API Console به صورت یک module داخلی برای اجرای controlled HTTP request پیاده‌سازی شده است.
+Online API Console یک ماژول controlled HTTP runner + مستندسازی/اشتراک است.
 
 ```text
 Frontend
   -> apiConsoleApi.ts
-  -> /api/api-console/*
-  -> API Console backend
-  -> policy + variable/secret resolution + SSRF/TLS/redirect controls
+  -> /api/session* | /api/cde* | /api/api-console/*
+  -> Session trust (cookie + CSRF) + RBAC
+  -> policy + variable/secret resolution + SSRF/TLS/DNS/redirect controls
   -> Node http/https Runner
-  -> Target API
+  -> Target API (یا Runtime Profile برای CDE Discovery)
   -> sanitized execution record
   -> Frontend response viewer
 ```
 
-در development، `vite.config.ts` مسیر `/api` را به `http://localhost:4174` proxy می‌کند. backend با `npm run backend` اجرا می‌شود و frontend با `npm run dev`.
+در development، Vite مسیر `/api` را به `http://localhost:5281` proxy می‌کند (`VITE_DEV_API_PROXY_TARGET`). Backend: `npm run backend` — Frontend: `npm run dev`. پورت‌های پیش‌فرض `5280`/`5281` از محدوده IS جدا هستند؛ در صورت اشغال، API و Vite خودکار پورت آزاد بعدی را می‌گیرند.
 
-این module Gateway یا Data Service موجود را تغییر نمی‌دهد. اگر یک Core request اجرا شود، دقیقا همان HTTP endpoint فعلی Core صدا زده می‌شود و semantic classification فقط برای UI، validation، risk policy و documentation استفاده می‌شود.
+اگر Core request اجرا شود، همان HTTP endpoint Runtime صدا زده می‌شود؛ classification برای UI، validation، risk و documentation است.
+
+### دو حالت کار (پس از ورود)
+
+| حالت | `sourceApproach` | توضیح |
+| --- | --- | --- |
+| درخواست آزاد | `FREE` | Postman-like؛ Collection روی پروژه یا `PERSONAL` |
+| کشف CDE | `CDE` | Scan → Runtime Profile → Sync → Execute ds/fr |
+
+`applicationId = PERSONAL` (`شخصی / آزاد`) همیشه در scope کاربر لاگین‌شده است و به سیستم CDE وابسته نیست.
 
 ## Runbook
 
 ```bash
 npm install
-npm run backend
-npm run dev
+npm run ports:check
+npm run dev:kill-ports   # فقط listenerهای همین ریپو
+npm run backend          # :5281 (+ fallback)
+npm run dev              # :5280 (+ Vite bump)
 npm run backend:self-check
 npm run build
 ```
 
-در PowerShell می‌توان از `npm.cmd` استفاده کرد:
-
-```powershell
-npm.cmd run backend
-npm.cmd run dev
-npm.cmd run backend:self-check
-npm.cmd run build
-```
-
-Backend default روی port `4174` بالا می‌آید. متغیرهای قابل تنظیم:
+Backend default روی port `5281` بالا می‌آید (اگر اشغال باشد بعدی). متغیرهای قابل تنظیم:
 
 - `API_CONSOLE_PORT`
 - `API_CONSOLE_DATA_DIR`
@@ -72,30 +78,26 @@ Backend default روی port `4174` بالا می‌آید. متغیرهای قا
 - `API_CONSOLE_CONNECT_TIMEOUT_MS`
 - `API_CONSOLE_READ_TIMEOUT_MS`
 - `API_CONSOLE_TOTAL_TIMEOUT_MS`
+- `API_CONSOLE_DNS_SERVERS` (پیش‌فرض `8.8.8.8,1.1.1.1` — fallback وقتی DNS سازمانی host عمومی را به IP خصوصی/sinkhole می‌برد)
+- `API_CONSOLE_DESTINATION_BLOCKLIST` / allowlistهای مقصد
 - `VITE_API_CONSOLE_BASE_URL`
+- `VITE_DEV_API_PROXY_TARGET`
 
 ## UI Behavior
 
-صفحه Online API Console ابتدا list view را نمایش می‌دهد:
+صفحه Online API Console list view + Workspace Runtime دارد:
 
-- compact filter section برای جستجو، Collection، classification و status
-- actionهای سمت راست شامل `Collection جدید`، `Import cURL` و `Request جدید`
-- table requestها با actionهای open/edit، soft delete، documentation preview و final documentation
-- data per user ذخیره و list می‌شود؛ backend بر اساس `createdBy` و `ownerId` دسترسی را محدود می‌کند
+- فیلتر منبع: آزاد / CDE؛ فیلتر سیستم اختیاری (شامل `PERSONAL`)
+- ساخت Collection: کارت «آزاد» در برابر «متصل به سیستم»
+- actionها: `Collection جدید`، `Import cURL`، `Request جدید`، Export
+- table requestها: open/edit، soft delete، documentation، version
+- دسترسی بر اساس session (`ownerId` / co-owners / visibility)، نه هدر جعلی مرورگر
 
-وقتی کاربر `Request جدید` یا `Import cURL` را انتخاب می‌کند، وارد editor می‌شود. editor شامل این tabها است:
+Editor tabها:
 
-- `Query Parameters`
-- `Headers`
-- `Cookies`
-- `Body`
-- `Authentication`
-- `Core Details`
-- `Scripts`
-- `Settings`
-- `Assertions`
-- `Generated cURL`
-- `Execution History`
+- `پارامترها` / `Headerها` / `Cookieها` / `Body`
+- `Authentication` / `Core Details` / `Scripts` / `Settings` (عمدتاً SYSTEM_ADMIN)
+- `Assertions` / `مستندات` / `cURL` / `History` / `اجرا` / `Response`
 
 `Settings` فقط برای role `SYSTEM_ADMIN` نمایش داده می‌شود. برای سایر roleها tab تنظیمات general قابل مشاهده نیست.
 
@@ -540,7 +542,10 @@ Secretها، tokenها، session cookieها، passwordها، client-secretها،
 Frontend context از طریق header زیر به backend داده می‌شود:
 
 ```text
-x-utms-context: base64(JSON.stringify(activeContext))
+Cookie: api_console_session=...
+x-csrf-token: <from session>
+# Legacy only (non-prod opt-in): API_CONSOLE_ALLOW_LEGACY_CONTEXT
+# x-api-console-context / x-utms-context — NOT trusted in production
 ```
 
 Backend توسعه‌ای علاوه بر مالکیت کاربر، `scopeApplicationIds` را برای list، read و mutation اعمال می‌کند:
@@ -554,7 +559,7 @@ Backend توسعه‌ای علاوه بر مالکیت کاربر، `scopeApplic
 | list خارج از Scope | رکورد بیرون Scope فیلتر می‌شود |
 | دسترسی مستقیم یا mutation خارج از Context | `403 AUTHENTICATION_ERROR` |
 
-`x-utms-context` فقط adapter توسعه‌ای این checkout است. در production باید با auth middleware و session/JWT امضاشده جایگزین شود و payload ارسالی مرورگر به‌تنهایی منبع اعتماد نباشد.
+منبع اعتماد production: **session سمت سرور** (`api_console_session` + CSRF). هدرهای context مرورگر فقط با `API_CONSOLE_ALLOW_LEGACY_CONTEXT` در غیر-production برای تست مجازند و هرگز جایگزین نقش واقعی session نمی‌شوند.
 
 ## RBAC
 
@@ -710,7 +715,8 @@ read api-usage report
 
 - در development، `runtime/api-console/*` runtime data است و نباید به عنوان production DB در نظر گرفته شود.
 - `apps/api/src/modules/api-console/infrastructure/templates/api-console-document-template.docx` باید همراه backend deploy شود یا مسیر آن با `API_CONSOLE_DOCX_TEMPLATE_FILE` تنظیم شود.
-- برای production، `x-utms-context` باید با session/JWT/auth middleware واقعی validate شود.
+- برای production فقط session + CSRF معتبر است؛ legacy context headers خاموش بمانند.
+- رویکردهای Local و IS: `docs/approaches/` و Epicهای E34/E35 در `BACKLOG.md`.
 - Network allowlist و Runner zoneها باید بر اساس سیاست سازمان تکمیل شوند.
 - Secret vault فعلی local adapter است؛ production باید از secret-management رسمی استفاده کند.
 - Gateway و Data Service برای این feature تغییر نکرده‌اند.

@@ -1,6 +1,6 @@
 # API Console — Product Backlog
 
-منبع: تحلیل معماری/BA روی وضعیت فعلی سیستم (standalone Online API Console با ورود CDE).
+منبع: تحلیل معماری/BA روی وضعیت فعلی سیستم (standalone Online API Console با ورود CDE) + گسترش Identity به Local و IS طبق [`PRD.md`](./PRD.md).
 
 قرارداد اولویت:
 
@@ -59,6 +59,8 @@
 | E31 | Security Hardening پیشرفته | P0/P1 | فاز 0–2 |
 | E32 | Runner Zones و جداسازی شبکه | P1 | فاز 2 |
 | E33 | Ownership و Collaboration روی Request | P1 | فاز 2 |
+| E34 | ورود Local Directory (غیر-CDE) | P0 | فاز 0–1 |
+| E35 | Approach Integrated Systems (Gateway/SSO/Spec) | P1 | فاز 1–2 |
 
 ---
 
@@ -831,6 +833,76 @@
 ### PI-3 (فاز 3)
 1. E24–E30 Portal، OpenAPI، Mock، Contract، Multi-origin، ITSM، Branding
 
+### PI Identity Expansion
+1. **E34** Local Directory — ورود یوزر/پسورد برای غیر-CDE + FREE-only workspace  
+2. **E35** IS Approach — پل `integrated-systems` Gateway/SSO + systems + execute
+
+جزئیات محصولی: [`PRD.md`](./PRD.md) ، [`approaches/`](./approaches/README.md)
+
+---
+
+## E34 — ورود Local Directory (غیر-CDE) (P0)
+
+**هدف:** مدیر سیستم حساب محلی بسازد؛ کاربر بدون CDE وارد شود و از قابلیت Postman-like (درخواست آزاد) استفاده کند.
+
+#### S34.01 — مدل LocalUser + Admin CRUD
+- **Status:** `TODO`
+- **Acceptance Criteria:**
+  - [ ] entity `LocalUser` با password hash، roles، ACTIVE/DISABLED
+  - [ ] API ادمین: create/list/patch/disable/reset-password
+  - [ ] audit برای همهٔ mutationها
+  - [ ] مستند در `docs/approaches/02-local-directory.md`
+
+#### S34.02 — Login محلی + Session `authApproach=LOCAL`
+- **Status:** `TODO`
+- **Acceptance Criteria:**
+  - [ ] `POST /api/auth/local/login` با rate limit
+  - [ ] session بدون الزام CDE cookie jar / project
+  - [ ] Gate وب: تب ورود محلی در کنار CDE
+  - [ ] تست session-trust: کاربر LOCAL نمی‌تواند خود را Admin کند
+
+#### S34.03 — Workspace محدود به FREE
+- **Status:** `TODO`
+- **Acceptance Criteria:**
+  - [ ] UI کشف CDE / Runtime Profiles برای LOCAL مخفی یا 403
+  - [ ] `PERSONAL` + درخواست آزاد کامل (Send/Save/Import/Export)
+  - [ ] Share/Review طبق RBAC نقش محلی
+
+---
+
+## E35 — Approach Integrated Systems (P1)
+
+**هدف:** شناسایی و اتصال به مونورپوی `D:\AllApp\IS\integrated-systems` (Gateway + SSO `_lsr` + Spec/OpenAPI).
+
+#### S35.01 — شناسایی معماری IS در docs
+- **Status:** `DONE`
+- **Acceptance Criteria:**
+  - [x] سند `docs/approaches/03-integrated-systems.md` با ساختار، auth، routes، نگاشت مفاهیم
+  - [x] ارجاع از PRD و docs/README
+
+#### S35.02 — Bridge نشست Gateway → Console
+- **Status:** `DONE`
+- **Acceptance Criteria:**
+  - [x] feature flag `API_CONSOLE_IS_ENABLED`
+  - [x] اعتبارسنجی login/`/api/v1/sso/me` روی `API_CONSOLE_IS_GATEWAY_URL`
+  - [x] directory user با `authApproach=IS` / `source: IS`
+  - [x] تب ورود IS در UI
+
+#### S35.03 — Systems + Execute از طریق Gateway
+- **Status:** `DONE`
+- **Acceptance Criteria:**
+  - [x] لیست `is:<serviceKey>` از کاتالوگ پیش‌فرض + `API_CONSOLE_IS_SYSTEMS`
+  - [x] Request آزاد با base Gateway
+  - [x] تزریق خودکار Cookie `_lsr` برای URL برابر Gateway
+  - [x] اجازهٔ مقصد localhost فقط برای Gateway پیکربندی‌شده
+  - [ ] حداقل یک تست integration با Gateway mock (باقیمانده)
+
+#### S35.04 — Import OpenAPI از Docs & Specs (اختیاری MVP+)
+- **Status:** `TODO`
+- **Acceptance Criteria:**
+  - [ ] خواندن `idp-docs` openapi.json
+  - [ ] ساخت Collection از operations منتخب
+
 ---
 
 ## قالب Story برای ابزارهای مدیریت کار (Jira/Azure DevOps)
@@ -874,9 +946,10 @@ Test Notes:
 
 | مورد | تعداد |
 | --- | --- |
-| Epics | 33 |
-| Stories | 81 |
-| P0-heavy Epics | E01–E08، بخش E23/E31 |
+| Epics | 35 |
+| Stories | 81 + E34/E35 stories |
+| P0-heavy Epics | E01–E08، E23/E31، **E34** |
+| Approaches docs | CDE / Local / IS — `docs/approaches/` |
 | P1 Epics | E09–E22، E32–E33، … |
 | P2 Epics | E24–E30 و بخشی E19/E20 |
 

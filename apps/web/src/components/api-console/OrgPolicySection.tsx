@@ -13,6 +13,7 @@ export function OrgPolicySection({ context }: { context: ActiveContext }) {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [allowlistText, setAllowlistText] = useState('');
+  const [blocklistText, setBlocklistText] = useState('');
   const [dualApproval, setDualApproval] = useState(false);
   const [forbidInsecureTls, setForbidInsecureTls] = useState(true);
   const [forbidExactMode, setForbidExactMode] = useState(true);
@@ -22,7 +23,9 @@ export function OrgPolicySection({ context }: { context: ActiveContext }) {
     try {
       const next = await apiConsoleApi.getOrgPolicy(context);
       setPolicy(next);
-      setAllowlistText((next.privateDestinationAllowlist || []).join('\n'));
+      const allow = Array.isArray(next.destinationAllowlist) ? next.destinationAllowlist : [];
+      setAllowlistText(allow.join('\n'));
+      setBlocklistText((next.destinationBlocklist || []).join('\n'));
       setDualApproval(next.dualApprovalProductionCommand === true);
       setForbidInsecureTls(next.forbidInsecureTlsInProduction !== false);
       setForbidExactMode(next.forbidExactModeInProduction !== false);
@@ -40,12 +43,18 @@ export function OrgPolicySection({ context }: { context: ActiveContext }) {
   const handleSave = async () => {
     setSaving(true);
     try {
-      const privateDestinationAllowlist = allowlistText
+      const destinationAllowlist = allowlistText
+        .split(/\r?\n|,/)
+        .map(item => item.trim())
+        .filter(Boolean);
+      const destinationBlocklist = blocklistText
         .split(/\r?\n|,/)
         .map(item => item.trim())
         .filter(Boolean);
       const next = await apiConsoleApi.updateOrgPolicy({
-        privateDestinationAllowlist,
+        destinationAllowlist,
+        destinationBlocklist,
+        privateDestinationAllowlist: destinationAllowlist,
         dualApprovalProductionCommand: dualApproval,
         forbidInsecureTlsInProduction: forbidInsecureTls,
         forbidExactModeInProduction: forbidExactMode,
@@ -64,21 +73,37 @@ export function OrgPolicySection({ context }: { context: ActiveContext }) {
       <Card padding="sm">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>
-            <h2 className="text-sm font-semibold text-gray-900">سیاست سازمانی Production</h2>
-            <p className="text-xs text-gray-500">فقط SYSTEM_ADMIN — allowlist مقصد خصوصی، dual approval و محدودیت TLS/EXACT.</p>
+            <h2 className="text-sm font-semibold text-gray-900">سیاست مقصد و Production</h2>
+            <p className="text-xs text-gray-500">
+              فقط SYSTEM_ADMIN — به‌صورت پیش‌فرض همه دامنه‌های عمومی آزادند. allowlist/blocklist اختیاری‌اند.
+            </p>
           </div>
           <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={() => void load()} loading={loading}>
             تازه‌سازی
           </Button>
         </div>
 
+        <div className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+          اگر allowlist خالی باشد، هر دامنه HTTP/HTTPS (مثل Postman) مجاز است. فقط localhost/metadata همیشه مسدود می‌مانند.
+        </div>
+
         <Textarea
-          label="Private destination allowlist (یک origin در هر خط)"
+          label="Allowlist مقصد (اختیاری — اگر پر باشد فقط همین‌ها مجازند)"
           value={allowlistText}
           onChange={(event) => setAllowlistText(event.target.value)}
-          className="min-h-28 font-mono text-left"
+          className="min-h-24 font-mono text-left"
           dir="ltr"
-          placeholder="http://10.0.0.5:8080"
+          placeholder={"https://api.example.com\n*.partner.ir"}
+          hint="خالی = همه آزاد. پر = حالت محدود."
+        />
+
+        <Textarea
+          label="Blocklist مقصد (اختیاری — همیشه مسدود)"
+          value={blocklistText}
+          onChange={(event) => setBlocklistText(event.target.value)}
+          className="mt-3 min-h-24 font-mono text-left"
+          dir="ltr"
+          placeholder={"https://evil.example\n*.blocked.ir"}
         />
 
         <div className="mt-4 space-y-2 text-sm text-gray-700">
@@ -96,11 +121,14 @@ export function OrgPolicySection({ context }: { context: ActiveContext }) {
           </label>
         </div>
 
-        {(policy?.envPrivateDestinationAllowlist?.length || policy?.envDualApproval) ? (
+        {(policy?.envPrivateDestinationAllowlist?.length || policy?.envDestinationBlocklist?.length || policy?.envDualApproval) ? (
           <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900" dir="ltr">
             {policy.envDualApproval ? <p>API_CONSOLE_DUAL_APPROVAL=true (env override)</p> : null}
             {policy.envPrivateDestinationAllowlist?.length ? (
               <p className="mt-1">Env allowlist: {policy.envPrivateDestinationAllowlist.join(', ')}</p>
+            ) : null}
+            {policy.envDestinationBlocklist?.length ? (
+              <p className="mt-1">Env blocklist: {policy.envDestinationBlocklist.join(', ')}</p>
             ) : null}
           </div>
         ) : null}

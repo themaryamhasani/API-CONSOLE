@@ -112,6 +112,7 @@ interface SearchableSelectProps {
     options: Array<{
         value: string;
         label: string;
+        description?: string | undefined;
         keywords?: string | undefined;
     }>;
     placeholder?: string | undefined;
@@ -122,6 +123,7 @@ interface SearchableSelectProps {
     dir?: 'rtl' | 'ltr' | undefined;
     id?: string | undefined;
     clearable?: boolean | undefined;
+    size?: 'sm' | 'md' | undefined;
 }
 
 export const SearchableSelect: React.FC<SearchableSelectProps> = ({
@@ -139,6 +141,7 @@ export const SearchableSelect: React.FC<SearchableSelectProps> = ({
     dir = 'rtl',
     id,
     clearable = false,
+    size = 'md',
 }) => {
     const generatedId = React.useId();
     const inputId = id || `utms-combobox-${generatedId.replace(/:/g, '')}`;
@@ -152,7 +155,7 @@ export const SearchableSelect: React.FC<SearchableSelectProps> = ({
     const selected = options.find(option => option.value === value);
     const normalizedQuery = query.trim().toLocaleLowerCase('fa-IR');
     const filteredOptions = React.useMemo(() => normalizedQuery
-        ? options.filter(option => `${option.label} ${option.value} ${option.keywords || ''}`
+        ? options.filter(option => `${option.label} ${option.value} ${option.description || ''} ${option.keywords || ''}`
             .toLocaleLowerCase('fa-IR')
             .includes(normalizedQuery))
         : options, [normalizedQuery, options]);
@@ -197,11 +200,11 @@ export const SearchableSelect: React.FC<SearchableSelectProps> = ({
     };
 
     return (<div ref={rootRef} className={cn('relative w-full', className)} dir={dir}>
-      {label && (<label htmlFor={inputId} className="mb-1 block text-sm font-medium text-gray-700">
+      {label && (<label htmlFor={inputId} className="mb-1 block text-sm font-medium text-[var(--theme-text-muted)]">
           {label}
         </label>)}
       <div className="relative">
-        <Search className="pointer-events-none absolute right-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-gray-400" />
+        <Search className="pointer-events-none absolute right-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-[var(--theme-text-subtle)]" />
         <input
           id={inputId}
           role="combobox"
@@ -227,10 +230,11 @@ export const SearchableSelect: React.FC<SearchableSelectProps> = ({
           }}
           onKeyDown={handleKeyDown}
           className={cn(
-              'h-10 w-full rounded-lg border bg-white py-2 pr-9 pl-16 text-sm text-gray-900 outline-none transition',
-              'placeholder:text-gray-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-100',
+              'w-full rounded-lg border bg-[var(--theme-surface-raised)] text-[var(--theme-text)] outline-none transition',
+              'placeholder:text-[var(--theme-text-subtle)] focus:border-transparent focus:ring-2 focus:ring-[var(--theme-focus)]',
               'disabled:cursor-not-allowed disabled:bg-[var(--theme-surface-muted)]',
-              error ? 'border-red-500' : 'border-[var(--theme-border-strong)]',
+              size === 'sm' ? 'h-9 py-1.5 pr-9 pl-14 text-sm' : 'h-10 py-2 pr-9 pl-16 text-sm',
+              error ? 'border-[var(--theme-danger)]' : 'border-[var(--theme-border-strong)]',
           )}
         />
         <div className="absolute left-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
@@ -239,24 +243,24 @@ export const SearchableSelect: React.FC<SearchableSelectProps> = ({
             aria-label="پاک کردن انتخاب"
             onMouseDown={event => event.preventDefault()}
             onClick={() => choose('')}
-            className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+            className="rounded p-1 text-[var(--theme-text-subtle)] hover:bg-[var(--theme-surface-muted)] hover:text-[var(--theme-text)]"
           >
             <X className="h-3.5 w-3.5" />
           </button>)}
-          <ChevronDown className={cn('h-4 w-4 text-gray-400 transition-transform', open && 'rotate-180')} />
+          <ChevronDown className={cn('h-4 w-4 text-[var(--theme-text-subtle)] transition-transform', open && 'rotate-180')} />
         </div>
       </div>
       {open && !disabled && (<div
         id={listboxId}
         role="listbox"
-        className="absolute z-50 mt-1 max-h-64 w-full overflow-y-auto rounded-xl border border-gray-200 bg-white p-1.5 shadow-xl"
+        className="absolute z-50 mt-1 max-h-72 w-full overflow-y-auto rounded-xl border border-[var(--theme-border)] bg-[var(--theme-surface-raised)] p-1.5 shadow-xl"
       >
         {filteredOptions.length ? filteredOptions.map((option, index) => {
             const isSelected = option.value === value;
             const isActive = index === activeIndex;
             return (<button
               id={`${inputId}-option-${index}`}
-              key={option.value}
+              key={option.value || `empty-${index}`}
               type="button"
               role="option"
               aria-selected={isSelected}
@@ -264,16 +268,21 @@ export const SearchableSelect: React.FC<SearchableSelectProps> = ({
               onMouseDown={event => event.preventDefault()}
               onClick={() => choose(option.value)}
               className={cn(
-                  'flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-right text-sm transition-colors',
-                  isActive ? 'bg-blue-50 text-blue-800' : 'text-gray-700 hover:bg-gray-50',
+                  'flex w-full items-start justify-between gap-3 rounded-lg px-3 py-2 text-right transition-colors',
+                  isActive ? 'bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]' : 'text-[var(--theme-text)] hover:bg-[var(--theme-surface-muted)]',
               )}
             >
-              <span className="min-w-0 flex-1 truncate">{option.label}</span>
-              {isSelected && <Check className="h-4 w-4 flex-shrink-0 text-blue-600" />}
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium">{option.label}</span>
+                {option.description ? (
+                  <span className="mt-0.5 block truncate font-mono text-[11px] text-[var(--theme-text-subtle)]" dir="ltr">{option.description}</span>
+                ) : null}
+              </span>
+              {isSelected && <Check className="mt-0.5 h-4 w-4 flex-shrink-0 text-[var(--theme-accent)]" />}
             </button>);
-        }) : (<div className="px-3 py-6 text-center text-sm text-gray-500">{emptyMessage}</div>)}
+        }) : (<div className="px-3 py-6 text-center text-sm text-[var(--theme-text-subtle)]">{emptyMessage}</div>)}
       </div>)}
       {error && <p id={errorId} role="alert" className="mt-1 text-sm text-[var(--theme-danger)]">{error}</p>}
-      {hint && !error && <p id={hintId} className="mt-1 text-xs text-gray-500">{hint}</p>}
+      {hint && !error && <p id={hintId} className="mt-1 text-xs text-[var(--theme-text-subtle)]">{hint}</p>}
     </div>);
 };

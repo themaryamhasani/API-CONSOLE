@@ -10,6 +10,8 @@
     "dev": "npm run dev:web",
     "dev:web": "npm run dev -w @api-console/web",
     "dev:api": "npm run dev -w @api-console/api",
+    "dev:kill-ports": "node scripts/kill-dev-ports.cjs",
+    "ports:check": "node scripts/check-dev-ports.cjs",
     "backend": "npm run dev:api",
     "backend:self-check": "npm run self-check -w @api-console/api",
     "backend:admin-check": "npm run test:admin -w @api-console/api",

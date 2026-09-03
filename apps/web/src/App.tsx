@@ -12,7 +12,9 @@ function Gate({ children }: { children: ReactNode }) {
   const bootstrapped = useSessionStore(state => state.bootstrapped);
   const loading = useSessionStore(state => state.loading);
   const activeContext = useSessionStore(state => state.activeContext);
+  const authenticated = useSessionStore(state => state.authenticated);
   const cdeConnected = useSessionStore(state => state.cdeConnected);
+  const isConnected = useSessionStore(state => state.isConnected);
   const bootstrap = useSessionStore(state => state.bootstrap);
 
   useEffect(() => {
@@ -27,7 +29,8 @@ function Gate({ children }: { children: ReactNode }) {
     );
   }
 
-  if (!cdeConnected || !activeContext) {
+  const signedIn = Boolean(authenticated || ((cdeConnected || isConnected) && activeContext));
+  if (!signedIn || !activeContext) {
     return <CdeLoginPage />;
   }
 

@@ -130,6 +130,9 @@ function createPhase3Router(deps) {
     assertCanReviewShares,
     DATA_DIR,
     DOCX_TEMPLATE_FILE,
+    generateDocumentationMarkdown,
+    buildDocxFromTemplate,
+    docxFileName,
   } = deps;
 
   function store() {
@@ -148,6 +151,8 @@ function createPhase3Router(deps) {
     if (!store().orgPolicies || typeof store().orgPolicies !== 'object' || Array.isArray(store().orgPolicies)) {
       setStoreField('orgPolicies', {
         privateDestinationAllowlist: [],
+        destinationAllowlist: [],
+        destinationBlocklist: [],
         dualApprovalProductionCommand: false,
         forbidInsecureTlsInProduction: true,
         forbidExactModeInProduction: true,
@@ -156,9 +161,21 @@ function createPhase3Router(deps) {
         updatedAt: null,
         updatedBy: null,
       });
-    } else if (store().orgPolicies.maxPortalShareTtlHours == null) {
-      store().orgPolicies.maxPortalShareTtlHours = 168;
-      store().orgPolicies.allowAnonymousPortalShare = store().orgPolicies.allowAnonymousPortalShare !== false;
+    } else {
+      if (!Array.isArray(store().orgPolicies.destinationAllowlist)) {
+        // Keep open-by-default; do not promote legacy private-only allowlist into a global allowlist.
+        store().orgPolicies.destinationAllowlist = [];
+      }
+      if (!Array.isArray(store().orgPolicies.destinationBlocklist)) {
+        store().orgPolicies.destinationBlocklist = [];
+      }
+      if (!Array.isArray(store().orgPolicies.privateDestinationAllowlist)) {
+        store().orgPolicies.privateDestinationAllowlist = [];
+      }
+      if (store().orgPolicies.maxPortalShareTtlHours == null) {
+        store().orgPolicies.maxPortalShareTtlHours = 168;
+        store().orgPolicies.allowAnonymousPortalShare = store().orgPolicies.allowAnonymousPortalShare !== false;
+      }
     }
     if (!store().branding) {
       setStoreField('branding', {
@@ -481,6 +498,46 @@ function createPhase3Router(deps) {
       if (!request || !['APPROVED', 'DEPRECATED'].includes(request.sharingStatus)) {
         throw new ApiConsoleError('INVALID_URL', 'Shared document not found.', 404);
       }
+
+      if (fourth === 'download') {
+        if (typeof generateDocumentationMarkdown !== 'function' || typeof buildDocxFromTemplate !== 'function') {
+          throw new ApiConsoleError('INTERNAL_EXECUTION_ERROR', 'Document generator is unavailable.', 500);
+        }
+        const language = String(parsedUrl.searchParams.get('language') || 'FA').toUpperCase() === 'EN' ? 'EN' : 'FA';
+        const markdownResult = generateDocumentationMarkdown(
+          request,
+          store().executions || [],
+          store().manualExamples || [],
+          record.createdBy || 'portal',
+        );
+        markdownResult.language = language;
+        const activeTemplate = store().branding?.templates?.find(item => item.id === store().branding?.activeTemplateId);
+        const templatePath = activeTemplate?.filePath && fs.existsSync(activeTemplate.filePath)
+          ? activeTemplate.filePath
+          : DOCX_TEMPLATE_FILE;
+        const docxBuffer = buildDocxFromTemplate(
+          request,
+          markdownResult,
+          store().executions || [],
+          store().manualExamples || [],
+          templatePath,
+        );
+        const fileName = typeof docxFileName === 'function'
+          ? docxFileName(request)
+          : `${String(request.name || 'api-document').replace(/[\\/:*?"<>|]+/g, '-')}.docx`;
+        return {
+          __rawResponse: {
+            statusCode: 200,
+            contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            body: docxBuffer,
+            headers: {
+              'content-disposition': `attachment; filename="${fileName.replace(/"/g, '')}"`,
+              'cache-control': 'no-store',
+            },
+          },
+        };
+      }
+
       return safeClone({
         apiId: request.apiId,
         version: semanticVersionOf(request),
@@ -497,6 +554,7 @@ function createPhase3Router(deps) {
         executeProductionAllowed: false,
         expiresAt: record.expiresAt,
         readOnly: true,
+        downloadPath: `/api/api-console/portal/shared/${encodeURIComponent(token)}/download`,
       });
     }
 
@@ -945,6 +1003,10 @@ function createPhase3Router(deps) {
             .split(',')
             .map(item => item.trim())
             .filter(Boolean),
+          envDestinationBlocklist: String(process.env.API_CONSOLE_DESTINATION_BLOCKLIST || '')
+            .split(',')
+            .map(item => item.trim())
+            .filter(Boolean),
           envDualApproval: String(process.env.API_CONSOLE_DUAL_APPROVAL || '').toLowerCase() === 'true',
         });
       }
@@ -954,26 +1016,35 @@ function createPhase3Router(deps) {
           throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Only SYSTEM_ADMIN can update org policy.', 403);
         }
         const data = body.data || body;
-        const allowlist = Array.isArray(data.privateDestinationAllowlist)
-          ? data.privateDestinationAllowlist.map(item => String(item || '').trim()).filter(Boolean)
-          : store().orgPolicies.privateDestinationAllowlist;
-        for (const origin of allowlist) {
+        const allowlistSource = Array.isArray(data.destinationAllowlist)
+          ? data.destinationAllowlist
+          : (Array.isArray(data.privateDestinationAllowlist)
+            ? data.privateDestinationAllowlist
+            : (store().orgPolicies.destinationAllowlist || store().orgPolicies.privateDestinationAllowlist || []));
+        const blocklistSource = Array.isArray(data.destinationBlocklist)
+          ? data.destinationBlocklist
+          : (store().orgPolicies.destinationBlocklist || []);
+        const allowlist = allowlistSource.map(item => String(item || '').trim()).filter(Boolean);
+        const blocklist = blocklistSource.map(item => String(item || '').trim()).filter(Boolean);
+        const validatePattern = (origin, label) => {
           try {
-            const parsed = new URL(origin);
-            const isOriginOnly = (parsed.pathname === '/' || parsed.pathname === '') && !parsed.search && !parsed.hash;
-            if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || !isOriginOnly) {
-              throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Invalid private destination origin: ${origin}`, 422);
-            }
-            if (/\*/.test(origin)) {
-              throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'Wildcard origins are not allowed in private destination allowlist.', 422);
+            if (origin.startsWith('*.') || /^[a-z0-9.-]+(?::\d+)?$/i.test(origin)) return;
+            const parsed = new URL(origin.includes('://') ? origin : `https://${origin}`);
+            if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+              throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Invalid ${label}: ${origin}`, 422);
             }
           } catch (error) {
             if (error instanceof ApiConsoleError) throw error;
-            throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Invalid private destination origin: ${origin}`, 422);
+            throw new ApiConsoleError('CORE_VALIDATION_ERROR', `Invalid ${label}: ${origin}`, 422);
           }
-        }
+        };
+        allowlist.forEach(item => validatePattern(item, 'destination allowlist entry'));
+        blocklist.forEach(item => validatePattern(item, 'destination blocklist entry'));
         store().orgPolicies = {
+          ...store().orgPolicies,
           privateDestinationAllowlist: allowlist,
+          destinationAllowlist: allowlist,
+          destinationBlocklist: blocklist,
           dualApprovalProductionCommand: data.dualApprovalProductionCommand === true,
           forbidInsecureTlsInProduction: data.forbidInsecureTlsInProduction !== false,
           forbidExactModeInProduction: data.forbidExactModeInProduction !== false,
@@ -987,6 +1058,7 @@ function createPhase3Router(deps) {
           forbidInsecureTlsInProduction: store().orgPolicies.forbidInsecureTlsInProduction,
           forbidExactModeInProduction: store().orgPolicies.forbidExactModeInProduction,
           allowlistCount: allowlist.length,
+          blocklistCount: blocklist.length,
         });
         saveStore(store());
         return safeClone(store().orgPolicies);

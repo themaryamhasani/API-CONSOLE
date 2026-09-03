@@ -124,14 +124,16 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 export const sessionApi = {
   current: () => request<{
     authenticated: boolean;
+    authApproach?: 'CDE' | 'IS' | 'LOCAL' | null;
     cdeConnected: boolean;
+    isConnected?: boolean;
     csrfToken: string;
     activeContext: import('../types').ActiveContext | null;
     applicationId: string | null;
     projects: string[];
   }>('/api/session'),
   selectContext: (projectKey: string, projects?: string[]) =>
-    request<{ activeContext: import('../types').ActiveContext; csrfToken: string }>('/api/session/context', {
+    request<{ activeContext: import('../types').ActiveContext; csrfToken: string; authApproach?: string | null }>('/api/session/context', {
       method: 'POST',
       body: JSON.stringify({ projectKey, applicationId: projectKey, projects }),
     }),

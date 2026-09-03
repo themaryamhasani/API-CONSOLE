@@ -5,7 +5,10 @@ export type ApiExecutionMode = 'RECOMMENDED' | 'EXACT';
 export type ApiClassificationType = 'GENERIC_HTTP' | 'CORE_QUERY' | 'CORE_COMMAND';
 export type ApiCoreOperationType = 'QUERY' | 'COMMAND';
 export type ApiSharingStatus = 'DRAFT' | 'PENDING_REVIEW' | 'RETURNED' | 'APPROVED' | 'DEPRECATED';
-export type ApiRequestSourceType = 'ORIGINAL' | 'REFERENCE' | 'CDE_DISCOVERY';
+export type ApiRequestSourceType = 'ORIGINAL' | 'REFERENCE' | 'CDE_DISCOVERY' | 'IS_DISCOVERY';
+/** Reserved applicationId for free-form / personal requests (not bound to a CDE system). */
+export const PERSONAL_APPLICATION_ID = 'PERSONAL';
+export const PERSONAL_APPLICATION_LABEL = 'شخصی / آزاد';
 export type ApiConsumerType = 'USER' | 'ROLE';
 export type ApiShareReviewAction = 'APPROVED' | 'RETURNED';
 export type ApiUsageEventType = 'ADDED_TO_CONSOLE' | 'API_OPENED' | 'API_EXECUTED' | 'REMOVED_FROM_CONSOLE' | 'NEW_VERSION_VIEWED';
@@ -323,6 +326,7 @@ export interface ApiRequestDefinition {
     updatedBy?: string | undefined;
     updatedAt: string;
     runtimeBinding?: RuntimeBinding | undefined;
+    isGatewayBinding?: IsGatewayBinding | undefined;
     sourceSync?: SourceSyncState | undefined;
     schemaCompleteness?: 'COMPLETE' | 'NEEDS_INPUT' | undefined;
     sourceEvidence?: SourceEvidence[] | undefined;
@@ -443,6 +447,23 @@ export interface RuntimeBinding {
     moduleId?: string | undefined;
     sourceFingerprint: string;
     requiresRuntimeSession: boolean;
+}
+
+/** Binding for Integrated Systems Gateway executions (cookie `_lsr` injected server-side). */
+export interface IsGatewayBinding {
+    approach: 'IS';
+    sourceKind: string;
+    sourceFingerprint: string;
+    serviceKey: string;
+    gatewayPath: string;
+    gatewayBaseUrl: string;
+    applicationId: string;
+    specFolder?: string | null;
+    controllerName?: string | null;
+    actionName?: string | null;
+    requiresIsSession: true;
+    /** Cookie / session secrets are never stored on the request; backend injects `_lsr`. */
+    secretsInjectedAtExecute: true;
 }
 
 export interface SourceSyncState {
@@ -654,6 +675,7 @@ export interface ApiPublicPortalDocument {
     executeProductionAllowed: false;
     expiresAt?: string | undefined;
     readOnly: true;
+    downloadPath?: string | undefined;
 }
 
 export interface ApiContractBaseline {
@@ -760,6 +782,8 @@ export interface ApiComplianceReport {
 
 export interface ApiOrgPolicies {
     privateDestinationAllowlist: string[];
+    destinationAllowlist?: string[];
+    destinationBlocklist?: string[];
     dualApprovalProductionCommand: boolean;
     forbidInsecureTlsInProduction: boolean;
     forbidExactModeInProduction: boolean;
@@ -768,6 +792,7 @@ export interface ApiOrgPolicies {
     updatedAt?: string | null;
     updatedBy?: string | null;
     envPrivateDestinationAllowlist?: string[];
+    envDestinationBlocklist?: string[];
     envDualApproval?: boolean;
 }
 

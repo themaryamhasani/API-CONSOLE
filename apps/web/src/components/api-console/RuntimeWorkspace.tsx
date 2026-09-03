@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
+  ChevronDown,
   Copy,
   Download,
   ExternalLink,
@@ -9,6 +10,7 @@ import {
   RefreshCw,
   Save,
   Search,
+  Settings2,
   ShieldCheck,
   Trash2,
   ZoomIn,
@@ -18,6 +20,7 @@ import type { ActiveContext } from '../../types';
 import type {
   ApiCollection,
   ApiDiscoverySnapshot,
+  ApiRequestDefinition,
   ApiRequestExecution,
   DiscoveryPreviewState,
   DiscoverySyncResult,
@@ -26,19 +29,29 @@ import type {
   RuntimeProfile,
   RuntimeSessionStatus,
 } from '../../types/apiConsole';
+import { PERSONAL_APPLICATION_ID, PERSONAL_APPLICATION_LABEL } from '../../types/apiConsole';
 import { apiConsoleApi } from '../../services/apiConsoleApi';
+import {
+  isApi,
+  type IsOperationDescriptor,
+  type IsSystemDescriptor,
+  type IsWorkspaceDescriptor,
+} from '../../services/isApi';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { Card } from '../ui/Card';
-import { Input, Select, Textarea } from '../ui/Input';
+import { Input, Select, Textarea, SearchableSelect } from '../ui/Input';
 import { Modal } from '../ui/Modal';
 import { Pagination } from '../ui/Table';
 import { toast } from '../ui/Toast';
+import { ApplicationSelect } from '../ui/ApplicationSelect';
+import { useApplicationLookup } from '../../utils/useApplicationLookup';
 
 type OperationTypeFilter = 'ALL' | 'CORE_QUERY' | 'CORE_COMMAND' | 'REST';
 type InspectorTab = 'request' | 'response';
 type ConflictChoice = 'SOURCE' | 'LOCAL';
 type ConflictResolutions = Record<string, Record<string, ConflictChoice>>;
+type WorkspaceMode = 'cde' | 'free' | 'is';
 
 const RUNTIME_KIND_ORDER: RuntimeEnvironmentKind[] = ['DEVELOPMENT', 'TEST', 'PRE_PRODUCTION', 'PRODUCTION'];
 const RUNTIME_KIND_LABELS: Record<RuntimeEnvironmentKind, string> = {
@@ -175,6 +188,11 @@ type Props = {
   isSystemAdmin: boolean;
   onSynced: () => Promise<void> | void;
   onConnectionChange?: (connected: boolean) => void;
+  onCreateFreeRequest?: (applicationId?: string) => void | Promise<void>;
+  onOpenRequest?: (requestId: string) => void | Promise<void>;
+  canCreateFreeRequest?: boolean;
+  projects?: Array<{ projectKey: string }>;
+  onSelectProject?: (projectKey: string) => void | Promise<void>;
 };
 
 type ProfileForm = {
@@ -289,7 +307,46 @@ function downloadText(fileName: string, value: string, type = 'text/plain;charse
   URL.revokeObjectURL(url);
 }
 
-export function RuntimeWorkspace({ context, projectKey, collections, isSystemAdmin, onSynced, onConnectionChange }: Props) {
+export function RuntimeWorkspace({
+  context,
+  projectKey,
+  collections,
+  isSystemAdmin,
+  onSynced,
+  onConnectionChange,
+  onCreateFreeRequest,
+  onOpenRequest,
+  canCreateFreeRequest = true,
+  projects = [],
+  onSelectProject,
+}: Props) {
+  const { getApplicationName } = useApplicationLookup();
+  const isIsApproach = context.authApproach === 'IS' || context.identitySource === 'IS';
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(isIsApproach ? 'is' : 'cde');
+
+  useEffect(() => {
+    if (isIsApproach) setWorkspaceMode('is');
+  }, [isIsApproach]);
+
+  const [isSystems, setIsSystems] = useState<IsSystemDescriptor[]>([]);
+  const [isWorkspaces, setIsWorkspaces] = useState<IsWorkspaceDescriptor[]>([]);
+  const [isSystemsLoading, setIsSystemsLoading] = useState(false);
+  const [isWorkspaceFilter, setIsWorkspaceFilter] = useState<string>('all');
+  const [isCategoryFilter, setIsCategoryFilter] = useState<string>('all');
+  const [isSelectedServiceKey, setIsSelectedServiceKey] = useState('');
+  const [isOperations, setIsOperations] = useState<IsOperationDescriptor[]>([]);
+  const [isOpsLoading, setIsOpsLoading] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isWarnings, setIsWarnings] = useState<Array<{ code: string; message: string }>>([]);
+  const [isSelectedOpIds, setIsSelectedOpIds] = useState<string[]>([]);
+  const [isSearch, setIsSearch] = useState('');
+  const [isCounts, setIsCounts] = useState<{ total: number; specs?: number; gateway: number; openapi: number } | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [freeSystemId, setFreeSystemId] = useState('');
+  const [freeSearch, setFreeSearch] = useState('');
+  const [freeRequests, setFreeRequests] = useState<ApiRequestDefinition[]>([]);
+  const [freeLoading, setFreeLoading] = useState(false);
+  const [freeCreating, setFreeCreating] = useState(false);
   const [profiles, setProfiles] = useState<RuntimeProfile[]>([]);
   const [selectedProfileId, setSelectedProfileId] = useState('');
   const [session, setSession] = useState<RuntimeSessionStatus | null>(null);
@@ -464,6 +521,166 @@ export function RuntimeWorkspace({ context, projectKey, collections, isSystemAdm
       onConnectionChange?.(status.connected);
     }).catch(() => undefined);
   }, [selectedProfileId]);
+
+  const loadFreeRequests = async () => {
+    setFreeLoading(true);
+    try {
+      const scope = freeSystemId || 'ALL';
+      const response = await apiConsoleApi.getRequests(scope, {
+        page: 1,
+        limit: 100,
+        search: freeSearch,
+        sourceApproach: freeSystemId === PERSONAL_APPLICATION_ID ? undefined : 'FREE',
+      }, context);
+      const rows = freeSystemId === PERSONAL_APPLICATION_ID
+        ? response.data.filter(item => item.applicationId === PERSONAL_APPLICATION_ID)
+        : response.data.filter(item => item.sourceType !== 'CDE_DISCOVERY');
+      setFreeRequests(rows);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'بارگذاری درخواست‌های آزاد ناموفق بود.');
+      setFreeRequests([]);
+    } finally {
+      setFreeLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (workspaceMode !== 'free') return;
+    void loadFreeRequests();
+  }, [workspaceMode, freeSystemId]);
+
+  const handleCreateFree = async () => {
+    if (!onCreateFreeRequest) return;
+    setFreeCreating(true);
+    try {
+      await onCreateFreeRequest(freeSystemId || PERSONAL_APPLICATION_ID);
+      await loadFreeRequests();
+    } finally {
+      setFreeCreating(false);
+    }
+  };
+
+  const loadIsSystems = async () => {
+    setIsSystemsLoading(true);
+    try {
+      const response = await isApi.systems();
+      const systems = (response.products?.length ? response.products : response.systems) || [];
+      setIsSystems(systems);
+      setIsWorkspaces(response.workspaces || []);
+      setIsWarnings(response.warnings || []);
+      if (!isSelectedServiceKey && systems[0]) {
+        setIsSelectedServiceKey(systems[0].serviceKey);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'بارگذاری محصولات Spec ناموفق بود.');
+      setIsSystems([]);
+      setIsWorkspaces([]);
+    } finally {
+      setIsSystemsLoading(false);
+    }
+  };
+
+  const loadIsApis = async (serviceKey = isSelectedServiceKey) => {
+    if (!serviceKey) return;
+    setIsOpsLoading(true);
+    try {
+      const system = isSystems.find(item => item.serviceKey === serviceKey);
+      const response = await isApi.systemApis(serviceKey, {
+        workspace: system?.workspaceIndex,
+        specFolder: system?.specFolder || undefined,
+      });
+      setIsOperations(response.operations || []);
+      setIsCounts(response.counts || null);
+      setIsWarnings(response.warnings || []);
+      setIsSelectedOpIds((response.operations || []).map(item => item.id));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'کشف API از Spec ناموفق بود.');
+      setIsOperations([]);
+      setIsCounts(null);
+    } finally {
+      setIsOpsLoading(false);
+    }
+  };
+
+  const syncIsApis = async () => {
+    if (!isSelectedServiceKey) return;
+    setIsSyncing(true);
+    try {
+      const system = isSystems.find(item => item.serviceKey === isSelectedServiceKey);
+      const result = await isApi.syncSystem(isSelectedServiceKey, {
+        label: system?.label,
+        operationIds: isSelectedOpIds.length ? isSelectedOpIds : undefined,
+        specFolder: system?.specFolder || undefined,
+        workspaceIndex: system?.workspaceIndex,
+      });
+      toast.success(`همگام‌سازی ${result.created + result.updated} درخواست (جدید: ${result.created}، به‌روز: ${result.updated})`);
+      setIsWarnings(result.warnings || []);
+      await onSynced();
+      if (onSelectProject) {
+        await onSelectProject(result.applicationId);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'همگام‌سازی IS ناموفق بود.');
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (workspaceMode !== 'is') return;
+    void loadIsSystems();
+  }, [workspaceMode]);
+
+  useEffect(() => {
+    if (workspaceMode !== 'is' || !isSelectedServiceKey) return;
+    void loadIsApis(isSelectedServiceKey);
+  }, [workspaceMode, isSelectedServiceKey]);
+
+  const isCategoryOptions = useMemo(() => {
+    const selectedWorkspace = isWorkspaceFilter === 'all'
+      ? null
+      : isWorkspaces.find(item => String(item.workspaceIndex) === isWorkspaceFilter);
+    const categories = new Map<string, string>();
+    if (selectedWorkspace?.categories?.length) {
+      for (const row of selectedWorkspace.categories) {
+        categories.set(String(row.slug), String(row.title || row.slug));
+      }
+    } else {
+      for (const system of isSystems) {
+        if (!system.category) continue;
+        if (isWorkspaceFilter !== 'all' && String(system.workspaceIndex) !== isWorkspaceFilter) continue;
+        categories.set(system.category, system.categoryTitle || system.category);
+      }
+    }
+    return Array.from(categories.entries()).sort((a, b) => a[1].localeCompare(b[1], 'fa'));
+  }, [isSystems, isWorkspaces, isWorkspaceFilter]);
+
+  const filteredIsSystems = useMemo(() => {
+    return isSystems.filter(system => {
+      if (isWorkspaceFilter !== 'all' && String(system.workspaceIndex) !== isWorkspaceFilter) return false;
+      if (isCategoryFilter !== 'all' && system.category !== isCategoryFilter) return false;
+      // Prefer products that came from specs disk when filters active
+      if ((isWorkspaceFilter !== 'all' || isCategoryFilter !== 'all') && !system.specFolder) return false;
+      return true;
+    });
+  }, [isSystems, isWorkspaceFilter, isCategoryFilter]);
+
+  useEffect(() => {
+    if (!filteredIsSystems.length) return;
+    if (!filteredIsSystems.some(item => item.serviceKey === isSelectedServiceKey)) {
+      setIsSelectedServiceKey(filteredIsSystems[0].serviceKey);
+    }
+  }, [filteredIsSystems, isSelectedServiceKey]);
+
+  const filteredIsOperations = useMemo(() => {
+    const q = isSearch.trim().toLowerCase();
+    if (!q) return isOperations;
+    return isOperations.filter(op =>
+      [op.name, op.path, op.method, op.description, op.controllerName, op.actionName, ...(op.folderPath || [])]
+        .filter(Boolean)
+        .some(value => String(value).toLowerCase().includes(q))
+    );
+  }, [isOperations, isSearch]);
 
   const openNewProfile = () => {
     setProfileForm({
@@ -839,507 +1056,769 @@ export function RuntimeWorkspace({ context, projectKey, collections, isSystemAdm
 
   return (
     <div className="space-y-3">
-      <Card padding="sm">
-        <div className="flex flex-wrap items-end justify-between gap-2">
-          <div className="min-w-[240px] flex-1">
-            <label className="mb-1 block text-xs font-medium text-gray-600">Runtime Profile</label>
-            <select
-              value={selectedProfile?.id || ''}
-              onChange={event => setSelectedProfileId(event.target.value)}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-gray-900 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500"
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="inline-flex rounded-lg border border-gray-200 bg-white p-1">
+          {isIsApproach ? (
+            <button
+              type="button"
+              onClick={() => setWorkspaceMode('is')}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${workspaceMode === 'is' ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-50'}`}
             >
-              {profilesByKind.length === 0 && <option value="">پروفایلی نیست</option>}
-              {profilesByKind.map(group => (
-                <optgroup key={group.kind} label={RUNTIME_KIND_LABELS[group.kind]}>
-                  {group.rows.map(profile => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.name} — {profile.origin}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            <Badge variant={session?.connected ? 'success' : session?.phase === 'PASSWORD_REQUIRED' ? 'warning' : 'default'}>
-              {session?.connected ? 'Connected' : session?.phase === 'PASSWORD_REQUIRED' ? 'Password' : 'Disconnected'}
-            </Badge>
-            {session?.connected
-              ? <Button size="sm" variant="secondary" onClick={disconnect}>قطع</Button>
-              : <Button size="sm" icon={<Link2 className="h-4 w-4" />} onClick={connect} loading={connecting} disabled={!selectedProfile}>Login</Button>}
-            {isSystemAdmin && selectedProfile && <Button size="sm" variant="secondary" icon={<ShieldCheck className="h-4 w-4" />} onClick={validateProfile}>Validate</Button>}
-            {isSystemAdmin && selectedProfile && <Button size="sm" variant="secondary" onClick={() => openEditProfile(selectedProfile)}>Edit</Button>}
-            {isSystemAdmin && selectedProfile && (
-              <Button size="sm" variant="secondary" onClick={() => openEditProfile(selectedProfile, { focusDataService: true })}>
-                Data Service
-              </Button>
-            )}
-            {isSystemAdmin && <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={openNewProfile}>Origin</Button>}
-          </div>
+              کشف IS
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setWorkspaceMode('cde')}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${workspaceMode === 'cde' ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-50'}`}
+            >
+              کشف CDE
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setWorkspaceMode('free')}
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${workspaceMode === 'free' ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-50'}`}
+          >
+            درخواست آزاد
+          </button>
         </div>
-        {canPromote && selectedProfile && (
-          <div className="mt-2 flex flex-wrap items-end gap-2 rounded-lg border border-gray-100 bg-gray-50 p-2">
+        <p className="text-xs text-gray-500">
+          {workspaceMode === 'is'
+            ? 'کشف API از specs/*.service.json (محصول → controller/action) و همگام‌سازی به Collection'
+            : workspaceMode === 'cde'
+              ? 'اسکن و اجرای عملیات سامانه‌ای از CDE'
+              : 'مثل Postman — URL آزاد، سامانه اختیاری'}
+        </p>
+      </div>
+
+      {workspaceMode === 'is' ? (
+        <Card padding="sm" className="overflow-hidden">
+          <div className="mb-3 flex flex-wrap items-end gap-2">
+            {isWorkspaces.length > 1 ? (
+              <div className="min-w-[160px]">
+                <Select
+                  label="Workspace"
+                  value={isWorkspaceFilter}
+                  onChange={event => {
+                    setIsWorkspaceFilter(event.target.value);
+                    setIsCategoryFilter('all');
+                  }}
+                  options={[
+                    { value: 'all', label: 'همه' },
+                    ...isWorkspaces.map(workspace => ({
+                      value: String(workspace.workspaceIndex),
+                      label: workspace.title,
+                    })),
+                  ]}
+                />
+              </div>
+            ) : null}
             <div className="min-w-[160px]">
               <Select
-                label="ارتقا به"
-                value={promoteTargetKind}
-                onChange={event => setPromoteTargetKind(event.target.value as RuntimeEnvironmentKind)}
-                options={promoteKindOptions}
+                label="دسته‌بندی"
+                value={isCategoryFilter}
+                onChange={event => setIsCategoryFilter(event.target.value)}
+                options={[
+                  { value: 'all', label: 'همه' },
+                  ...isCategoryOptions.map(([slug, title]) => ({ value: slug, label: title })),
+                ]}
               />
             </div>
-            <Button size="sm" variant="secondary" onClick={() => { void promoteProfile(); }} loading={promoting} disabled={!promoteTargetKind || promoteTargetKind === selectedProfile.kind}>
-              Promote
+            <div className="min-w-[220px] flex-1">
+              <SearchableSelect
+                label="محصول Spec"
+                value={isSelectedServiceKey}
+                onValueChange={setIsSelectedServiceKey}
+                options={filteredIsSystems.map(system => ({
+                  value: system.serviceKey,
+                  label: (system.categoryTitle || system.category)
+                    ? `${system.label} · ${system.categoryTitle || system.category}`
+                    : system.label,
+                  description: `${system.basePath}${system.actionCount != null ? ` · ${system.actionCount} action` : ''}`,
+                  keywords: `${system.serviceKey} ${system.specFolder || ''} ${system.label} ${system.category || ''} ${system.workspaceSlug || ''}`,
+                }))}
+                placeholder={isSystemsLoading ? 'در حال بارگذاری…' : 'انتخاب محصول'}
+                disabled={isSystemsLoading}
+              />
+            </div>
+            <div className="min-w-[160px] flex-1">
+              <Input
+                label="جستجوی عملیات"
+                value={isSearch}
+                onChange={event => setIsSearch(event.target.value)}
+                placeholder="method / path / controller…"
+              />
+            </div>
+            <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={() => void loadIsSystems()} loading={isSystemsLoading}>
+              محصولات
+            </Button>
+            <Button size="sm" variant="secondary" icon={<Search className="h-4 w-4" />} onClick={() => void loadIsApis()} loading={isOpsLoading} disabled={!isSelectedServiceKey}>
+              کشف از Spec
+            </Button>
+            <Button size="sm" icon={<Save className="h-4 w-4" />} onClick={() => void syncIsApis()} loading={isSyncing} disabled={!isSelectedServiceKey || !isSelectedOpIds.length}>
+              همگام‌سازی به Requestها
             </Button>
           </div>
-        )}
-        {profilesByKind.length > 0 && (
-          <div className="mt-2 space-y-1.5 rounded-lg border border-gray-100 bg-gray-50 p-2 text-[11px] text-gray-600">
-            {profilesByKind.map(group => (
-              <div key={group.kind}>
-                <div className="mb-1 font-semibold text-gray-700">{RUNTIME_KIND_LABELS[group.kind]}</div>
-                <div className="flex flex-wrap gap-1.5">
-                  {group.rows.map(profile => (
-                    <button
-                      key={profile.id}
-                      type="button"
-                      onClick={() => setSelectedProfileId(profile.id)}
-                      className={`rounded-md border px-2 py-1 text-left ${profile.id === selectedProfile?.id ? 'border-blue-300 bg-blue-50 text-blue-900' : 'border-gray-200 bg-white hover:bg-gray-100'}`}
-                    >
-                      <span className="font-medium">{profile.name}</span>
-                      {profile.id === selectedProfile?.id && (
-                        <span className="mr-1">
-                          {' '}
-                          <Badge variant={session?.connected ? 'success' : 'default'} size="sm">
-                            {session?.connected ? 'Connected' : 'session'}
-                          </Badge>
-                        </span>
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-        {selectedProfile && (
-          <>
-            <div className="mt-2 grid gap-1.5 text-[11px] text-gray-600 md:grid-cols-4" dir="ltr">
-              <div className="rounded bg-gray-50 px-2 py-1"><b>Origin</b><div className="truncate font-mono">{selectedProfile.origin}</div></div>
-              <div className="rounded bg-gray-50 px-2 py-1"><b>runtimeServiceId</b><div className="truncate font-mono">{selectedProfile.runtimeServiceId}</div></div>
-              <div className="rounded bg-gray-50 px-2 py-1"><b>projectServiceId</b><div className="truncate font-mono">{selectedProfile.projectServiceId || 'unapproved'}</div></div>
-              <div className="rounded bg-gray-50 px-2 py-1"><b>prostage</b><div className="font-mono">{selectedProfile.prostage || '—'}</div></div>
-            </div>
-            {!selectedProfile.projectServiceId && (
-              <div className="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
-                Project Service ID تأیید نشده — Scan و Approve لازم است.
-              </div>
-            )}
-          </>
-        )}
-        <div className="mt-2 rounded-lg border border-gray-100 bg-white p-2 text-xs text-gray-600">
-          <div className="mb-1 font-medium text-gray-800">Originهای provision‌شده</div>
-          {provisionedOrigins.length === 0
-            ? <div className="text-gray-500">هنوز Originی ثبت نشده است.</div>
-            : (
-              <div className="flex flex-wrap gap-1.5" dir="ltr">
-                {provisionedOrigins.map(origin => (
-                  <Badge key={origin} variant="default" size="sm">{origin}</Badge>
-                ))}
-              </div>
-            )}
-          <p className="mt-1.5 text-[11px] text-gray-500">افزودن Origin فقط توسط ادمین سیستم (دکمه Origin) مجاز است.</p>
-        </div>
-      </Card>
 
-      <Card padding="sm">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <button type="button" className="flex items-center gap-2 text-left" onClick={() => setDiscoveryOpen(open => !open)}>
-            <h2 className="text-sm font-semibold text-gray-900">Discovery</h2>
-            <span className="text-xs text-gray-400">{discoveryOpen ? 'hide' : 'show'}</span>
-            {snapshot && <Badge variant="info" size="sm">{snapshot.operations.length} ops</Badge>}
-          </button>
-          <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={scan} loading={scanning}>Scan CDE</Button>
-        </div>
-        {discoveryOpen && (
-          snapshot ? (
-            <div className="mt-4 space-y-3">
-              <div className="flex flex-wrap gap-2">
-                <Badge variant={snapshot.serviceIdStatus === 'RESOLVED' ? 'success' : 'danger'}>serviceId: {snapshot.serviceIdStatus}</Badge>
-                <Badge variant="info">{snapshot.operations.length} ops</Badge>
-                <Badge variant="success">{snapshot.stats.new || 0} new</Badge>
-                <Badge variant="warning">{snapshot.stats.changed || 0} changed</Badge>
-                <Badge variant="danger">{snapshot.stats.removed || 0} removed</Badge>
-                <Badge variant="warning">{snapshot.stats.needsInput || 0} needs input</Badge>
-                <span className="text-xs text-gray-500">{new Date(snapshot.createdAt).toLocaleString('fa-IR')}</span>
-              </div>
-              {candidates.map(candidate => (
-                <div key={candidate.value} className="rounded-lg border border-blue-100 bg-blue-50 p-3 text-sm">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="font-mono font-semibold" dir="ltr">{candidate.value}</div>
-                    {selectedProfile?.projectServiceId === candidate.value
-                      ? <Badge variant="success">approved</Badge>
-                      : isSystemAdmin && selectedProfile
-                        ? <Button size="sm" icon={<ShieldCheck className="h-4 w-4" />} loading={approvingServiceId === candidate.value} onClick={() => void approveProjectServiceId(candidate)}>Approve</Button>
-                        : <Badge variant="warning">pending admin</Badge>}
-                  </div>
-                  {candidate.evidence.map((evidence, index) => (
-                    <div key={index} className="mt-1 text-xs text-gray-600" dir="ltr">
-                      {evidence.repositoryType}/{evidence.packageId}: {evidence.file}:{evidence.line}
-                    </div>
-                  ))}
+          {isCounts ? (
+            <div className="mb-3 flex flex-wrap gap-2 text-xs text-gray-600">
+              <Badge variant="secondary" size="sm">کل: {isCounts.total}</Badge>
+              <Badge variant="success" size="sm">Spec: {isCounts.specs ?? 0}</Badge>
+              <Badge variant="info" size="sm">Gateway: {isCounts.gateway}</Badge>
+              <Badge variant="default" size="sm">OpenAPI: {isCounts.openapi}</Badge>
+              <Badge variant="default" size="sm">انتخاب‌شده: {isSelectedOpIds.length}</Badge>
+            </div>
+          ) : null}
+
+          {isWarnings.length > 0 ? (
+            <div className="mb-3 space-y-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              {isWarnings.map(warning => (
+                <div key={`${warning.code}-${warning.message}`}>
+                  <span className="font-mono">{warning.code}</span>: {warning.message}
                 </div>
               ))}
-              {warningGroups.length > 0 && (
-                <div className="rounded-lg border border-amber-200 bg-amber-50">
-                  <button
-                    type="button"
-                    className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm text-amber-900"
-                    onClick={() => setWarningsOpen(open => !open)}
-                  >
-                    <span>
-                      Scan warnings · {snapshot.warnings.length}
-                      <span className="mr-2 text-xs font-normal text-amber-700"> — اطلاعاتی؛ مانع Login/Send نیستند</span>
-                    </span>
-                    <span className="text-xs text-amber-700">{warningsOpen ? 'hide' : 'show'}</span>
-                  </button>
-                  {warningsOpen && (
-                    <div className="space-y-2 border-t border-amber-200 px-3 py-2">
-                      {warningGroups.map(group => (
-                        <details key={group.code} className="rounded border border-amber-200 bg-white/70 p-2">
-                          <summary className="cursor-pointer text-xs font-medium text-amber-900">
-                            <span className="font-mono" dir="ltr">{group.code}</span>
-                            <span className="mx-1 text-amber-700">×{group.rows.length}</span>
-                            <span className="font-normal text-amber-800">— {group.label}</span>
-                          </summary>
-                          <div className="mt-2 max-h-40 space-y-1 overflow-auto text-[11px] text-amber-900" dir="ltr">
-                            {group.rows.slice(0, 40).map((warning, index) => (
-                              <div key={`${group.code}-${index}`} className="font-mono">
-                                {warning.message}
-                              </div>
-                            ))}
-                            {group.rows.length > 40 && (
-                              <div className="text-amber-700">… and {group.rows.length - 40} more</div>
-                            )}
-                          </div>
-                        </details>
-                      ))}
+            </div>
+          ) : null}
+
+          <div className="mb-2 flex items-center justify-between gap-2 text-xs text-gray-500">
+            <button
+              type="button"
+              className="text-[var(--theme-accent)] hover:underline"
+              onClick={() => setIsSelectedOpIds(filteredIsOperations.map(item => item.id))}
+            >
+              انتخاب همهٔ فیلترشده
+            </button>
+            <button
+              type="button"
+              className="hover:underline"
+              onClick={() => setIsSelectedOpIds([])}
+            >
+              حذف انتخاب
+            </button>
+          </div>
+
+          <div className="max-h-[420px] divide-y divide-gray-100 overflow-auto rounded-xl border border-gray-200">
+            {isOpsLoading && <div className="p-6 text-center text-sm text-gray-500">در حال خواندن *.service.json…</div>}
+            {!isOpsLoading && filteredIsOperations.length === 0 && (
+              <div className="p-6 text-center text-sm text-gray-500">
+                برای این محصول عملیاتی در Spec پیدا نشد. مسیر API_CONSOLE_IS_SPECS_ROOT و فایل *.service.json را بررسی کنید.
+              </div>
+            )}
+            {filteredIsOperations.map(operation => {
+              const checked = isSelectedOpIds.includes(operation.id);
+              return (
+                <label key={operation.id} className="flex cursor-pointer items-start gap-3 px-3 py-2.5 hover:bg-gray-50">
+                  <input
+                    type="checkbox"
+                    className="mt-1"
+                    checked={checked}
+                    onChange={() => {
+                      setIsSelectedOpIds(current =>
+                        checked ? current.filter(id => id !== operation.id) : [...current, operation.id]
+                      );
+                    }}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="info" size="sm">{operation.method}</Badge>
+                      <span className="font-mono text-xs text-gray-800" dir="ltr">{operation.path}</span>
+                      {operation.sourceKind ? <span className="text-[10px] text-gray-400">{operation.sourceKind}</span> : null}
                     </div>
+                    <div className="mt-0.5 text-sm text-gray-700">{operation.name}</div>
+                    {operation.folderPath?.length ? (
+                      <div className="text-[11px] text-gray-400">{operation.folderPath.join(' / ')}</div>
+                    ) : null}
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        </Card>
+      ) : null}
+
+      {workspaceMode === 'free' ? (
+        <Card padding="sm" className="overflow-hidden">
+          <div className="mb-3 flex flex-wrap items-end gap-2">
+            <div className="min-w-[200px] flex-1">
+              <ApplicationSelect
+                label="سامانه (اختیاری)"
+                value={freeSystemId}
+                onChange={setFreeSystemId}
+                includeEmptyOption
+                emptyOptionLabel="همه درخواست‌های آزاد"
+                includePersonalOption
+                personalOptionLabel={PERSONAL_APPLICATION_LABEL}
+                hint="با انتخاب سامانه، درخواست‌های همان سامانه لود می‌شود. خالی = همه‌ی آزادها."
+              />
+            </div>
+            <div className="min-w-[180px] flex-1">
+              <Input
+                label="جستجو"
+                value={freeSearch}
+                onChange={event => setFreeSearch(event.target.value)}
+                onKeyDown={event => { if (event.key === 'Enter') void loadFreeRequests(); }}
+                placeholder="نام یا URL…"
+              />
+            </div>
+            <Button size="sm" variant="secondary" icon={<Search className="h-4 w-4" />} onClick={() => void loadFreeRequests()} loading={freeLoading}>
+              فیلتر
+            </Button>
+            <Button
+              size="sm"
+              icon={<Plus className="h-4 w-4" />}
+              onClick={() => void handleCreateFree()}
+              loading={freeCreating}
+              disabled={!canCreateFreeRequest || !onCreateFreeRequest}
+            >
+              درخواست جدید
+            </Button>
+          </div>
+
+          <div className="mb-3 rounded-lg border border-dashed border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+            اینجا محدود به CDE نیستید — مثلاً API نقشه یا هر HTTP عمومی. برای اشتراک‌گذاری از ویرایشگر Request استفاده کنید.
+          </div>
+
+          <div className="divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-200">
+            {freeLoading && <div className="p-6 text-center text-sm text-gray-500">در حال بارگذاری…</div>}
+            {!freeLoading && freeRequests.length === 0 && (
+              <div className="p-8 text-center text-sm text-gray-500">
+                هنوز درخواست آزادی نیست.
+                <div className="mt-3">
+                  <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={() => void handleCreateFree()} disabled={!canCreateFreeRequest || !onCreateFreeRequest}>
+                    ساخت اولین درخواست
+                  </Button>
+                </div>
+              </div>
+            )}
+            {!freeLoading && freeRequests.map(item => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => { void onOpenRequest?.(item.id); }}
+                className="flex w-full items-start justify-between gap-3 px-3 py-3 text-right transition hover:bg-gray-50"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium text-gray-900">{item.name}</span>
+                    <Badge variant="default" size="sm">{item.method}</Badge>
+                    {item.applicationId === PERSONAL_APPLICATION_ID
+                      ? <Badge variant="success" size="sm">آزاد</Badge>
+                      : <Badge variant="info" size="sm">{getApplicationName(item.applicationId)}</Badge>}
+                  </div>
+                  <p className="mt-1 truncate font-mono text-xs text-gray-500" dir="ltr">{item.urlTemplate}</p>
+                </div>
+                <span className="shrink-0 text-[11px] text-gray-400">{new Date(item.updatedAt).toLocaleString('fa-IR')}</span>
+              </button>
+            ))}
+          </div>
+        </Card>
+      ) : workspaceMode === 'cde' ? (
+        <>
+          <Card padding="sm">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                {projects.length > 0 && onSelectProject ? (
+                  <div className="min-w-[200px] max-w-sm flex-1">
+                    <SearchableSelect
+                      label="سامانه"
+                      value={projectKey}
+                      onValueChange={(next) => { void onSelectProject(next); }}
+                      options={projects.map(project => ({
+                        value: project.projectKey,
+                        label: project.projectKey,
+                        keywords: project.projectKey,
+                      }))}
+                      placeholder="جستجو و انتخاب سامانه"
+                      searchPlaceholder="نام سامانه…"
+                      size="sm"
+                      className="[&_label]:sr-only"
+                    />
+                  </div>
+                ) : null}
+                <select
+                  value={selectedProfile?.id || ''}
+                  onChange={event => setSelectedProfileId(event.target.value)}
+                  className="min-w-[200px] max-w-full flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  aria-label="Runtime Profile"
+                >
+                  {profilesByKind.length === 0 && <option value="">پروفایلی نیست</option>}
+                  {profilesByKind.map(group => (
+                    <optgroup key={group.kind} label={RUNTIME_KIND_LABELS[group.kind]}>
+                      {group.rows.map(profile => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name} — {profile.origin}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+                <Badge variant={session?.connected ? 'success' : session?.phase === 'PASSWORD_REQUIRED' ? 'warning' : 'default'}>
+                  {session?.connected ? 'Connected' : session?.phase === 'PASSWORD_REQUIRED' ? 'Password' : 'Disconnected'}
+                </Badge>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {session?.connected
+                  ? <Button size="sm" variant="secondary" onClick={disconnect}>قطع</Button>
+                  : <Button size="sm" icon={<Link2 className="h-4 w-4" />} onClick={connect} loading={connecting} disabled={!selectedProfile}>Login</Button>}
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon={<Settings2 className="h-4 w-4" />}
+                  onClick={() => setSettingsOpen(open => !open)}
+                >
+                  تنظیمات
+                  <ChevronDown className={`ms-1 h-3.5 w-3.5 transition ${settingsOpen ? 'rotate-180' : ''}`} />
+                </Button>
+              </div>
+            </div>
+
+            {settingsOpen && (
+              <div className="mt-3 space-y-3 border-t border-gray-100 pt-3">
+                <div className="flex flex-wrap gap-1.5">
+                  {isSystemAdmin && selectedProfile && <Button size="sm" variant="secondary" icon={<ShieldCheck className="h-4 w-4" />} onClick={validateProfile}>Validate</Button>}
+                  {isSystemAdmin && selectedProfile && <Button size="sm" variant="secondary" onClick={() => openEditProfile(selectedProfile)}>Edit</Button>}
+                  {isSystemAdmin && selectedProfile && (
+                    <Button size="sm" variant="secondary" onClick={() => openEditProfile(selectedProfile, { focusDataService: true })}>
+                      Data Service
+                    </Button>
                   )}
+                  {isSystemAdmin && <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={openNewProfile}>Origin</Button>}
+                </div>
+                {canPromote && selectedProfile && (
+                  <div className="flex flex-wrap items-end gap-2 rounded-lg border border-gray-100 bg-gray-50 p-2">
+                    <div className="min-w-[160px]">
+                      <Select
+                        label="ارتقا به"
+                        value={promoteTargetKind}
+                        onChange={event => setPromoteTargetKind(event.target.value as RuntimeEnvironmentKind)}
+                        options={promoteKindOptions}
+                      />
+                    </div>
+                    <Button size="sm" variant="secondary" onClick={() => { void promoteProfile(); }} loading={promoting} disabled={!promoteTargetKind || promoteTargetKind === selectedProfile.kind}>
+                      Promote
+                    </Button>
+                  </div>
+                )}
+                {selectedProfile && (
+                  <div className="grid gap-1.5 text-[11px] text-gray-600 md:grid-cols-4" dir="ltr">
+                    <div className="rounded bg-gray-50 px-2 py-1"><b>Origin</b><div className="truncate font-mono">{selectedProfile.origin}</div></div>
+                    <div className="rounded bg-gray-50 px-2 py-1"><b>runtimeServiceId</b><div className="truncate font-mono">{selectedProfile.runtimeServiceId}</div></div>
+                    <div className="rounded bg-gray-50 px-2 py-1"><b>projectServiceId</b><div className="truncate font-mono">{selectedProfile.projectServiceId || 'unapproved'}</div></div>
+                    <div className="rounded bg-gray-50 px-2 py-1"><b>prostage</b><div className="font-mono">{selectedProfile.prostage || '—'}</div></div>
+                  </div>
+                )}
+                {!selectedProfile?.projectServiceId && selectedProfile && (
+                  <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+                    Project Service ID تأیید نشده — Scan و Approve لازم است.
+                  </div>
+                )}
+                {isSystemAdmin && (
+                  <div className="rounded-lg border border-gray-100 bg-white p-2 text-xs text-gray-600">
+                    <div className="mb-1 font-medium text-gray-800">Originهای provision‌شده</div>
+                    {provisionedOrigins.length === 0
+                      ? <div className="text-gray-500">هنوز Originی ثبت نشده است.</div>
+                      : (
+                        <div className="flex flex-wrap gap-1.5" dir="ltr">
+                          {provisionedOrigins.map(origin => (
+                            <Badge key={origin} variant="default" size="sm">{origin}</Badge>
+                          ))}
+                        </div>
+                      )}
+                  </div>
+                )}
+              </div>
+            )}
+          </Card>
+
+          <Card padding="sm">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={scan} loading={scanning}>Scan CDE</Button>
+                {snapshot && (
+                  <>
+                    <Badge variant="info" size="sm">{snapshot.operations.length} ops</Badge>
+                    <Badge variant="success" size="sm">{driftStats.new} NEW</Badge>
+                    <Badge variant="warning" size="sm">{driftStats.changed} CHANGED</Badge>
+                    <Badge variant="danger" size="sm">{driftStats.removed} REMOVED</Badge>
+                    {(driftStats.needsInput > 0) && <Badge variant="warning" size="sm">{driftStats.needsInput} needs input</Badge>}
+                  </>
+                )}
+                <button type="button" className="text-xs text-gray-500 hover:text-gray-800" onClick={() => setDiscoveryOpen(open => !open)}>
+                  {discoveryOpen ? 'بستن جزئیات کشف' : 'جزئیات کشف'}
+                </button>
+              </div>
+              {snapshot && (
+                <div className="flex flex-wrap items-end gap-2">
+                  <div className="min-w-[160px]">
+                    <Select
+                      aria-label="Collection"
+                      value={collectionId}
+                      onChange={event => setCollectionId(event.target.value)}
+                      options={collections.filter(item => item.applicationId === projectKey).map(item => ({ value: item.id, label: item.name }))}
+                    />
+                  </div>
+                  <Button size="sm" icon={<Save className="h-4 w-4" />} onClick={sync} loading={syncing} disabled={!collectionId || !selectedProfile || !selectedOperationIds.length}>
+                    Sync ({selectedOperationIds.length})
+                  </Button>
+                  <Button size="sm" variant="secondary" icon={<Download className="h-4 w-4" />} onClick={exportPostman} disabled={!selectedProfile}>Postman</Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    icon={<ExternalLink className="h-4 w-4" />}
+                    onClick={() => selectedProfile && window.open(apiConsoleApi.runtimeDocsUrl(projectKey, selectedProfile.id), '_blank', 'noopener,noreferrer')}
+                    disabled={!selectedProfile}
+                  >
+                    Swagger
+                  </Button>
                 </div>
               )}
             </div>
-          ) : <p className="mt-4 text-sm text-gray-500">هنوز snapshot ساخته نشده است.</p>
-        )}
-      </Card>
-
-      {snapshot && (
-        <Card padding="sm" className="overflow-hidden">
-          <div className="mb-3 space-y-2">
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2 text-xs text-indigo-900">
-              <span className="font-semibold">Drift</span>
-              <Badge variant="success" size="sm">{driftStats.new} NEW</Badge>
-              <Badge variant="warning" size="sm">{driftStats.changed} CHANGED</Badge>
-              <Badge variant="danger" size="sm">{driftStats.removed} REMOVED</Badge>
-              <Badge variant="warning" size="sm">{driftStats.needsInput} needs input</Badge>
-            </div>
-            <div className="flex flex-wrap items-end gap-2">
-              <div className="min-w-[200px] flex-1">
-                <label className="mb-1 block text-xs text-gray-600">Collection</label>
-                <Select
-                  value={collectionId}
-                  onChange={event => setCollectionId(event.target.value)}
-                  options={collections.filter(item => item.applicationId === projectKey).map(item => ({ value: item.id, label: item.name }))}
-                />
-              </div>
-              <Button icon={<Save className="h-4 w-4" />} onClick={sync} loading={syncing} disabled={!collectionId || !selectedProfile || !selectedOperationIds.length}>
-                Sync ({selectedOperationIds.length})
-              </Button>
-              <Button variant="secondary" icon={<Download className="h-4 w-4" />} onClick={exportPostman} disabled={!selectedProfile}>Postman</Button>
-              <Button
-                variant="secondary"
-                icon={<ExternalLink className="h-4 w-4" />}
-                onClick={() => selectedProfile && window.open(apiConsoleApi.runtimeDocsUrl(projectKey, selectedProfile.id), '_blank', 'noopener,noreferrer')}
-                disabled={!selectedProfile}
-              >
-                Swagger
-              </Button>
-            </div>
-          </div>
-
-          <div className="grid h-[calc(100vh-14rem)] min-h-[520px] grid-cols-1 overflow-hidden rounded-xl border border-gray-200 lg:grid-cols-[minmax(260px,340px)_minmax(0,1fr)]" dir="ltr">
-            <aside className="flex min-h-0 flex-col border-b border-gray-200 bg-gray-50 lg:border-b-0 lg:border-r lg:border-gray-200">
-              <div className="space-y-2 border-b border-gray-200 bg-white p-3">
-                <div className="relative" dir="ltr">
-                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
-                  <input
-                    value={operationSearch}
-                    onChange={event => setOperationSearch(event.target.value)}
-                    placeholder="Search path / ds/ / fr/ / file"
-                    className="w-full rounded-lg border border-gray-300 py-2 pl-9 pr-3 font-mono text-sm text-gray-900 placeholder:font-sans placeholder:text-gray-400 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-                <div className="flex flex-wrap gap-1">
-                  {([
-                    ['ALL', 'All'],
-                    ['CORE_QUERY', 'ds'],
-                    ['CORE_COMMAND', 'fr'],
-                    ['REST', 'REST'],
-                  ] as Array<[OperationTypeFilter, string]>).map(([value, label]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      onClick={() => setTypeFilter(value)}
-                      className={`rounded-md px-2.5 py-1 text-xs font-medium ${typeFilter === value ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={() => setNeedsInputOnly(value => !value)}
-                    className={`rounded-md px-2.5 py-1 text-xs font-medium ${needsInputOnly ? 'bg-amber-600 text-white' : 'bg-amber-50 text-amber-800 hover:bg-amber-100'}`}
-                  >
-                    needs input
-                  </button>
-                </div>
-                <div className="flex items-center justify-between gap-2 text-xs text-gray-500">
-                  <label className="flex items-center gap-2">
-                    <input type="checkbox" checked={pageAllSelected} onChange={event => togglePageSelection(event.target.checked)} />
-                    صفحه جاری
-                  </label>
-                  <span dir="ltr">{filteredOperations.length} matched</span>
-                </div>
-              </div>
-
-              <div className="flex-1 overflow-auto">
-                {pagedOperations.map(operation => {
-                  const active = operation.id === selectedOperationId;
-                  const hasResponse = Boolean(executionsByOp[operation.id]);
-                  return (
-                    <button
-                      key={operation.id}
-                      type="button"
-                      onClick={() => selectOperation(operation)}
-                      className={`flex w-full items-start gap-2 border-b border-gray-100 px-3 py-2.5 text-left transition ${active ? 'bg-blue-50' : 'bg-white hover:bg-gray-50'}`}
-                    >
-                      <input
-                        type="checkbox"
-                        className="mt-1"
-                        checked={selectedOperationIds.includes(operation.id)}
-                        onClick={event => event.stopPropagation()}
-                        onChange={event => setSelectedOperationIds(current => event.target.checked
-                          ? [...new Set([...current, operation.id])]
-                          : current.filter(id => id !== operation.id))}
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          {operationBadge(operation)}
-                          {previewStateBadge(operation.previewState)}
-                          {hasResponse && <Badge variant="success" size="sm">resp</Badge>}
-                          <Badge
-                            variant={
-                              operation.schemaCompleteness === 'COMPLETE' || locallyReadyOps[operation.id]
-                                ? 'success'
-                                : 'warning'
-                            }
-                            size="sm"
-                          >
-                            {operation.schemaCompleteness === 'COMPLETE' || locallyReadyOps[operation.id] ? 'ok' : 'input'}
-                          </Badge>
-                        </div>
-                        <div className="mt-1 truncate font-mono text-xs text-gray-900" dir="ltr" title={operation.sourceId}>
-                          {operation.sourceId}
-                        </div>
-                        <div className="truncate text-[11px] text-gray-500" dir="ltr">
-                          {operation.evidence[0]?.file || operation.path || operation.sourceKind}
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-                {pagedOperations.length === 0 && (
-                  <div className="p-6 text-center text-sm text-gray-500">نتیجه‌ای برای این جستجو نیست.</div>
-                )}
-                {snapshot.removedOperations.map(operation => (
-                  <div key={`removed-${operation.id}`} className="border-b border-red-100 bg-red-50 px-3 py-2 opacity-80">
-                    <div className="font-mono text-xs line-through" dir="ltr">{operation.sourceId}</div>
-                    <Badge variant="danger" size="sm">REMOVED</Badge>
+            {discoveryOpen && (
+              snapshot ? (
+                <div className="mt-3 space-y-3 border-t border-gray-100 pt-3">
+                  <div className="flex flex-wrap gap-2 text-xs text-gray-500">
+                    <Badge variant={snapshot.serviceIdStatus === 'RESOLVED' ? 'success' : 'danger'}>serviceId: {snapshot.serviceIdStatus}</Badge>
+                    <span>{new Date(snapshot.createdAt).toLocaleString('fa-IR')}</span>
                   </div>
-                ))}
-              </div>
-
-              <Pagination
-                page={Math.min(page, totalPages)}
-                totalPages={totalPages}
-                total={filteredOperations.length}
-                limit={pageSize}
-                onPageChange={setPage}
-                onLimitChange={(limit) => {
-                  setPageSize(limit);
-                  setPage(1);
-                }}
-              />
-            </aside>
-
-            <section className="flex min-h-0 flex-col bg-white">
-              {selectedOperation && selectedProfile ? (
-                <>
-                  <div className="border-b border-gray-200 p-3">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          {operationBadge(selectedOperation)}
-                          {previewStateBadge(selectedOperation.previewState)}
-                          <h3 className="truncate font-mono text-sm font-semibold text-gray-900" dir="ltr">{selectedOperation.sourceId}</h3>
-                        </div>
-                        <div className="mt-2 grid gap-2 text-[11px] text-gray-600 sm:grid-cols-3" dir="ltr">
-                          <div className="rounded bg-gray-50 px-2 py-1"><b>serviceId</b><div className="truncate font-mono">{selectedProfile.projectServiceId || '—'}</div></div>
-                          <div className="rounded bg-gray-50 px-2 py-1">
-                            <b>{selectedOperation.type === 'CORE_COMMAND' ? 'formId' : selectedOperation.type === 'CORE_QUERY' ? 'key' : 'path'}</b>
-                            <div className="truncate font-mono">{operationProviderId(selectedOperation)}</div>
-                          </div>
-                          <div className="rounded bg-gray-50 px-2 py-1"><b>endpoint</b><div className="truncate font-mono">{operationEndpoint(selectedOperation)}</div></div>
-                        </div>
+                  {candidates.map(candidate => (
+                    <div key={candidate.value} className="rounded-lg border border-blue-100 bg-blue-50 p-3 text-sm">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="font-mono font-semibold" dir="ltr">{candidate.value}</div>
+                        {selectedProfile?.projectServiceId === candidate.value
+                          ? <Badge variant="success">approved</Badge>
+                          : isSystemAdmin && selectedProfile
+                            ? <Button size="sm" icon={<ShieldCheck className="h-4 w-4" />} loading={approvingServiceId === candidate.value} onClick={() => void approveProjectServiceId(candidate)}>Approve</Button>
+                            : <Badge variant="warning">pending admin</Badge>}
                       </div>
-                      <div className="flex flex-wrap gap-2">
-                        <Button size="sm" variant="secondary" icon={<Download className="h-4 w-4" />} onClick={() => exportCurl(selectedOperation, 'sample')}>cURL</Button>
-                        {selectedOperation.sourceKind === 'API_MODULE' && (
-                          <Button size="sm" variant="secondary" onClick={() => exportCurl(selectedOperation, 'bundle')}>Login bundle</Button>
-                        )}
-                        <Button size="sm" icon={<PlayCircle className="h-4 w-4" />} onClick={() => void executeSelected()} loading={executing} disabled={!session?.connected}>
-                          Send
-                        </Button>
-                      </div>
+                      {candidate.evidence.map((evidence, index) => (
+                        <div key={index} className="mt-1 text-xs text-gray-600" dir="ltr">
+                          {evidence.repositoryType}/{evidence.packageId}: {evidence.file}:{evidence.line}
+                        </div>
+                      ))}
                     </div>
-                    <div className="mt-3 flex gap-1">
+                  ))}
+                  {warningGroups.length > 0 && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50">
+                      <button
+                        type="button"
+                        className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm text-amber-900"
+                        onClick={() => setWarningsOpen(open => !open)}
+                      >
+                        <span>
+                          Scan warnings · {snapshot.warnings.length}
+                          <span className="mr-2 text-xs font-normal text-amber-700"> — اطلاعاتی؛ مانع Login/Send نیستند</span>
+                        </span>
+                        <span className="text-xs text-amber-700">{warningsOpen ? 'hide' : 'show'}</span>
+                      </button>
+                      {warningsOpen && (
+                        <div className="space-y-2 border-t border-amber-200 px-3 py-2">
+                          {warningGroups.map(group => (
+                            <details key={group.code} className="rounded border border-amber-200 bg-white/70 p-2">
+                              <summary className="cursor-pointer text-xs font-medium text-amber-900">
+                                <span className="font-mono" dir="ltr">{group.code}</span>
+                                <span className="mx-1 text-amber-700">×{group.rows.length}</span>
+                                <span className="font-normal text-amber-800">— {group.label}</span>
+                              </summary>
+                              <div className="mt-2 max-h-40 space-y-1 overflow-auto text-[11px] text-amber-900" dir="ltr">
+                                {group.rows.slice(0, 40).map((warning, index) => (
+                                  <div key={`${group.code}-${index}`} className="font-mono">
+                                    {warning.message}
+                                  </div>
+                                ))}
+                                {group.rows.length > 40 && (
+                                  <div className="text-amber-700">… and {group.rows.length - 40} more</div>
+                                )}
+                              </div>
+                            </details>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : <p className="mt-3 text-sm text-gray-500">هنوز snapshot ساخته نشده است. Scan CDE را بزنید.</p>
+            )}
+          </Card>
+
+          {snapshot && (
+            <Card padding="sm" className="overflow-hidden">
+              <div className="grid h-[calc(100vh-12rem)] min-h-[520px] grid-cols-1 overflow-hidden rounded-xl border border-gray-200 lg:grid-cols-[minmax(260px,340px)_minmax(0,1fr)]" dir="ltr">
+                <aside className="flex min-h-0 flex-col border-b border-gray-200 bg-gray-50 lg:border-b-0 lg:border-r lg:border-gray-200">
+                  <div className="space-y-2 border-b border-gray-200 bg-white p-3">
+                    <div className="relative" dir="ltr">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                      <input
+                        value={operationSearch}
+                        onChange={event => setOperationSearch(event.target.value)}
+                        placeholder="Search path / ds/ / fr/ / file"
+                        className="w-full rounded-lg border border-gray-300 py-2 pl-9 pr-3 font-mono text-sm text-gray-900 placeholder:font-sans placeholder:text-gray-400 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-1">
                       {([
-                        ['request', 'Request'],
-                        ['response', `Response${selectedExecution ? ` · ${selectedExecution.statusCode || 200}` : ''}`],
-                      ] as Array<[InspectorTab, string]>).map(([tab, label]) => (
+                        ['ALL', 'All'],
+                        ['CORE_QUERY', 'ds'],
+                        ['CORE_COMMAND', 'fr'],
+                        ['REST', 'REST'],
+                      ] as Array<[OperationTypeFilter, string]>).map(([value, label]) => (
                         <button
-                          key={tab}
+                          key={value}
                           type="button"
-                          onClick={() => setInspectorTab(tab)}
-                          className={`rounded-md px-3 py-1.5 text-sm font-medium ${inspectorTab === tab ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                          onClick={() => setTypeFilter(value)}
+                          className={`rounded-md px-2.5 py-1 text-xs font-medium ${typeFilter === value ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
                         >
                           {label}
                         </button>
                       ))}
+                      <button
+                        type="button"
+                        onClick={() => setNeedsInputOnly(value => !value)}
+                        className={`rounded-md px-2.5 py-1 text-xs font-medium ${needsInputOnly ? 'bg-amber-600 text-white' : 'bg-amber-50 text-amber-800 hover:bg-amber-100'}`}
+                      >
+                        needs input
+                      </button>
+                    </div>
+                    <div className="flex items-center justify-between gap-2 text-xs text-gray-500">
+                      <label className="flex items-center gap-2">
+                        <input type="checkbox" checked={pageAllSelected} onChange={event => togglePageSelection(event.target.checked)} />
+                        صفحه جاری
+                      </label>
+                      <span dir="ltr">{filteredOperations.length} matched</span>
                     </div>
                   </div>
 
-                  <div className="flex-1 overflow-auto p-3">
-                    {inspectorTab === 'request' ? (
-                      <div className="space-y-3">
-                        {dsBlockedHint && (
-                          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-                            <div className="mb-2 font-medium">Data Service برای اجرا آماده نیست</div>
-                            <ul className="mb-3 list-disc space-y-1 pr-5 text-xs">
-                              {dataServiceChecklist(selectedProfile).map(item => (
-                                <li key={item.label} className={item.ok ? 'text-green-700' : 'text-amber-900'}>
-                                  {item.ok ? '✓' : '✗'} {item.label}
-                                </li>
-                              ))}
-                            </ul>
-                            <Button size="sm" onClick={openDataServiceSettings}>
-                              باز کردن تنظیمات Data Service
+                  <div className="flex-1 overflow-auto">
+                    {pagedOperations.map(operation => {
+                      const active = operation.id === selectedOperationId;
+                      const hasResponse = Boolean(executionsByOp[operation.id]);
+                      return (
+                        <button
+                          key={operation.id}
+                          type="button"
+                          onClick={() => selectOperation(operation)}
+                          className={`flex w-full items-start gap-2 border-b border-gray-100 px-3 py-2.5 text-left transition ${active ? 'bg-blue-50' : 'bg-white hover:bg-gray-50'}`}
+                        >
+                          <input
+                            type="checkbox"
+                            className="mt-1"
+                            checked={selectedOperationIds.includes(operation.id)}
+                            onClick={event => event.stopPropagation()}
+                            onChange={event => setSelectedOperationIds(current => event.target.checked
+                              ? [...new Set([...current, operation.id])]
+                              : current.filter(id => id !== operation.id))}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {operationBadge(operation)}
+                              {previewStateBadge(operation.previewState)}
+                              {hasResponse && <Badge variant="success" size="sm">resp</Badge>}
+                              <Badge
+                                variant={
+                                  operation.schemaCompleteness === 'COMPLETE' || locallyReadyOps[operation.id]
+                                    ? 'success'
+                                    : 'warning'
+                                }
+                                size="sm"
+                              >
+                                {operation.schemaCompleteness === 'COMPLETE' || locallyReadyOps[operation.id] ? 'ok' : 'input'}
+                              </Badge>
+                            </div>
+                            <div className="mt-1 truncate font-mono text-xs text-gray-900" dir="ltr" title={operation.sourceId}>
+                              {operation.sourceId}
+                            </div>
+                            <div className="truncate text-[11px] text-gray-500" dir="ltr">
+                              {operation.evidence[0]?.file || operation.path || operation.sourceKind}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                    {pagedOperations.length === 0 && (
+                      <div className="p-6 text-center text-sm text-gray-500">نتیجه‌ای برای این جستجو نیست.</div>
+                    )}
+                    {snapshot.removedOperations.map(operation => (
+                      <div key={`removed-${operation.id}`} className="border-b border-red-100 bg-red-50 px-3 py-2 opacity-80">
+                        <div className="font-mono text-xs line-through" dir="ltr">{operation.sourceId}</div>
+                        <Badge variant="danger" size="sm">REMOVED</Badge>
+                      </div>
+                    ))}
+                  </div>
+
+                  <Pagination
+                    page={Math.min(page, totalPages)}
+                    totalPages={totalPages}
+                    total={filteredOperations.length}
+                    limit={pageSize}
+                    onPageChange={setPage}
+                    onLimitChange={(limit) => {
+                      setPageSize(limit);
+                      setPage(1);
+                    }}
+                  />
+                </aside>
+
+                <section className="flex min-h-0 flex-col bg-white">
+                  {selectedOperation && selectedProfile ? (
+                    <>
+                      <div className="border-b border-gray-200 p-3">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              {operationBadge(selectedOperation)}
+                              {previewStateBadge(selectedOperation.previewState)}
+                              <h3 className="truncate font-mono text-sm font-semibold text-gray-900" dir="ltr">{selectedOperation.sourceId}</h3>
+                            </div>
+                            <div className="mt-2 grid gap-2 text-[11px] text-gray-600 sm:grid-cols-3" dir="ltr">
+                              <div className="rounded bg-gray-50 px-2 py-1"><b>serviceId</b><div className="truncate font-mono">{selectedProfile.projectServiceId || '—'}</div></div>
+                              <div className="rounded bg-gray-50 px-2 py-1">
+                                <b>{selectedOperation.type === 'CORE_COMMAND' ? 'formId' : selectedOperation.type === 'CORE_QUERY' ? 'key' : 'path'}</b>
+                                <div className="truncate font-mono">{operationProviderId(selectedOperation)}</div>
+                              </div>
+                              <div className="rounded bg-gray-50 px-2 py-1"><b>endpoint</b><div className="truncate font-mono">{operationEndpoint(selectedOperation)}</div></div>
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <Button size="sm" variant="secondary" icon={<Download className="h-4 w-4" />} onClick={() => exportCurl(selectedOperation, 'sample')}>cURL</Button>
+                            {selectedOperation.sourceKind === 'API_MODULE' && (
+                              <Button size="sm" variant="secondary" onClick={() => exportCurl(selectedOperation, 'bundle')}>Login bundle</Button>
+                            )}
+                            <Button size="sm" icon={<PlayCircle className="h-4 w-4" />} onClick={() => void executeSelected()} loading={executing} disabled={!session?.connected}>
+                              Send
+                            </Button>
+                          </div>
+                        </div>
+                        <div className="mt-3 flex gap-1">
+                          {([
+                            ['request', 'Request'],
+                            ['response', `Response${selectedExecution ? ` · ${selectedExecution.statusCode || 200}` : ''}`],
+                          ] as Array<[InspectorTab, string]>).map(([tab, label]) => (
+                            <button
+                              key={tab}
+                              type="button"
+                              onClick={() => setInspectorTab(tab)}
+                              className={`rounded-md px-3 py-1.5 text-sm font-medium ${inspectorTab === tab ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="flex-1 overflow-auto p-3">
+                        {inspectorTab === 'request' ? (
+                          <div className="space-y-3">
+                            {dsBlockedHint && (
+                              <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                                <div className="mb-2 font-medium">Data Service برای اجرا آماده نیست</div>
+                                <ul className="mb-3 list-disc space-y-1 pr-5 text-xs">
+                                  {dataServiceChecklist(selectedProfile).map(item => (
+                                    <li key={item.label} className={item.ok ? 'text-green-700' : 'text-amber-900'}>
+                                      {item.ok ? '✓' : '✗'} {item.label}
+                                    </li>
+                                  ))}
+                                </ul>
+                                <Button size="sm" onClick={openDataServiceSettings}>
+                                  باز کردن تنظیمات Data Service
+                                </Button>
+                              </div>
+                            )}
+                            <Textarea
+                              label={operationPayloadLabel(selectedOperation)}
+                              value={selectedDraft}
+                              onChange={event => {
+                                const value = event.target.value;
+                                setDraftInputs(current => ({ ...current, [selectedOperation.id]: value }));
+                                setExecuteInputError('');
+                              }}
+                              error={executeInputError || undefined}
+                              className="min-h-[220px] text-left font-mono"
+                              dir="ltr"
+                              hint={
+                                selectedOperation.schemaCompleteness === 'NEEDS_INPUT' && !locallyReadyOps[selectedOperation.id]
+                                  ? `${operationPayloadLabel(selectedOperation)} برای NEEDS_INPUT الزامی است — خالی ({}) مسدود می‌شود`
+                                  : selectedOperation.type === 'CORE_COMMAND'
+                                    ? 'ارسال به‌عنوان data در store-form-data'
+                                    : selectedOperation.type === 'CORE_QUERY'
+                                      ? 'ارسال به‌عنوان params در get-data-source — مثلاً limit / offset / viewerRole'
+                                      : 'بدنه REST'
+                              }
+                            />
+                            <div className="flex flex-wrap gap-2">
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => setDraftInputs(current => ({
+                                  ...current,
+                                  [selectedOperation.id]: prettyJson(selectedOperation.payloadExample || {}),
+                                }))}
+                              >
+                                Reset example
+                              </Button>
+                              <Button size="sm" icon={<PlayCircle className="h-4 w-4" />} onClick={() => void executeSelected()} loading={executing} disabled={!session?.connected}>
+                                Send
+                              </Button>
+                            </div>
+                            {selectedOperation.schema && (
+                              <details className="rounded-lg border border-gray-200 p-3">
+                                <summary className="cursor-pointer text-sm font-medium text-gray-700">Schema</summary>
+                                <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-left text-xs font-mono" dir="ltr">{prettyJson(selectedOperation.schema)}</pre>
+                              </details>
+                            )}
+                          </div>
+                        ) : selectedExecution ? (
+                          <div className="space-y-3">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge variant={(selectedExecution.statusCode || 200) < 400 ? 'success' : 'danger'}>
+                                HTTP {selectedExecution.statusCode || 200}
+                              </Badge>
+                              <Badge variant="default">{selectedExecution.response?.responseSize || 0} B</Badge>
+                              <Badge variant="info">{selectedExecution.response?.durationMs || 0} ms</Badge>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                icon={<Copy className="h-4 w-4" />}
+                                onClick={() => {
+                                  void navigator.clipboard?.writeText(selectedResponseBody);
+                                  toast.success('JSON کپی شد.');
+                                }}
+                              >
+                                Copy
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                icon={<Download className="h-4 w-4" />}
+                                onClick={() => downloadText(`${selectedOperation.sourceId.replace(/\//g, '_')}-response.json`, selectedResponseBody, 'application/json;charset=utf-8')}
+                              >
+                                Download
+                              </Button>
+                            </div>
+                            <RuntimeJsonViewer value={selectedResponseBody || '-'} />
+                          </div>
+                        ) : (
+                          <div className="flex h-full min-h-[280px] flex-col items-center justify-center rounded-lg border border-dashed border-gray-300 bg-gray-50 p-6 text-center text-sm text-gray-500">
+                            هنوز پاسخی برای این عملیات نیست. از تب Request مقدار را بفرستید.
+                            <Button className="mt-3" size="sm" icon={<PlayCircle className="h-4 w-4" />} onClick={() => setInspectorTab('request')}>
+                              رفتن به Request
                             </Button>
                           </div>
                         )}
-                        <Textarea
-                          label={operationPayloadLabel(selectedOperation)}
-                          value={selectedDraft}
-                          onChange={event => {
-                            const value = event.target.value;
-                            setDraftInputs(current => ({ ...current, [selectedOperation.id]: value }));
-                            setExecuteInputError('');
-                          }}
-                          error={executeInputError || undefined}
-                          className="min-h-[220px] text-left font-mono"
-                          dir="ltr"
-                          hint={
-                            selectedOperation.schemaCompleteness === 'NEEDS_INPUT' && !locallyReadyOps[selectedOperation.id]
-                              ? `${operationPayloadLabel(selectedOperation)} برای NEEDS_INPUT الزامی است — خالی ({}) مسدود می‌شود`
-                              : selectedOperation.type === 'CORE_COMMAND'
-                                ? 'ارسال به‌عنوان data در store-form-data'
-                                : selectedOperation.type === 'CORE_QUERY'
-                                  ? 'ارسال به‌عنوان params در get-data-source — مثلاً limit / offset / viewerRole'
-                                  : 'بدنه REST'
-                          }
-                        />
-                        <div className="flex flex-wrap gap-2">
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            onClick={() => setDraftInputs(current => ({
-                              ...current,
-                              [selectedOperation.id]: prettyJson(selectedOperation.payloadExample || {}),
-                            }))}
-                          >
-                            Reset example
-                          </Button>
-                          <Button size="sm" icon={<PlayCircle className="h-4 w-4" />} onClick={() => void executeSelected()} loading={executing} disabled={!session?.connected}>
-                            Send
-                          </Button>
-                        </div>
-                        {selectedOperation.schema && (
-                          <details className="rounded-lg border border-gray-200 p-3">
-                            <summary className="cursor-pointer text-sm font-medium text-gray-700">Schema</summary>
-                            <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-left text-xs font-mono" dir="ltr">{prettyJson(selectedOperation.schema)}</pre>
-                          </details>
-                        )}
                       </div>
-                    ) : selectedExecution ? (
-                      <div className="space-y-3">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Badge variant={(selectedExecution.statusCode || 200) < 400 ? 'success' : 'danger'}>
-                            HTTP {selectedExecution.statusCode || 200}
-                          </Badge>
-                          <Badge variant="default">{selectedExecution.response?.responseSize || 0} B</Badge>
-                          <Badge variant="info">{selectedExecution.response?.durationMs || 0} ms</Badge>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            icon={<Copy className="h-4 w-4" />}
-                            onClick={() => {
-                              void navigator.clipboard?.writeText(selectedResponseBody);
-                              toast.success('JSON کپی شد.');
-                            }}
-                          >
-                            Copy
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            icon={<Download className="h-4 w-4" />}
-                            onClick={() => downloadText(`${selectedOperation.sourceId.replace(/\//g, '_')}-response.json`, selectedResponseBody, 'application/json;charset=utf-8')}
-                          >
-                            Download
-                          </Button>
-                        </div>
-                        <RuntimeJsonViewer value={selectedResponseBody || '-'} />
-                      </div>
-                    ) : (
-                      <div className="flex h-full min-h-[280px] flex-col items-center justify-center rounded-lg border border-dashed border-gray-300 bg-gray-50 p-6 text-center text-sm text-gray-500">
-                        هنوز پاسخی برای این عملیات نیست. از تب Request مقدار را بفرستید.
-                        <Button className="mt-3" size="sm" icon={<PlayCircle className="h-4 w-4" />} onClick={() => setInspectorTab('request')}>
-                          رفتن به Request
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                </>
-              ) : (
-                <div className="flex flex-1 items-center justify-center p-8 text-sm text-gray-500">
-                  یک عملیات را از لیست انتخاب کنید.
-                </div>
-              )}
-            </section>
-          </div>
-        </Card>
-      )}
+                    </>
+                  ) : (
+                    <div className="flex flex-1 items-center justify-center p-8 text-sm text-gray-500">
+                      یک عملیات را از لیست انتخاب کنید.
+                    </div>
+                  )}
+                </section>
+              </div>
+            </Card>
+          )}
+        </>
+      ) : null}
 
-      {loading && <div className="text-sm text-gray-500">در حال بارگذاری Runtime…</div>}
+      {loading && workspaceMode === 'cde' && <div className="text-sm text-gray-500">در حال بارگذاری Runtime…</div>}
 
       <Modal isOpen={passwordModal} onClose={() => { setPassword(''); setPasswordModal(false); }} title="ورود Runtime" size="sm">
         <div className="space-y-4">

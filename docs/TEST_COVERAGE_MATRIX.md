@@ -40,3 +40,9 @@ Includes: phase2, phase3, persist, vault, promote, environments, session, system
 | `npm run migrate:db -w @api-console/api` | JSON store → SQLite |
 | `npm run zone-worker -w @api-console/api` | Zone execution worker process |
 | `npm run backend:session-check` | Root alias for `test:session` |
+| `npm run dev:kill-ports` | Kill listeners on WEB/API ports (+ project node on Windows) |
+
+## Product docs
+
+PRD and multi-approach identity (CDE / Local / IS): [`PRD.md`](./PRD.md), [`approaches/`](./approaches/README.md). When E34/E35 land, add dedicated auth tests to this matrix.
+

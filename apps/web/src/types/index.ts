@@ -57,6 +57,11 @@ export interface ActiveContext {
   scope: AccessScope;
   automatedTestsEnabled?: boolean;
   token: string;
+  authApproach?: 'CDE' | 'IS' | 'LOCAL' | null;
+  identitySource?: string;
+  isGatewayBaseUrl?: string;
+  cdeOriginId?: string;
+  cdeOriginUrl?: string;
 }
 
 export interface PaginatedResponse<T> {

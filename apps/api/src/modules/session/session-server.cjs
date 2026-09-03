@@ -228,6 +228,7 @@ function createSessionRecord(partial = {}) {
     csrfToken,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    authApproach: null,
     cdeConnected: false,
     userLoginName: null,
     userId: null,
@@ -237,8 +238,18 @@ function createSessionRecord(partial = {}) {
     role: 'DEVELOPER',
     applicationId: null,
     projects: [],
+    isGatewayCookie: null,
+    isGatewayBaseUrl: null,
+    isRoles: [],
     ...partial,
   };
+}
+
+function isSessionAuthenticated(session) {
+  if (!session?.userId) return false;
+  if (session.authApproach === 'IS') return true;
+  if (session.authApproach === 'LOCAL') return true;
+  return Boolean(session.cdeConnected);
 }
 
 async function getSession(sessionId) {
@@ -328,7 +339,8 @@ function buildApplication(projectKey) {
 }
 
 function buildConsoleContext(session) {
-  if (!session?.cdeConnected || !session.userId) return null;
+  if (!isSessionAuthenticated(session)) return null;
+  const authApproach = session.authApproach || (session.cdeConnected ? 'CDE' : null);
   const applicationId = session.applicationId || (session.projects?.[0] || null);
   if (!applicationId) return null;
   const application = buildApplication(applicationId);
@@ -347,24 +359,36 @@ function buildConsoleContext(session) {
   };
   const managedScope = resolveManagedScopeApplicationIds(session.userLoginName, session.userId);
   const scopeApplicationIds = managedScope?.length ? managedScope : [applicationId];
+  const prefix = authApproach === 'IS' ? 'is' : authApproach === 'LOCAL' ? 'local' : 'cde';
   return {
-    contextId: `cde:${session.id}`,
+    contextId: `${prefix}:${session.id}`,
     userId: session.userId,
     user,
-    assignmentId: `cde:${session.userId}:${applicationId}`,
-    assignmentIds: [`cde:${session.userId}:${applicationId}`],
+    assignmentId: `${prefix}:${session.userId}:${applicationId}`,
+    assignmentIds: [`${prefix}:${session.userId}:${applicationId}`],
     applicationId,
     scopeApplicationIds,
     application,
     applications,
     // Resolve on every request so an administrator assignment becomes effective
-    // without requiring the target CDE account to sign in again.
+    // without requiring the target account to sign in again.
     role: resolveRole(session.userLoginName, session.userId),
     scope: 'SYSTEMS',
     token: session.csrfToken,
-    cdeOriginId: session.cdeOriginId || 'default',
-    cdeOriginUrl: session.cdeOriginUrl || undefined,
+    authApproach,
+    identitySource: authApproach,
+    cdeOriginId: authApproach === 'CDE' ? (session.cdeOriginId || 'default') : undefined,
+    cdeOriginUrl: authApproach === 'CDE' ? session.cdeOriginUrl || undefined : undefined,
+    isGatewayBaseUrl: authApproach === 'IS' ? session.isGatewayBaseUrl || undefined : undefined,
+    // Server-only; used to forward Gateway session on IS executions (never expose in UI APIs).
+    isGatewayCookie: authApproach === 'IS' ? session.isGatewayCookie || undefined : undefined,
   };
+}
+
+function publicConsoleContext(context) {
+  if (!context) return null;
+  const { isGatewayCookie, ...rest } = context;
+  return rest;
 }
 
 function attachConsoleContext(req) {
@@ -378,7 +402,11 @@ function attachConsoleContext(req) {
 
 async function markCdeConnected(session, user) {
   const loginName = String(user?.userLoginName || user?.loginName || session.userLoginName || '');
+  session.authApproach = 'CDE';
   session.cdeConnected = true;
+  session.isGatewayCookie = null;
+  session.isGatewayBaseUrl = null;
+  session.isRoles = [];
   session.userLoginName = loginName;
   session.userId = String(user?.id || user?.userId || loginName || session.id);
   session.firstName = String(user?.firstName || '');
@@ -390,6 +418,7 @@ async function markCdeConnected(session, user) {
 }
 
 async function markCdeDisconnected(session) {
+  session.authApproach = null;
   session.cdeConnected = false;
   session.userLoginName = null;
   session.userId = null;
@@ -399,8 +428,32 @@ async function markCdeDisconnected(session) {
   session.applicationId = null;
   session.projects = [];
   session.role = 'DEVELOPER';
+  session.isGatewayCookie = null;
+  session.isGatewayBaseUrl = null;
+  session.isRoles = [];
   await saveSession(session);
   return session;
+}
+
+async function markIsConnected(session, user, extras = {}) {
+  const loginName = String(user?.userLoginName || user?.loginName || session.userLoginName || '');
+  session.authApproach = 'IS';
+  session.cdeConnected = false;
+  session.userLoginName = loginName;
+  session.userId = String(user?.id || user?.userId || loginName || session.id);
+  session.firstName = String(user?.firstName || '');
+  session.lastName = String(user?.lastName || '');
+  session.displayName = String(user?.displayName || `${session.firstName} ${session.lastName}`.trim() || loginName);
+  session.role = resolveRole(loginName, session.userId);
+  session.isGatewayCookie = extras.gatewayCookie || null;
+  session.isGatewayBaseUrl = extras.gatewayBaseUrl || null;
+  session.isRoles = Array.isArray(extras.isRoles) ? extras.isRoles : (Array.isArray(user?.roles) ? user.roles : []);
+  await saveSession(session);
+  return session;
+}
+
+async function markIsDisconnected(session) {
+  return markCdeDisconnected(session);
 }
 
 async function setSelectedProject(session, projectKey, projects = []) {
@@ -423,11 +476,14 @@ async function handleSession(req, parsedUrl, body, res) {
   const pathname = parsedUrl.pathname;
   if (pathname === '/api/session' && req.method === 'GET') {
     const context = buildConsoleContext(session);
+    const authApproach = session.authApproach || (session.cdeConnected ? 'CDE' : null);
     return {
-      authenticated: Boolean(session.cdeConnected && context),
-      cdeConnected: Boolean(session.cdeConnected),
+      authenticated: Boolean(isSessionAuthenticated(session) && context),
+      authApproach,
+      cdeConnected: Boolean(session.cdeConnected && authApproach === 'CDE'),
+      isConnected: authApproach === 'IS',
       csrfToken: session.csrfToken,
-      activeContext: context,
+      activeContext: publicConsoleContext(context),
       user: context?.user || null,
       applicationId: session.applicationId,
       projects: session.projects || [],
@@ -435,19 +491,34 @@ async function handleSession(req, parsedUrl, body, res) {
   }
   if (pathname === '/api/session/context' && req.method === 'POST') {
     assertCsrf(req);
-    if (!session.cdeConnected) {
-      throw new SessionError('CDE_NOT_CONNECTED', 'Connect a CDE account before selecting a project.', 401);
+    if (!isSessionAuthenticated(session)) {
+      throw new SessionError('NOT_AUTHENTICATED', 'Sign in before selecting a project or system.', 401);
     }
     const projectKey = String(body?.applicationId || body?.projectKey || '').trim();
     if (!projectKey) throw new SessionError('PROJECT_REQUIRED', 'projectKey is required.', 400);
     await setSelectedProject(session, projectKey, body?.projects);
     const context = buildConsoleContext(session);
-    return { activeContext: context, csrfToken: session.csrfToken };
+    return {
+      activeContext: publicConsoleContext(context),
+      csrfToken: session.csrfToken,
+      authApproach: session.authApproach || null,
+    };
   }
   if (pathname === '/api/session/logout' && req.method === 'POST') {
     assertCsrf(req);
     const { deleteAllRuntimeSessions } = require('../runtime/runtime-session-store.cjs');
     const { deleteCdeSession } = require('../cde/cde-session-store.cjs');
+    if (session.authApproach === 'IS' && session.isGatewayCookie) {
+      try {
+        const { gatewayBaseUrl } = require('../is/is-auth-server.cjs');
+        await fetch(`${gatewayBaseUrl()}/api/v1/sso/logout`, {
+          method: 'POST',
+          headers: { cookie: session.isGatewayCookie, accept: 'application/json' },
+        });
+      } catch {
+        // best-effort upstream logout
+      }
+    }
     await deleteAllRuntimeSessions(session.id);
     await deleteCdeSession(session.id);
     await deleteSession(session.id);
@@ -467,7 +538,9 @@ function summarizeSession(session) {
     displayName: session.displayName || null,
     role: session.role || null,
     applicationId: session.applicationId || null,
+    authApproach: session.authApproach || (session.cdeConnected ? 'CDE' : null),
     cdeConnected: Boolean(session.cdeConnected),
+    isConnected: session.authApproach === 'IS',
     createdAt: session.createdAt || null,
     updatedAt: session.updatedAt || null,
   };
@@ -534,12 +607,16 @@ module.exports = {
   attachConsoleContext,
   assertCsrf,
   buildConsoleContext,
+  publicConsoleContext,
   canHandleSession,
   clearSessionCookie,
   createSessionRecord,
   handleSession,
   markCdeConnected,
   markCdeDisconnected,
+  markIsConnected,
+  markIsDisconnected,
+  isSessionAuthenticated,
   isBootstrapSystemAdmin,
   loginListIncludes,
   pickPrimaryRole,

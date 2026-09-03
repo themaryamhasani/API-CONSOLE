@@ -3,7 +3,6 @@ import { ExternalLink, LogOut, Menu, Moon, RefreshCw, Sun } from 'lucide-react';
 import { useSessionStore } from '../../stores/sessionStore';
 import { ROLE_LABELS } from '../../types';
 import { MinimalLoader } from '../ui/Loading';
-import { Select } from '../ui/Input';
 import { Button } from '../ui/Button';
 
 interface HeaderProps {
@@ -39,17 +38,11 @@ export const Header: React.FC<HeaderProps> = ({
   actions,
   onMenuClick,
 }) => {
-  const {
-    activeContext,
-    projects,
-    selectedProjectKey,
-    selectProject,
-    disconnect,
-    catalog,
-  } = useSessionStore();
+  const { activeContext, disconnect, catalog, authApproach } = useSessionStore();
   const [isDark, setIsDark] = useState(() => document.documentElement.classList.contains('dark'));
 
   const apiModule = catalog?.repositories.find(repository => repository.type === 'API_MODULE');
+  const approachLabel = authApproach === 'IS' ? 'IS' : authApproach === 'CDE' ? 'CDE' : null;
 
   return (
     <header className="z-30 shrink-0 border-b border-[var(--theme-border)] bg-[var(--theme-surface)]/90 px-3 py-2 backdrop-blur-md sm:px-5 lg:px-6">
@@ -73,6 +66,14 @@ export const Header: React.FC<HeaderProps> = ({
                   {activeContext.user.fullName || activeContext.user.displayName}
                   <span className="mx-1.5 opacity-40">·</span>
                   {ROLE_LABELS[activeContext.role]}
+                  {approachLabel ? (
+                    <>
+                      <span className="mx-1.5 opacity-40">·</span>
+                      <span className="rounded bg-[var(--theme-accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--theme-accent-ink)]">
+                        {approachLabel}
+                      </span>
+                    </>
+                  ) : null}
                   {apiModule ? (
                     <>
                       <span className="mx-1.5 opacity-40">·</span>
@@ -89,21 +90,6 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         <div className="ac-toolbar justify-end">
-          {projects.length > 0 ? (
-            <div className="min-w-[160px]">
-              <Select
-                aria-label="پروژه"
-                value={selectedProjectKey}
-                onChange={event => {
-                  void selectProject(event.target.value);
-                }}
-                options={projects.map(project => ({
-                  value: project.projectKey,
-                  label: project.projectKey,
-                }))}
-              />
-            </div>
-          ) : null}
           <a
             className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--theme-border)] px-3 py-2 text-xs text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-muted)]"
             href="/api/docs"

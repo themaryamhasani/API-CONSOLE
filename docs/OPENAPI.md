@@ -12,13 +12,18 @@ Covered surfaces:
 - CDE bridge (`/api/cde/session*`, projects, catalog, package)
 - Online API Console (`/api/api-console/*`)
 
-This Swagger UI documents the **host APIs**. Per-request markdown/DOCX documentation inside the Online API Console UI is unchanged.
+Planned (E34/E35 — not in host OpenAPI until implemented):
+
+- Local auth: `/api/auth/local/*`
+- IS bridge: `/api/auth/is/*`, `/api/api-console/is/*`
+
+This Swagger UI documents the **host APIs**. Per-request markdown/DOCX documentation inside the Online API Console UI is unchanged. Product approaches: [approaches/README.md](./approaches/README.md).
 
 ## Quick start (Try it out)
 
-1. Start API: `npm run backend`
-2. Log in via web UI: `http://localhost:5173` (CDE + project selection)
-3. Open Swagger: `http://localhost:4274/api/docs`
+1. Start API: `npm run backend` (preferred `:5281`, auto-fallback if busy)
+2. Log in via web UI: `http://localhost:5280` (CDE or IS)
+3. Open Swagger: `http://localhost:5281/api/docs`
 4. Call `GET /api/session` — confirm `authenticated: true`
 5. Use prefilled examples on `POST /api/api-console/curl/parse` or `POST /api/api-console/validate-core`
 
@@ -51,3 +56,7 @@ Replace `YOUR_PROJECT_SERVICE_ID`, `YOUR_PROJECT_KEY`, and `YOUR_RUNTIME_PROFILE
    - fr: add `"confirmed": true`
 
 Or open Runtime Swagger at `.../runtime-profiles/{profileId}/docs` for generated execute endpoints per discovered operation.
+
+## Free request execution
+
+`POST /api/api-console/requests/{id}/execute` runs the Node runner with destination policy + optional public DNS fallback (`API_CONSOLE_DNS_SERVERS`). Filter lists with `?sourceApproach=FREE|CDE`.

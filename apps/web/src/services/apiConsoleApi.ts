@@ -630,7 +630,16 @@ export const apiConsoleApi = {
 
   getRequests(
     applicationId: ApplicationScopeFilter,
-    filters: { page: number; limit: number; search?: string; collectionId?: string; classificationType?: string; status?: string; folderPath?: string },
+    filters: {
+      page: number;
+      limit: number;
+      search?: string;
+      collectionId?: string;
+      classificationType?: string;
+      status?: string;
+      folderPath?: string;
+      sourceApproach?: '' | 'FREE' | 'CDE' | 'IS';
+    },
     context?: ActiveContext
   ): Promise<PaginatedResponse<ApiRequestDefinition>> {
     return requestJson(withQuery('/requests', {
@@ -642,6 +651,7 @@ export const apiConsoleApi = {
       classificationType: filters.classificationType,
       status: filters.status,
       folderPath: filters.folderPath,
+      sourceApproach: filters.sourceApproach || undefined,
     }), { context });
   },
 
@@ -1061,6 +1071,13 @@ export const apiConsoleApi = {
     return requestJson(`/portal/shared/${encodeURIComponent(token)}`);
   },
 
+  downloadSharedPortalDocument(token: string, language: 'FA' | 'EN' = 'FA'): Promise<void> {
+    return downloadAuthenticatedFile(
+      withQuery(`/portal/shared/${encodeURIComponent(token)}/download`, { language }),
+      `api-document-${token.slice(0, 8)}.docx`,
+    );
+  },
+
   createContractBaseline(
     data: { collectionId: string; name?: string; openapi?: Record<string, unknown> },
     context: ActiveContext
@@ -1190,7 +1207,9 @@ export const apiConsoleApi = {
 
   updateOrgPolicy(
     data: {
-      privateDestinationAllowlist: string[];
+      privateDestinationAllowlist?: string[];
+      destinationAllowlist?: string[];
+      destinationBlocklist?: string[];
       dualApprovalProductionCommand: boolean;
       forbidInsecureTlsInProduction: boolean;
       forbidExactModeInProduction: boolean;

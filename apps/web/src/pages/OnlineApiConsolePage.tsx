@@ -51,7 +51,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useDataScope } from '../utils/useDataScope';
 import { useApplicationLookup } from '../utils/useApplicationLookup';
 import { apiConsoleApi } from '../services/apiConsoleApi';
-import { API_SHARING_STATUS_LABELS } from '../types/apiConsole';
+import { API_SHARING_STATUS_LABELS, PERSONAL_APPLICATION_ID, PERSONAL_APPLICATION_LABEL } from '../types/apiConsole';
 import type {
   ApiActivityEvent,
   ApiClassification,
@@ -1165,16 +1165,25 @@ const JsonEditor = ({
 };
 
 export const OnlineApiConsolePage: React.FC = () => {
-  const { activeContext } = useAuthStore();
+  const { activeContext, projects, selectProject } = useAuthStore();
   const { appId, initialApplicationIdForCreate } = useDataScope();
-  const { shouldShowSystemColumn, getApplicationName } = useApplicationLookup();
+  const { getApplicationName } = useApplicationLookup();
   const [collections, setCollections] = useState<ApiCollection[]>([]);
   const [environments, setEnvironments] = useState<ApiEnvironmentProfile[]>([]);
   const [requests, setRequests] = useState<PaginatedResponse<ApiRequestDefinition> | null>(null);
   const [selectedRequest, setSelectedRequest] = useState<ApiRequestDefinition | null>(null);
   const [savedRequest, setSavedRequest] = useState<ApiRequestDefinition | null>(null);
   const [pageMode, setPageMode] = useState<PageMode>('list');
-  const [filters, setFilters] = useState({ page: 1, limit: 10, search: '', collectionId: '', classificationType: '', folderPath: '' });
+  const [filters, setFilters] = useState({
+    page: 1,
+    limit: 10,
+    search: '',
+    collectionId: '',
+    classificationType: '',
+    folderPath: '',
+    systemFilter: '',
+    sourceApproach: '' as '' | 'FREE' | 'CDE',
+  });
   const [knownFolders, setKnownFolders] = useState<string[]>([]);
   const [folderDraft, setFolderDraft] = useState('');
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
@@ -1225,7 +1234,13 @@ export const OnlineApiConsolePage: React.FC = () => {
   const [selfCheck, setSelfCheck] = useState<{ passed: number; failed: number; details: ParserSelfCheckDetail[] } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ApiRequestDefinition | null>(null);
   const [collectionModalOpen, setCollectionModalOpen] = useState(false);
-  const [collectionForm, setCollectionForm] = useState({ applicationId: '', name: '', description: '' });
+  const [collectionForm, setCollectionForm] = useState({
+    applicationId: PERSONAL_APPLICATION_ID,
+    name: '',
+    description: '',
+    bindMode: 'free' as 'free' | 'system',
+  });
+  const [collectionAdvancedOpen, setCollectionAdvancedOpen] = useState(false);
   const [exportingCollectionId, setExportingCollectionId] = useState<string | null>(null);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('requests');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -1400,11 +1415,13 @@ export const OnlineApiConsolePage: React.FC = () => {
     return JSON.stringify(selectedRequest) !== JSON.stringify(savedRequest);
   }, [selectedRequest, savedRequest]);
 
+  const requestsScope = filters.systemFilter || 'ALL';
+
   useEffect(() => {
     if (activeContext) {
       loadAll();
     }
-  }, [activeContext, appId, filters.page, filters.limit, filters.collectionId, filters.classificationType, filters.folderPath]);
+  }, [activeContext, appId, filters.page, filters.limit, filters.collectionId, filters.classificationType, filters.folderPath, filters.systemFilter, filters.sourceApproach]);
 
   useEffect(() => {
     if (!activeContext) {
@@ -1491,9 +1508,9 @@ export const OnlineApiConsolePage: React.FC = () => {
     setLoading(true);
     try {
       const [collectionRows, environmentRows, requestRows, repositorySummary, reviewSummary] = await Promise.all([
-        apiConsoleApi.getCollections(appId, activeContext),
+        apiConsoleApi.getCollections(requestsScope, activeContext),
         apiConsoleApi.getEnvironments(),
-        apiConsoleApi.getRequests(appId, filters, activeContext),
+        apiConsoleApi.getRequests(requestsScope, filters, activeContext),
         apiConsoleApi
           .getRepository({ ...repositoryFilters, applicationId: appId }, activeContext)
           .catch(() => null),
@@ -1756,7 +1773,7 @@ export const OnlineApiConsolePage: React.FC = () => {
     if (!activeContext) return;
     const reloadSeq = ++reloadRequestsSeqRef.current;
     if (selectId) selectRequestSeqRef.current += 1;
-    const response = await apiConsoleApi.getRequests(appId, filters, activeContext);
+    const response = await apiConsoleApi.getRequests(requestsScope, filters, activeContext);
     if (reloadSeq !== reloadRequestsSeqRef.current) return;
     setRequests(response);
     setKnownFolders(prev => {
@@ -1918,12 +1935,18 @@ export const OnlineApiConsolePage: React.FC = () => {
     setPostmanText('');
     setPostmanFileName('');
     setPostmanPreview(null);
-    setPostmanApplicationId(initialApplicationIdForCreate);
+    setPostmanApplicationId(PERSONAL_APPLICATION_ID);
     setPostmanModalOpen(true);
   };
 
   const openCreateCollection = () => {
-    setCollectionForm({ applicationId: initialApplicationIdForCreate, name: '', description: '' });
+    setCollectionForm({
+      applicationId: PERSONAL_APPLICATION_ID,
+      name: '',
+      description: '',
+      bindMode: 'free',
+    });
+    setCollectionAdvancedOpen(false);
     setCollectionModalOpen(true);
   };
 
@@ -1939,23 +1962,71 @@ export const OnlineApiConsolePage: React.FC = () => {
     }
   };
 
-  const handleNewRequest = async () => {
+  const ensureCollectionForApplication = async (applicationId: string, preferredName?: string) => {
+    if (!activeContext) throw new Error('نشست فعال نیست.');
+    const name = preferredName
+      || (applicationId === PERSONAL_APPLICATION_ID ? 'درخواست‌های آزاد' : `Collection ${applicationId}`);
+    const existing = collections.find(collection =>
+      collection.applicationId === applicationId
+      && (preferredName
+        ? collection.name.trim().toLowerCase() === preferredName.trim().toLowerCase()
+        : true)
+    ) || collections.find(collection => collection.applicationId === applicationId);
+    if (existing) return existing;
+    const collection = await apiConsoleApi.createCollection({
+      applicationId,
+      name,
+      description: applicationId === PERSONAL_APPLICATION_ID
+        ? 'درخواست‌های شخصی و HTTP عمومی (بدون الزام CDE)'
+        : undefined,
+    }, activeContext);
+    setCollections(prev => [collection, ...prev]);
+    return collection;
+  };
+
+  const handleNewRequest = async (preferredApplicationId?: string) => {
     if (!activeContext || !canCreate) return;
     const selectedCollection = filters.collectionId
       ? collections.find(collection => collection.id === filters.collectionId)
       : undefined;
-    if (!selectedCollection) {
-      toast.info('برای ساخت Request ابتدا Collection و سامانه آن را انتخاب یا ایجاد کنید.');
-      openCreateCollection();
-      return;
+
+    let targetCollection = selectedCollection;
+    if (!targetCollection) {
+      const applicationId = preferredApplicationId
+        || filters.systemFilter
+        || (filters.sourceApproach === 'FREE' ? PERSONAL_APPLICATION_ID : '')
+        || initialApplicationIdForCreate
+        || PERSONAL_APPLICATION_ID;
+      try {
+        targetCollection = await ensureCollectionForApplication(applicationId);
+        setFilters(prev => ({ ...prev, collectionId: targetCollection!.id, systemFilter: applicationId === PERSONAL_APPLICATION_ID ? PERSONAL_APPLICATION_ID : prev.systemFilter, page: 1 }));
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'ساخت Collection برای درخواست جدید ناموفق بود.');
+        openCreateCollection();
+        return;
+      }
     }
+
     const folderPath = filters.folderPath && filters.folderPath !== '__root__'
       ? filters.folderPath.split('/').map(part => part.trim()).filter(Boolean)
       : [];
-    const request = await apiConsoleApi.createBlankRequest(selectedCollection.id, selectedCollection.applicationId, environments[0]?.id || 'env-development', activeContext, folderPath);
-    toast.success('Request جدید ساخته شد.');
-    await reloadRequests(request.id);
-    setPageMode('editor');
+    try {
+      const request = await apiConsoleApi.createBlankRequest(
+        targetCollection.id,
+        targetCollection.applicationId,
+        environments[0]?.id || 'env-development',
+        activeContext,
+        folderPath,
+      );
+      toast.success(targetCollection.applicationId === PERSONAL_APPLICATION_ID
+        ? 'درخواست آزاد ساخته شد — URL را مثل Postman تنظیم کنید.'
+        : 'Request جدید ساخته شد.');
+      await reloadRequests(request.id);
+      setPageMode('editor');
+      setWorkspaceView('requests');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'ساخت Request ناموفق بود.');
+    }
   };
 
   const handleParseCurl = async () => {
@@ -2130,31 +2201,38 @@ export const OnlineApiConsolePage: React.FC = () => {
   };
 
   const handleCreateCollection = async () => {
-    if (!activeContext || !canCreate || !collectionForm.applicationId || !collectionForm.name.trim()) return;
+    if (!activeContext || !canCreate || !collectionForm.name.trim()) return;
+    const applicationId = collectionForm.bindMode === 'free'
+      ? PERSONAL_APPLICATION_ID
+      : collectionForm.applicationId;
+    if (!applicationId || (collectionForm.bindMode === 'system' && applicationId === PERSONAL_APPLICATION_ID)) {
+      toast.warning('برای Collection سامانه‌ای، یک سامانه انتخاب کنید.');
+      return;
+    }
     const normalizedName = collectionForm.name.trim().toLowerCase();
     const existingCollection = collections.find(collection =>
-      collection.applicationId === collectionForm.applicationId
+      collection.applicationId === applicationId
       && collection.name.trim().toLowerCase() === normalizedName
     );
     if (existingCollection) {
-      setFilters(prev => ({ ...prev, collectionId: existingCollection.id, page: 1 }));
+      setFilters(prev => ({ ...prev, collectionId: existingCollection.id, systemFilter: applicationId, page: 1 }));
       setImportCollectionId(existingCollection.id);
       setCollectionModalOpen(false);
-      setCollectionForm({ applicationId: initialApplicationIdForCreate, name: '', description: '' });
+      setCollectionForm({ applicationId: PERSONAL_APPLICATION_ID, name: '', description: '', bindMode: 'free' });
       toast.info('این Collection قبلاً وجود دارد و همان انتخاب شد.');
       return;
     }
     try {
       const collection = await apiConsoleApi.createCollection({
-        applicationId: collectionForm.applicationId,
+        applicationId,
         name: collectionForm.name.trim(),
         description: collectionForm.description.trim() || undefined,
       }, activeContext);
       setCollections(prev => [collection, ...prev]);
-      setFilters(prev => ({ ...prev, collectionId: collection.id, page: 1 }));
+      setFilters(prev => ({ ...prev, collectionId: collection.id, systemFilter: applicationId, page: 1 }));
       setImportCollectionId(collection.id);
       setCollectionModalOpen(false);
-      setCollectionForm({ applicationId: initialApplicationIdForCreate, name: '', description: '' });
+      setCollectionForm({ applicationId: PERSONAL_APPLICATION_ID, name: '', description: '', bindMode: 'free' });
       toast.success('Collection جدید ساخته شد.');
       await reloadRequests();
     } catch (error) {
@@ -2315,7 +2393,7 @@ export const OnlineApiConsolePage: React.FC = () => {
 
   const handleSend = () => {
     if (!selectedRequest || !selectedEnvironment) return;
-    if (selectedRequest.classification.type === 'CORE_COMMAND' && (selectedRequest.runtimeBinding || selectedEnvironment.kind === 'PRODUCTION')) {
+    if (selectedRequest.classification.type === 'CORE_COMMAND' && (selectedRequest.runtimeBinding?.runtimeProfileId || selectedEnvironment.kind === 'PRODUCTION') && selectedRequest.sourceType !== 'IS_DISCOVERY' && !selectedRequest.isGatewayBinding) {
       setProductionModalOpen(true);
       return;
     }
@@ -2902,22 +2980,19 @@ export const OnlineApiConsolePage: React.FC = () => {
             }}
           >
           <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="default" size="sm">{item.method}</Badge>
             <span className="font-medium text-gray-900">{item.name}</span>
-            <Badge variant={classBadgeVariant(item.classification.type)} size="sm">
-              {CLASSIFICATION_LABELS[item.classification.type]}
-            </Badge>
-            <Badge variant="default" size="sm">v{item.semanticVersion || item.documentation?.version || '1.0.0'}</Badge>
-            {item.sourceType === 'REFERENCE' && <Badge variant="info" size="sm">Reference</Badge>}
-            {item.sourceType === 'CDE_DISCOVERY' && <Badge variant="info" size="sm">CDE Sync</Badge>}
+            {item.sourceType === 'CDE_DISCOVERY' && <Badge variant="info" size="sm">CDE</Badge>}
+            {item.applicationId === PERSONAL_APPLICATION_ID && <Badge variant="success" size="sm">آزاد</Badge>}
             {item.sourceSync?.status === 'STALE' && <Badge variant="danger" size="sm">STALE</Badge>}
-            {item.sourceSync?.status === 'CONFLICT' && <Badge variant="warning" size="sm">Sync Conflict</Badge>}
+            {item.sourceSync?.status === 'CONFLICT' && <Badge variant="warning" size="sm">Conflict</Badge>}
             {item.latestReturnReason && <Badge variant="danger" size="sm">بازگردانی</Badge>}
             {selectingRequestId === item.id && (
               <MinimalLoader size="xs" className="text-blue-600" />
             )}
           </div>
-          <p className="mt-1 max-w-[18rem] truncate text-left font-mono text-xs text-gray-500" dir="ltr">
-            {item.method} {item.urlTemplate}
+          <p className="mt-1 max-w-[28rem] truncate text-left font-mono text-xs text-gray-500" dir="ltr">
+            {item.urlTemplate}
           </p>
           {(item.folderPath || []).length > 0 && (
             <p className="mt-1 text-xs text-gray-500" dir="ltr">{(item.folderPath || []).join(' / ')}</p>
@@ -2948,20 +3023,16 @@ export const OnlineApiConsolePage: React.FC = () => {
       ),
     },
     {
-      key: 'apiId',
-      title: 'API ID',
-      className: 'max-w-[11rem]',
+      key: 'applicationId',
+      title: 'سامانه',
       render: (item: ApiRequestDefinition) => (
-        <span className="block max-w-[11rem] truncate font-mono text-xs text-gray-600" dir="ltr" title={item.apiId || item.id}>
-          {item.apiId || item.id}
+        <span className="text-xs text-gray-700">
+          {item.applicationId === PERSONAL_APPLICATION_ID
+            ? PERSONAL_APPLICATION_LABEL
+            : getApplicationName(item.applicationId)}
         </span>
       ),
     },
-    ...(shouldShowSystemColumn ? [{
-      key: 'applicationId',
-      title: 'سامانه',
-      render: (item: ApiRequestDefinition) => getApplicationName(item.applicationId),
-    }] : []),
     {
       key: 'sharingStatus',
       title: 'وضعیت',
@@ -3093,7 +3164,7 @@ export const OnlineApiConsolePage: React.FC = () => {
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h2 className="text-sm font-semibold text-[var(--theme-text)]">درخواست‌ها</h2>
                   <div className="relative flex flex-wrap items-center justify-end gap-2">
-                    <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={handleNewRequest} disabled={!canCreate}>
+                    <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={() => void handleNewRequest()} disabled={!canCreate}>
                       درخواست جدید
                     </Button>
                     <Button
@@ -3120,42 +3191,97 @@ export const OnlineApiConsolePage: React.FC = () => {
                     ) : null}
                   </div>
                 </div>
-                <div className="grid grid-cols-1 items-end gap-2 md:grid-cols-[minmax(180px,1fr)_160px_160px_auto]">
-                  <Input
-                    aria-label="جستجوی Request"
-                    value={filters.search}
-                    onChange={(event) => setFilters(prev => ({ ...prev, search: event.target.value }))}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') reloadRequests();
-                    }}
-                    placeholder="نام، URL، serviceId…"
-                    className="py-1.5 text-sm"
-                  />
-                  <Select
-                    aria-label="Collection"
-                    value={filters.collectionId}
-                    onChange={(event) => setFilters(prev => ({ ...prev, collectionId: event.target.value, folderPath: '', page: 1 }))}
-                    className="py-1.5 text-sm"
-                    options={[
-                      { value: '', label: 'همه Collectionها' },
-                      ...collections.map(collection => ({ value: collection.id, label: `${collection.name} — ${getApplicationName(collection.applicationId)}` })),
-                    ]}
-                  />
-                  <Select
-                    aria-label="Classification"
-                    value={filters.classificationType}
-                    onChange={(event) => setFilters(prev => ({ ...prev, classificationType: event.target.value, page: 1 }))}
-                    className="py-1.5 text-sm"
-                    options={[
-                      { value: '', label: 'همه انواع' },
-                      { value: 'GENERIC_HTTP', label: 'HTTP عمومی' },
-                      { value: 'CORE_QUERY', label: 'Core Query' },
-                      { value: 'CORE_COMMAND', label: 'Core Command' },
-                    ]}
-                  />
-                  <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={() => reloadRequests()}>
-                    فیلتر
-                  </Button>
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-end gap-2">
+                    <div className="min-w-[200px] flex-[1.4]">
+                      <Input
+                        aria-label="جستجوی Request"
+                        value={filters.search}
+                        onChange={(event) => setFilters(prev => ({ ...prev, search: event.target.value }))}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') reloadRequests();
+                        }}
+                        placeholder="جستجو: نام یا URL…"
+                        className="py-1.5 text-sm"
+                      />
+                    </div>
+                    <div className="min-w-[180px] flex-1">
+                      <ApplicationSelect
+                        label="فیلتر سامانه"
+                        value={filters.systemFilter}
+                        onChange={(systemFilter) => setFilters(prev => ({ ...prev, systemFilter, collectionId: '', page: 1 }))}
+                        includeEmptyOption
+                        emptyOptionLabel="همه"
+                        includePersonalOption
+                        personalOptionLabel={PERSONAL_APPLICATION_LABEL}
+                        size="sm"
+                        clearable
+                        className="[&_label]:sr-only"
+                        placeholder="همه سامانه‌ها"
+                        searchPlaceholder="جستجوی سامانه…"
+                      />
+                    </div>
+                    <div className="min-w-[160px] flex-1">
+                      <Select
+                        aria-label="Collection"
+                        value={filters.collectionId}
+                        onChange={(event) => setFilters(prev => ({ ...prev, collectionId: event.target.value, folderPath: '', page: 1 }))}
+                        className="py-1.5 text-sm"
+                        options={[
+                          { value: '', label: 'همه Collectionها' },
+                          ...collections
+                            .filter(collection => !filters.systemFilter || collection.applicationId === filters.systemFilter)
+                            .map(collection => ({
+                              value: collection.id,
+                              label: collection.name,
+                            })),
+                        ]}
+                      />
+                    </div>
+                    <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={() => reloadRequests()}>
+                      اعمال
+                    </Button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {([
+                      ['', 'همه'],
+                      ['FREE', 'آزاد'],
+                      ['CDE', 'CDE'],
+                    ] as const).map(([value, label]) => (
+                      <button
+                        key={value || 'all'}
+                        type="button"
+                        onClick={() => setFilters(prev => ({ ...prev, sourceApproach: value, page: 1 }))}
+                        className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                          filters.sourceApproach === value
+                            ? 'bg-[var(--theme-text)] text-[var(--theme-surface)]'
+                            : 'bg-[var(--theme-surface-muted)] text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-subtle)]'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                    <span className="mx-1 self-center text-[var(--theme-border-strong)]">|</span>
+                    {([
+                      ['', 'همه انواع'],
+                      ['GENERIC_HTTP', 'HTTP'],
+                      ['CORE_QUERY', 'Query'],
+                      ['CORE_COMMAND', 'Command'],
+                    ] as const).map(([value, label]) => (
+                      <button
+                        key={value || 'all-type'}
+                        type="button"
+                        onClick={() => setFilters(prev => ({ ...prev, classificationType: value, page: 1 }))}
+                        className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                          filters.classificationType === value
+                            ? 'bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]'
+                            : 'bg-[var(--theme-surface-muted)] text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-subtle)]'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             </Card>
@@ -3709,6 +3835,18 @@ export const OnlineApiConsolePage: React.FC = () => {
                 isSystemAdmin={canManageGeneralSettings}
                 onSynced={reloadRequests}
                 onConnectionChange={setRuntimeConnected}
+                canCreateFreeRequest={canCreate}
+                projects={projects}
+                onSelectProject={async (projectKey) => {
+                  await selectProject(projectKey);
+                }}
+                onCreateFreeRequest={async (applicationId) => {
+                  await handleNewRequest(applicationId || PERSONAL_APPLICATION_ID);
+                }}
+                onOpenRequest={async (requestId) => {
+                  setWorkspaceView('requests');
+                  await reloadRequests(requestId);
+                }}
               />
             )}
           </section>
@@ -3950,7 +4088,28 @@ export const OnlineApiConsolePage: React.FC = () => {
                       </div>
                     </div>
                   )}
-                  {selectedRequest.runtimeBinding && (
+                  {selectedRequest.isGatewayBinding || selectedRequest.sourceType === 'IS_DISCOVERY' ? (
+                    <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                      <div className="font-semibold">IS Gateway binding</div>
+                      <div className="mt-1 font-mono text-xs" dir="ltr">
+                        service={selectedRequest.isGatewayBinding?.serviceKey || '—'}
+                        {' · '}
+                        path={selectedRequest.isGatewayBinding?.gatewayPath || selectedRequest.urlTemplate || '—'}
+                        {' · '}
+                        source={selectedRequest.isGatewayBinding?.sourceKind || selectedRequest.sourceSync?.sourceKind || 'SPEC_SERVICE'}
+                      </div>
+                      {(selectedRequest.isGatewayBinding?.specFolder || selectedRequest.isGatewayBinding?.controllerName) ? (
+                        <div className="mt-1 font-mono text-[11px] text-emerald-800/80" dir="ltr">
+                          spec={selectedRequest.isGatewayBinding?.specFolder || '—'}
+                          {selectedRequest.isGatewayBinding?.controllerName ? ` · ${selectedRequest.isGatewayBinding.controllerName}` : ''}
+                          {selectedRequest.isGatewayBinding?.actionName ? `/${selectedRequest.isGatewayBinding.actionName}` : ''}
+                        </div>
+                      ) : null}
+                      <div className="mt-1 text-xs">
+                        کوکی نشست Gateway (`_lsr`) در Request ذخیره نمی‌شود و هنگام اجرا فقط در backend تزریق می‌شود. Environment پیشنهادی: IS Gateway.
+                      </div>
+                    </div>
+                  ) : selectedRequest.runtimeBinding?.runtimeProfileId ? (
                     <div className="mt-4 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
                       <div className="font-semibold">Runtime binding ثبت‌شده</div>
                       <div className="mt-1 font-mono text-xs" dir="ltr">
@@ -3958,7 +4117,7 @@ export const OnlineApiConsolePage: React.FC = () => {
                       </div>
                       <div className="mt-1 text-xs">Cookie و client-id در این Request ذخیره نشده‌اند و هنگام اجرا فقط در backend تزریق می‌شوند.</div>
                     </div>
-                  )}
+                  ) : null}
                   {selectedRequest.latestReturnReason && (
                     <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
                       <span className="font-semibold">دلیل بازگردانی مدیرسیستم: </span>
@@ -4918,29 +5077,92 @@ export const OnlineApiConsolePage: React.FC = () => {
 
       <Modal isOpen={collectionModalOpen} onClose={() => setCollectionModalOpen(false)} title="Collection جدید" size="md">
         <div className="space-y-4">
-          <ApplicationSelect
-            label="سامانه Collection"
-            required
-            value={collectionForm.applicationId}
-            onChange={(applicationId) => setCollectionForm(prev => ({ ...prev, applicationId }))}
-            hint="تمام Requestهای این Collection به همین سامانه تعلق دارند."
-          />
+          <div>
+            <p className="mb-2 text-sm font-medium text-[var(--theme-text)]">نوع Collection</p>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={() => setCollectionForm(prev => ({
+                  ...prev,
+                  bindMode: 'free',
+                  applicationId: PERSONAL_APPLICATION_ID,
+                }))}
+                className={`rounded-xl border px-3 py-3 text-right transition ${
+                  collectionForm.bindMode === 'free'
+                    ? 'border-[var(--theme-accent)] bg-[var(--theme-accent-soft)]'
+                    : 'border-[var(--theme-border)] hover:bg-[var(--theme-surface-muted)]'
+                }`}
+              >
+                <div className="text-sm font-semibold text-[var(--theme-text)]">آزاد / شخصی</div>
+                <div className="mt-1 text-xs text-[var(--theme-text-subtle)]">مثل Postman — بدون الزام سامانه CDE</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setCollectionForm(prev => ({
+                  ...prev,
+                  bindMode: 'system',
+                  applicationId: prev.applicationId === PERSONAL_APPLICATION_ID ? '' : prev.applicationId,
+                }))}
+                className={`rounded-xl border px-3 py-3 text-right transition ${
+                  collectionForm.bindMode === 'system'
+                    ? 'border-[var(--theme-accent)] bg-[var(--theme-accent-soft)]'
+                    : 'border-[var(--theme-border)] hover:bg-[var(--theme-surface-muted)]'
+                }`}
+              >
+                <div className="text-sm font-semibold text-[var(--theme-text)]">متصل به سامانه</div>
+                <div className="mt-1 text-xs text-[var(--theme-text-subtle)]">برای همگام‌سازی و Requestهای CDE</div>
+              </button>
+            </div>
+          </div>
+
+          {collectionForm.bindMode === 'system' ? (
+            <ApplicationSelect
+              label="سامانه"
+              required
+              value={collectionForm.applicationId}
+              onChange={(applicationId) => setCollectionForm(prev => ({ ...prev, applicationId }))}
+              placeholder="جستجو و انتخاب سامانه"
+              searchPlaceholder="نام سامانه را تایپ کنید…"
+              hint="فقط وقتی لازم است Requestها به یک پروژه CDE وصل شوند."
+            />
+          ) : null}
+
           <Input
             label="نام Collection"
             value={collectionForm.name}
             onChange={(event) => setCollectionForm(prev => ({ ...prev, name: event.target.value }))}
-            placeholder="مثلاً سرویس‌های Core مدرسه"
+            placeholder={collectionForm.bindMode === 'free' ? 'مثلاً نقشه و موقعیت مکانی' : 'مثلاً Core Queries'}
           />
-          <Textarea
-            label="توضیحات Collection"
-            value={collectionForm.description}
-            onChange={(event) => setCollectionForm(prev => ({ ...prev, description: event.target.value }))}
-            className="min-h-28"
-            placeholder="توضیح کوتاه برای گروه‌بندی Requestها"
-          />
+
+          <div>
+            <button
+              type="button"
+              className="text-xs text-[var(--theme-text-subtle)] hover:text-[var(--theme-text)]"
+              onClick={() => setCollectionAdvancedOpen(open => !open)}
+            >
+              {collectionAdvancedOpen ? 'بستن توضیحات' : 'توضیحات (اختیاری)'}
+            </button>
+            {collectionAdvancedOpen ? (
+              <Textarea
+                className="mt-2 min-h-20"
+                value={collectionForm.description}
+                onChange={(event) => setCollectionForm(prev => ({ ...prev, description: event.target.value }))}
+                placeholder="توضیح کوتاه برای این گروه از Requestها"
+              />
+            ) : null}
+          </div>
+
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setCollectionModalOpen(false)}>انصراف</Button>
-            <Button icon={<FolderPlus className="h-4 w-4" />} onClick={handleCreateCollection} disabled={!collectionForm.applicationId || !collectionForm.name.trim() || !canCreate}>
+            <Button
+              icon={<FolderPlus className="h-4 w-4" />}
+              onClick={handleCreateCollection}
+              disabled={
+                !canCreate
+                || !collectionForm.name.trim()
+                || (collectionForm.bindMode === 'system' && !collectionForm.applicationId)
+              }
+            >
               ساخت Collection
             </Button>
           </div>
@@ -6728,12 +6950,15 @@ const ImportPostmanCollectionModal = ({
     <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1fr_1.2fr]">
       <div className="space-y-3">
         <ApplicationSelect
-          label="سامانه Collection"
-          required
+          label="سامانه مقصد"
           value={applicationId}
           onChange={onApplicationChange}
           disabled={importing}
-          hint="Collection و تمام Requestهای Importشده به این سامانه متصل می‌شوند."
+          includePersonalOption
+          personalOptionLabel={PERSONAL_APPLICATION_LABEL}
+          placeholder="جستجو و انتخاب سامانه"
+          searchPlaceholder="نام سامانه را تایپ کنید…"
+          hint="آزاد = بدون CDE. یا یک سامانه برای Import متصل به پروژه."
         />
         <label className="block space-y-2">
           <span className="text-sm font-medium text-gray-700">فایل Postman Collection</span>

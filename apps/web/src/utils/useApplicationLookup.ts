@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { useAuthStore } from '../stores/authStore';
+import { PERSONAL_APPLICATION_ID, PERSONAL_APPLICATION_LABEL } from '../types/apiConsole';
 import { useDataScope } from './useDataScope';
 
 export function useApplicationLookup() {
@@ -14,9 +15,11 @@ export function useApplicationLookup() {
     if (projects.length) {
       return projects.map(project => ({
         id: project.projectKey,
-        name: project.projectKey,
-        code: project.repositories.API_MODULE,
-        description: '',
+        name: project.projectKey === PERSONAL_APPLICATION_ID
+          ? PERSONAL_APPLICATION_LABEL
+          : (project.repositories?.API_MODULE || project.projectKey),
+        code: project.repositories?.API_MODULE || project.projectKey,
+        description: project.projectKey.startsWith('is:') ? 'Integrated Systems' : '',
         isActive: true,
       }));
     }
@@ -47,6 +50,11 @@ export function useApplicationLookup() {
   const getApplicationName = (applicationId?: string) => {
     if (!applicationId) return '-';
     if (applicationId === 'ALL') return 'همه پروژه‌ها';
+    if (applicationId === PERSONAL_APPLICATION_ID) return PERSONAL_APPLICATION_LABEL;
+    if (applicationId.startsWith('is:')) {
+      const serviceKey = applicationId.slice(3);
+      return applicationNameById[applicationId] || serviceKey || applicationId;
+    }
     return applicationNameById[applicationId] || activeContext?.application?.name || applicationId;
   };
 

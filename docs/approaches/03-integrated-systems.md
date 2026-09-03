@@ -100,8 +100,8 @@ SPECS_ROOT (مثلاً specs/medu-apps)
 | عملیات | Flatten controller/action → Gateway path | method + `/api/v1/...` |
 | غنی‌سازی اختیاری | `gateway-apis` + OpenAPI idp-docs (اگر `_lsr` باشد) | شمارنده‌های Gateway/OpenAPI |
 | همگام‌سازی | `POST /api/api-console/is/systems/:key/sync` | Collection `IS · …` + Requestهای `IS_DISCOVERY` |
-| اجرای بدون rule (dev) | Gateway: `GATEWAY_ALLOW_MISSING_ACCESS_RULES` (پیش‌فرض non-prod = allow) | مسیر بدون `api_access_rules` برای کاربر لاگین‌شده رد نمی‌شود |
-| بازیابی Console | `API_CONSOLE_IS_AUTO_ENSURE_ACCESS_RULES=true` | روی 403، یک‌بار `POST /api/v1/iam/rules` با `is_public` سپس retry |
+| بازیابی Console (بدون پچ Gateway) | `API_CONSOLE_IS_AUTO_ENSURE_ACCESS_RULES=true` | روی 403، یک‌بار `POST /api/v1/iam/rules` با `is_public` سپس retry — فقط اگر خود IAM rules برای کاربر مجاز باشد |
+| اجرای واقعی | Gateway بدون تغییر سورس | مسیر بدون `api_access_rules` همان 403 استاندارد IS را می‌دهد |
 
 UI: تب **کشف IS** — فیلتر Workspace / دسته / محصول Spec، سپس همگام‌سازی به Collection.
 

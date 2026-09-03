@@ -27,7 +27,7 @@ import {
 import { ROLE_LABELS } from '../types';
 import type { ActiveContext, ApiAuditEvent, Notification, NotificationListResponse, PaginatedResponse, UserRole } from '../types';
 import { AppShell, buildWorkspaceNav, type WorkspaceNavId } from '../components/layout/AppShell';
-import { Header } from '../components/layout/Header';
+import { Header, HeaderIconButton, HeaderMenuItem } from '../components/layout/Header';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { Card, StatCard } from '../components/ui/Card';
@@ -1422,6 +1422,30 @@ export const OnlineApiConsolePage: React.FC = () => {
       loadAll();
     }
   }, [activeContext, appId, filters.page, filters.limit, filters.collectionId, filters.classificationType, filters.folderPath, filters.systemFilter, filters.sourceApproach]);
+
+  const searchEffectSkipRef = useRef(true);
+  useEffect(() => {
+    if (!activeContext) return;
+    if (searchEffectSkipRef.current) {
+      searchEffectSkipRef.current = false;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void reloadRequests();
+    }, 320);
+    return () => window.clearTimeout(timer);
+  }, [filters.search]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setGlobalSearchOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   useEffect(() => {
     if (!activeContext) {
@@ -3096,23 +3120,34 @@ export const OnlineApiConsolePage: React.FC = () => {
         onRefresh={loadAll}
         refreshing={loading}
         onMenuClick={() => setMobileNavOpen(true)}
+        menuExtras={canManageGeneralSettings ? (
+          <HeaderMenuItem icon={<ShieldCheck className="h-3.5 w-3.5" />} onClick={runSelfCheck}>
+            Self-check
+          </HeaderMenuItem>
+        ) : undefined}
         actions={(
-          <div className="relative flex flex-wrap gap-2">
+          <div className="relative flex items-center gap-0.5">
+            <HeaderIconButton label="جستجوی سراسری (Ctrl+K)" onClick={() => setGlobalSearchOpen(true)}>
+              <Search className="h-4 w-4" />
+            </HeaderIconButton>
+
             <div className="relative">
-              <Button
-                variant="secondary"
-                size="sm"
-                icon={<Bell className="h-4 w-4" />}
+              <HeaderIconButton
+                label="اعلان‌ها"
                 onClick={() => {
                   setNotificationsOpen(open => !open);
                   void loadNotifications();
                 }}
               >
-                اعلان‌ها
-                {(notificationFeed?.unreadCount || 0) > 0 && (
-                  <span className="mr-1 rounded-md bg-[var(--theme-danger)] px-1.5 text-[10px] text-white">{notificationFeed?.unreadCount}</span>
-                )}
-              </Button>
+                <span className="relative inline-flex">
+                  <Bell className="h-4 w-4" />
+                  {(notificationFeed?.unreadCount || 0) > 0 ? (
+                    <span className="absolute -left-1.5 -top-1.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-[var(--theme-danger)] px-0.5 text-[9px] font-semibold text-white">
+                      {(notificationFeed?.unreadCount || 0) > 9 ? '9+' : notificationFeed?.unreadCount}
+                    </span>
+                  ) : null}
+                </span>
+              </HeaderIconButton>
               {notificationsOpen && (
                 <div className="absolute left-0 z-30 mt-2 w-80 rounded-[var(--theme-radius)] border border-[var(--theme-border)] bg-[var(--theme-surface-raised)] p-2 shadow-lg sm:left-auto sm:right-0">
                   <div className="mb-2 flex items-center justify-between gap-2 px-1">
@@ -3142,13 +3177,24 @@ export const OnlineApiConsolePage: React.FC = () => {
                 </div>
               )}
             </div>
-            <Button variant="secondary" size="sm" icon={<Search className="h-4 w-4" />} onClick={() => setGlobalSearchOpen(true)}>
-              جستجو
-            </Button>
-            <span className={`ac-chip ${runtimeConnected ? 'border-emerald-200 text-emerald-700' : ''}`}>
-              Runtime {runtimeConnected ? 'متصل' : 'قطع'}
-            </span>
-            {canManageGeneralSettings && <Button variant="ghost" size="sm" icon={<ShieldCheck className="h-4 w-4" />} onClick={runSelfCheck}>Self-check</Button>}
+
+            <button
+              type="button"
+              title={runtimeConnected ? 'Runtime متصل — رفتن به Runtime' : 'Runtime قطع — رفتن به Runtime'}
+              aria-label={runtimeConnected ? 'Runtime متصل' : 'Runtime قطع'}
+              onClick={() => {
+                setPageMode('list');
+                setWorkspaceView('runtime');
+              }}
+              className={`ms-1 inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-[11px] font-medium transition-colors ${
+                runtimeConnected
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/15 dark:text-emerald-400'
+                  : 'border-[var(--theme-border)] bg-[var(--theme-surface-muted)] text-[var(--theme-text-subtle)] hover:bg-[var(--theme-surface-subtle)]'
+              }`}
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${runtimeConnected ? 'bg-emerald-500' : 'bg-[var(--theme-danger)]'}`} />
+              <span className="hidden sm:inline">Runtime</span>
+            </button>
           </div>
         )}
       />
@@ -3160,10 +3206,55 @@ export const OnlineApiConsolePage: React.FC = () => {
             {workspaceView === 'requests' && (
               <>
             <Card padding="sm" className="shrink-0">
-              <div className="space-y-2">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <h2 className="text-sm font-semibold text-[var(--theme-text)]">درخواست‌ها</h2>
-                  <div className="relative flex flex-wrap items-center justify-end gap-2">
+              <div className="space-y-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative min-w-[200px] flex-[1.6]">
+                    <Search className="pointer-events-none absolute start-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--theme-text-subtle)]" />
+                    <Input
+                      aria-label="جستجوی Request"
+                      value={filters.search}
+                      onChange={(event) => setFilters(prev => ({ ...prev, search: event.target.value, page: 1 }))}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') void reloadRequests();
+                      }}
+                      placeholder="جستجو: نام یا URL…"
+                      className="py-1.5 ps-8 text-sm"
+                    />
+                  </div>
+                  <div className="min-w-[160px] flex-1">
+                    <ApplicationSelect
+                      label="فیلتر سامانه"
+                      value={filters.systemFilter}
+                      onChange={(systemFilter) => setFilters(prev => ({ ...prev, systemFilter, collectionId: '', page: 1 }))}
+                      includeEmptyOption
+                      emptyOptionLabel="همه"
+                      includePersonalOption
+                      personalOptionLabel={PERSONAL_APPLICATION_LABEL}
+                      size="sm"
+                      clearable
+                      className="[&_label]:sr-only"
+                      placeholder="همه سامانه‌ها"
+                      searchPlaceholder="جستجوی سامانه…"
+                    />
+                  </div>
+                  <div className="min-w-[150px] flex-1">
+                    <Select
+                      aria-label="Collection"
+                      value={filters.collectionId}
+                      onChange={(event) => setFilters(prev => ({ ...prev, collectionId: event.target.value, folderPath: '', page: 1 }))}
+                      className="py-1.5 text-sm"
+                      options={[
+                        { value: '', label: 'همه Collectionها' },
+                        ...collections
+                          .filter(collection => !filters.systemFilter || collection.applicationId === filters.systemFilter)
+                          .map(collection => ({
+                            value: collection.id,
+                            label: collection.name,
+                          })),
+                      ]}
+                    />
+                  </div>
+                  <div className="relative ms-auto flex flex-wrap items-center justify-end gap-1.5">
                     <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={() => void handleNewRequest()} disabled={!canCreate}>
                       درخواست جدید
                     </Button>
@@ -3173,14 +3264,16 @@ export const OnlineApiConsolePage: React.FC = () => {
                       icon={<PlayCircle className="h-4 w-4" />}
                       onClick={() => void openCollectionRunModal()}
                       disabled={!filters.collectionId || !canExecute}
+                      className="hidden sm:inline-flex"
                     >
                       اجرای Collection
                     </Button>
-                    <Button size="sm" variant="secondary" onClick={() => setRequestsMoreOpen(open => !open)}>
+                    <Button size="sm" variant="secondary" onClick={() => setRequestsMoreOpen(open => !open)} aria-expanded={requestsMoreOpen}>
                       بیشتر
                     </Button>
                     {requestsMoreOpen ? (
                       <div className="absolute left-0 top-full z-20 mt-1 w-56 rounded-[var(--theme-radius)] border border-[var(--theme-border)] bg-[var(--theme-surface-raised)] p-1 shadow-lg">
+                        <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)] sm:hidden" disabled={!filters.collectionId || !canExecute} onClick={() => { setRequestsMoreOpen(false); void openCollectionRunModal(); }}>اجرای Collection</button>
                         <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!canCreate} onClick={() => { setRequestsMoreOpen(false); openCreateCollection(); }}>Collection جدید</button>
                         <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!canCreate} onClick={() => { setRequestsMoreOpen(false); openImportCurl(); }}>Import cURL</button>
                         <button type="button" className="ac-nav-item !text-[var(--theme-text-muted)] hover:!bg-[var(--theme-surface-muted)]" disabled={!canCreate} onClick={() => { setRequestsMoreOpen(false); openImportPostmanCollection(); }}>Import Collection</button>
@@ -3191,97 +3284,45 @@ export const OnlineApiConsolePage: React.FC = () => {
                     ) : null}
                   </div>
                 </div>
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-end gap-2">
-                    <div className="min-w-[200px] flex-[1.4]">
-                      <Input
-                        aria-label="جستجوی Request"
-                        value={filters.search}
-                        onChange={(event) => setFilters(prev => ({ ...prev, search: event.target.value }))}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter') reloadRequests();
-                        }}
-                        placeholder="جستجو: نام یا URL…"
-                        className="py-1.5 text-sm"
-                      />
-                    </div>
-                    <div className="min-w-[180px] flex-1">
-                      <ApplicationSelect
-                        label="فیلتر سامانه"
-                        value={filters.systemFilter}
-                        onChange={(systemFilter) => setFilters(prev => ({ ...prev, systemFilter, collectionId: '', page: 1 }))}
-                        includeEmptyOption
-                        emptyOptionLabel="همه"
-                        includePersonalOption
-                        personalOptionLabel={PERSONAL_APPLICATION_LABEL}
-                        size="sm"
-                        clearable
-                        className="[&_label]:sr-only"
-                        placeholder="همه سامانه‌ها"
-                        searchPlaceholder="جستجوی سامانه…"
-                      />
-                    </div>
-                    <div className="min-w-[160px] flex-1">
-                      <Select
-                        aria-label="Collection"
-                        value={filters.collectionId}
-                        onChange={(event) => setFilters(prev => ({ ...prev, collectionId: event.target.value, folderPath: '', page: 1 }))}
-                        className="py-1.5 text-sm"
-                        options={[
-                          { value: '', label: 'همه Collectionها' },
-                          ...collections
-                            .filter(collection => !filters.systemFilter || collection.applicationId === filters.systemFilter)
-                            .map(collection => ({
-                              value: collection.id,
-                              label: collection.name,
-                            })),
-                        ]}
-                      />
-                    </div>
-                    <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={() => reloadRequests()}>
-                      اعمال
-                    </Button>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {([
-                      ['', 'همه'],
-                      ['FREE', 'آزاد'],
-                      ['CDE', 'CDE'],
-                    ] as const).map(([value, label]) => (
-                      <button
-                        key={value || 'all'}
-                        type="button"
-                        onClick={() => setFilters(prev => ({ ...prev, sourceApproach: value, page: 1 }))}
-                        className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
-                          filters.sourceApproach === value
-                            ? 'bg-[var(--theme-text)] text-[var(--theme-surface)]'
-                            : 'bg-[var(--theme-surface-muted)] text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-subtle)]'
-                        }`}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                    <span className="mx-1 self-center text-[var(--theme-border-strong)]">|</span>
-                    {([
-                      ['', 'همه انواع'],
-                      ['GENERIC_HTTP', 'HTTP'],
-                      ['CORE_QUERY', 'Query'],
-                      ['CORE_COMMAND', 'Command'],
-                    ] as const).map(([value, label]) => (
-                      <button
-                        key={value || 'all-type'}
-                        type="button"
-                        onClick={() => setFilters(prev => ({ ...prev, classificationType: value, page: 1 }))}
-                        className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
-                          filters.classificationType === value
-                            ? 'bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]'
-                            : 'bg-[var(--theme-surface-muted)] text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-subtle)]'
-                        }`}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {([
+                    ['', 'همه'],
+                    ['FREE', 'آزاد'],
+                    ['CDE', 'CDE'],
+                  ] as const).map(([value, label]) => (
+                    <button
+                      key={value || 'all'}
+                      type="button"
+                      onClick={() => setFilters(prev => ({ ...prev, sourceApproach: value, page: 1 }))}
+                      className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                        filters.sourceApproach === value
+                          ? 'bg-[var(--theme-text)] text-[var(--theme-surface)]'
+                          : 'bg-[var(--theme-surface-muted)] text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-subtle)]'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                  <span className="mx-1 self-center text-[var(--theme-border-strong)]">|</span>
+                  {([
+                    ['', 'همه انواع'],
+                    ['GENERIC_HTTP', 'HTTP'],
+                    ['CORE_QUERY', 'Query'],
+                    ['CORE_COMMAND', 'Command'],
+                  ] as const).map(([value, label]) => (
+                    <button
+                      key={value || 'all-type'}
+                      type="button"
+                      onClick={() => setFilters(prev => ({ ...prev, classificationType: value, page: 1 }))}
+                      className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                        filters.classificationType === value
+                          ? 'bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]'
+                          : 'bg-[var(--theme-surface-muted)] text-[var(--theme-text-muted)] hover:bg-[var(--theme-surface-subtle)]'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
               </div>
             </Card>
@@ -5031,12 +5072,13 @@ export const OnlineApiConsolePage: React.FC = () => {
           <div className="flex gap-2">
             <Input
               aria-label="عبارت جستجو"
+              autoFocus
               value={globalSearchQuery}
               onChange={(event) => setGlobalSearchQuery(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter') void runGlobalSearch();
               }}
-              placeholder="Request / Repository / Discovery"
+              placeholder="Request / Repository / Discovery — Ctrl+K"
               dir="ltr"
             />
             <Button onClick={() => { void runGlobalSearch(); }} loading={globalSearchLoading}>جستجو</Button>

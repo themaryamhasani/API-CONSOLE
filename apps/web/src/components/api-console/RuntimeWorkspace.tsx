@@ -201,6 +201,9 @@ type ProfileForm = {
   name: string;
   kind: RuntimeEnvironmentKind;
   origin: string;
+  originsText: string;
+  targetScope: 'current' | 'selected' | 'all';
+  selectedApplicationIds: string[];
   coreBasePath: string;
   loginPath: string;
   appRefererPath: string;
@@ -230,6 +233,9 @@ const emptyProfile = (projectKey: string): ProfileForm => ({
   name: `${projectKey} Development`,
   kind: 'DEVELOPMENT',
   origin: DEFAULT_RUNTIME_ORIGIN,
+  originsText: DEFAULT_RUNTIME_ORIGIN,
+  targetScope: 'current',
+  selectedApplicationIds: [projectKey],
   coreBasePath: '/core-api/v1',
   loginPath: '/devlogin',
   appRefererPath: '/',
@@ -320,7 +326,7 @@ export function RuntimeWorkspace({
   projects = [],
   onSelectProject,
 }: Props) {
-  const { getApplicationName } = useApplicationLookup();
+  const { getApplicationName, applications: accessibleApplications } = useApplicationLookup();
   const isIsApproach = context.authApproach === 'IS' || context.identitySource === 'IS';
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(isIsApproach ? 'is' : 'cde');
 
@@ -387,8 +393,15 @@ export function RuntimeWorkspace({
     resolutions: ConflictResolutions;
   } | null>(null);
   const canPromote = PROTECTED_ENV_ROLES.has(context.role);
+  const canManageDevelopmentOrigins = Boolean(
+    context.role
+    && context.role !== 'DEVELOPER'
+    && apiConsoleApi.policy.canManageDevelopmentRuntimeProfiles.includes(context.role),
+  );
 
   const selectedProfile = profiles.find(item => item.id === selectedProfileId) || profiles[0];
+  const canManageSelectedOrigin = canManageDevelopmentOrigins
+    && (isSystemAdmin || selectedProfile?.kind === 'DEVELOPMENT');
   const promoteKindOptions = useMemo(
     () => RUNTIME_KIND_ORDER
       .filter(kind => kind !== selectedProfile?.kind)
@@ -686,7 +699,8 @@ export function RuntimeWorkspace({
     setProfileForm({
       ...emptyProfile(projectKey),
       kind: 'DEVELOPMENT',
-      projectServiceId: candidates.length === 1 ? candidates[0].value : '',
+      selectedApplicationIds: [projectKey],
+      projectServiceId: isSystemAdmin && candidates.length === 1 ? candidates[0].value : '',
     });
     setDsWizardStep(1);
     setFocusDataService(false);
@@ -700,6 +714,9 @@ export function RuntimeWorkspace({
       name: profile.name,
       kind: isSystemAdmin ? profile.kind : 'DEVELOPMENT',
       origin: profile.origin,
+      originsText: profile.origin,
+      targetScope: 'current',
+      selectedApplicationIds: [profile.applicationId || projectKey],
       coreBasePath: profile.coreBasePath,
       loginPath: profile.loginPath,
       appRefererPath: profile.appRefererPath,
@@ -727,27 +744,55 @@ export function RuntimeWorkspace({
   };
 
   const saveProfile = async () => {
+    if (!canManageDevelopmentOrigins) {
+      toast.error('فقط مدیر سیستم یا سرپرست فنی می‌تواند Origin را مدیریت کند.');
+      return;
+    }
     const evidence = candidates.find(item => item.value === profileForm.projectServiceId)?.evidence || selectedProfile?.serviceIdEvidence || [];
-    if (profileForm.projectServiceId && !evidence.length) {
+    if (isSystemAdmin && profileForm.projectServiceId && !evidence.length) {
       toast.error('برای Service ID باید evidence کشف‌شده انتخاب شود.');
       return;
     }
     const kind = isSystemAdmin ? profileForm.kind : 'DEVELOPMENT';
+    const originList = [...new Set(
+      (profileForm.id ? [profileForm.origin] : profileForm.originsText.split(/[\n,]+/))
+        .map(value => value.trim())
+        .filter(Boolean),
+    )];
+    if (!originList.length) {
+      toast.error('حداقل یک Origin HTTPS وارد کنید.');
+      return;
+    }
+    const selectableApps = accessibleApplications
+      .map(app => app.id)
+      .filter(id => id && id !== PERSONAL_APPLICATION_ID);
+    let applicationIds = [projectKey];
+    if (!profileForm.id) {
+      if (profileForm.targetScope === 'all') {
+        applicationIds = selectableApps.length ? selectableApps : [projectKey];
+      } else if (profileForm.targetScope === 'selected') {
+        applicationIds = profileForm.selectedApplicationIds.filter(id => selectableApps.includes(id) || id === projectKey);
+        if (!applicationIds.length) {
+          toast.error('حداقل یک سامانه انتخاب کنید.');
+          return;
+        }
+      }
+    }
     setProfileSaving(true);
     try {
-      const data = {
-        applicationId: projectKey,
-        projectKey,
+      const isBatchCreate = !profileForm.id && (applicationIds.length > 1 || originList.length > 1);
+      const baseData = {
         name: profileForm.name,
         kind,
-        origin: profileForm.origin,
+        rowVersion: profileForm.rowVersion,
+      };
+      const adminExtras = isSystemAdmin && !isBatchCreate ? {
         coreBasePath: profileForm.coreBasePath,
         loginPath: profileForm.loginPath,
         appRefererPath: profileForm.appRefererPath,
         projectServiceId: profileForm.projectServiceId || undefined,
         serviceIdEvidence: evidence,
         prostage: profileForm.prostage || undefined,
-        rowVersion: profileForm.rowVersion,
         dataService: {
           baseUrl: profileForm.dataServiceBaseUrl,
           authMode: profileForm.dataServiceAuthMode,
@@ -755,17 +800,50 @@ export function RuntimeWorkspace({
           tokenPath: profileForm.dataServiceTokenPath,
           ...(profileForm.dataServiceAuthSecret ? { authSecret: profileForm.dataServiceAuthSecret } : {}),
         },
-      };
-      const saved = profileForm.id
-        ? await apiConsoleApi.updateRuntimeProfile(profileForm.id, data, context)
-        : await apiConsoleApi.createRuntimeProfile(data, context);
-      toast.success(saved.dataService?.executionEnabled
-        ? 'Runtime Profile ذخیره شد — Data Service برای اجرا آماده است.'
-        : 'Runtime Profile ذخیره شد.');
+      } : {};
+
+      if (profileForm.id) {
+        const saved = await apiConsoleApi.updateRuntimeProfile(profileForm.id, {
+          ...baseData,
+          ...adminExtras,
+          applicationId: projectKey,
+          projectKey,
+          origin: originList[0],
+        }, context);
+        toast.success(saved.dataService?.executionEnabled
+          ? 'Runtime Profile ذخیره شد — Data Service برای اجرا آماده است.'
+          : 'Runtime Profile ذخیره شد.');
+        setSelectedProfileId(saved.id);
+      } else {
+        const result = await apiConsoleApi.createRuntimeProfile({
+          ...baseData,
+          ...adminExtras,
+          applicationId: applicationIds.length === 1 ? applicationIds[0] : undefined,
+          applicationIds,
+          origins: originList,
+          origin: originList[0],
+        }, context);
+        const created = Array.isArray((result as { created?: RuntimeProfile[] }).created)
+          ? (result as { created: RuntimeProfile[]; skipped?: unknown[] }).created
+          : [result as RuntimeProfile];
+        const skipped = Array.isArray((result as { skipped?: unknown[] }).skipped)
+          ? (result as { skipped: unknown[] }).skipped.length
+          : 0;
+        const forCurrent = created.find(item => item.applicationId === projectKey) || created[0];
+        toast.success(
+          skipped
+            ? `${created.length} Origin ذخیره شد (${skipped} تکراری نادیده گرفته شد).`
+            : created.length > 1
+              ? `${created.length} Origin برای ${applicationIds.length} سامانه ذخیره شد.`
+              : (forCurrent?.dataService?.executionEnabled
+                ? 'Runtime Profile ذخیره شد — Data Service برای اجرا آماده است.'
+                : 'Runtime Profile ذخیره شد.'),
+        );
+        if (forCurrent) setSelectedProfileId(forCurrent.id);
+      }
       setProfileModal(false);
       setFocusDataService(false);
       setPassword('');
-      setSelectedProfileId(saved.id);
       setDsBlockedHint(false);
       await load();
     } catch (error) {
@@ -988,7 +1066,7 @@ export function RuntimeWorkspace({
   const executeSelected = async () => {
     if (!selectedProfile || !selectedOperation) return;
     const parsed = parseJsonObject(selectedDraft);
-    if (!parsed.ok) {
+    if (parsed.ok === false) {
       setExecuteInputError(parsed.message);
       setInspectorTab('request');
       return;
@@ -1361,6 +1439,12 @@ export function RuntimeWorkspace({
                 {session?.connected
                   ? <Button size="sm" variant="secondary" onClick={disconnect}>قطع</Button>
                   : <Button size="sm" icon={<Link2 className="h-4 w-4" />} onClick={connect} loading={connecting} disabled={!selectedProfile}>Login</Button>}
+                {canManageSelectedOrigin && selectedProfile && (
+                  <Button size="sm" variant="secondary" onClick={() => openEditProfile(selectedProfile)}>ویرایش Origin</Button>
+                )}
+                {canManageDevelopmentOrigins && (
+                  <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={openNewProfile}>افزودن Origin</Button>
+                )}
                 <Button
                   size="sm"
                   variant="secondary"
@@ -1376,14 +1460,12 @@ export function RuntimeWorkspace({
             {settingsOpen && (
               <div className="mt-3 space-y-3 border-t border-gray-100 pt-3">
                 <div className="flex flex-wrap gap-1.5">
-                  {isSystemAdmin && selectedProfile && <Button size="sm" variant="secondary" icon={<ShieldCheck className="h-4 w-4" />} onClick={validateProfile}>Validate</Button>}
-                  {isSystemAdmin && selectedProfile && <Button size="sm" variant="secondary" onClick={() => openEditProfile(selectedProfile)}>Edit</Button>}
+                  {canManageSelectedOrigin && selectedProfile && <Button size="sm" variant="secondary" icon={<ShieldCheck className="h-4 w-4" />} onClick={validateProfile}>اعتبارسنجی Origin</Button>}
                   {isSystemAdmin && selectedProfile && (
                     <Button size="sm" variant="secondary" onClick={() => openEditProfile(selectedProfile, { focusDataService: true })}>
                       Data Service
                     </Button>
                   )}
-                  {isSystemAdmin && <Button size="sm" icon={<Plus className="h-4 w-4" />} onClick={openNewProfile}>Origin</Button>}
                 </div>
                 {canPromote && selectedProfile && (
                   <div className="flex flex-wrap items-end gap-2 rounded-lg border border-gray-100 bg-gray-50 p-2">
@@ -1413,20 +1495,18 @@ export function RuntimeWorkspace({
                     Project Service ID تأیید نشده — Scan و Approve لازم است.
                   </div>
                 )}
-                {isSystemAdmin && (
-                  <div className="rounded-lg border border-gray-100 bg-white p-2 text-xs text-gray-600">
-                    <div className="mb-1 font-medium text-gray-800">Originهای provision‌شده</div>
-                    {provisionedOrigins.length === 0
-                      ? <div className="text-gray-500">هنوز Originی ثبت نشده است.</div>
-                      : (
-                        <div className="flex flex-wrap gap-1.5" dir="ltr">
-                          {provisionedOrigins.map(origin => (
-                            <Badge key={origin} variant="default" size="sm">{origin}</Badge>
-                          ))}
-                        </div>
-                      )}
-                  </div>
-                )}
+                <div className="rounded-lg border border-gray-100 bg-white p-2 text-xs text-gray-600">
+                  <div className="mb-1 font-medium text-gray-800">Originهای قابل انتخاب</div>
+                  {provisionedOrigins.length === 0
+                    ? <div className="text-gray-500">هنوز Originی ثبت نشده است.</div>
+                    : (
+                      <div className="flex flex-wrap gap-1.5" dir="ltr">
+                        {provisionedOrigins.map(origin => (
+                          <Badge key={origin} variant="default" size="sm">{origin}</Badge>
+                        ))}
+                      </div>
+                    )}
+                </div>
               </div>
             )}
           </Card>
@@ -1844,20 +1924,132 @@ export function RuntimeWorkspace({
         <div className="space-y-4">
           {!profileForm.id && (
             <div className="rounded-lg border border-blue-100 bg-blue-50 p-3 text-sm text-blue-800">
-              فقط Origin را وارد کنید. Core path، login و prostage=develop پیش‌فرض هستند.
+              می‌توانید چند Origin (هر خط یکی) را برای سامانه فعلی، چند سامانه انتخابی، یا همه سامانه‌های در دسترس provision کنید. مسیر <span className="font-mono" dir="ltr">/devlogin</span> برای Development پیش‌فرض است.
             </div>
           )}
-          <Input
-            label="Origin HTTPS"
-            dir="ltr"
-            value={profileForm.origin}
-            onChange={event => {
-              const origin = event.target.value;
-              setProfileForm(value => ({ ...value, origin, name: value.id ? value.name : defaultProfileName(projectKey, origin) }));
-            }}
-            placeholder="https://soha.m.edus.ir"
-          />
-          <details className="rounded-lg border border-gray-200 p-3" open={Boolean(profileForm.id) && !focusDataService}>
+          {profileForm.id ? (
+            <Input
+              label="Origin HTTPS"
+              dir="ltr"
+              value={profileForm.origin}
+              onChange={event => {
+                const origin = event.target.value;
+                setProfileForm(value => ({
+                  ...value,
+                  origin,
+                  originsText: origin,
+                  name: value.id && isSystemAdmin ? value.name : defaultProfileName(projectKey, origin),
+                }));
+              }}
+              placeholder="https://soha.m.edus.ir"
+              hint="نمونه: https://soha.m.edus.ir، https://adib.m.edus.ir یا https://soha.medu.ir"
+            />
+          ) : (
+            <>
+              <Textarea
+                label="Originهای HTTPS"
+                dir="ltr"
+                rows={3}
+                value={profileForm.originsText}
+                onChange={event => {
+                  const originsText = event.target.value;
+                  const first = originsText.split(/[\n,]+/).map(item => item.trim()).find(Boolean) || '';
+                  setProfileForm(value => ({
+                    ...value,
+                    originsText,
+                    origin: first || value.origin,
+                    name: defaultProfileName(projectKey, first || DEFAULT_RUNTIME_ORIGIN),
+                  }));
+                }}
+                placeholder={'https://soha.m.edus.ir\nhttps://adib.m.edus.ir\nhttps://soha.medu.ir'}
+                hint="هر خط یک Origin — می‌توانید چند میزبان Development را با هم اضافه کنید."
+              />
+              <div className="space-y-2 rounded-lg border border-gray-200 p-3">
+                <div className="text-sm font-medium text-gray-800">سامانه‌های هدف</div>
+                <div className="flex flex-wrap gap-3 text-sm text-gray-700">
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      name="origin-target-scope"
+                      checked={profileForm.targetScope === 'current'}
+                      onChange={() => setProfileForm(value => ({ ...value, targetScope: 'current', selectedApplicationIds: [projectKey] }))}
+                    />
+                    فقط سامانه فعلی
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      name="origin-target-scope"
+                      checked={profileForm.targetScope === 'selected'}
+                      onChange={() => setProfileForm(value => ({
+                        ...value,
+                        targetScope: 'selected',
+                        selectedApplicationIds: value.selectedApplicationIds.length ? value.selectedApplicationIds : [projectKey],
+                      }))}
+                    />
+                    چند سامانه
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      name="origin-target-scope"
+                      checked={profileForm.targetScope === 'all'}
+                      onChange={() => setProfileForm(value => ({
+                        ...value,
+                        targetScope: 'all',
+                        selectedApplicationIds: accessibleApplications
+                          .map(app => app.id)
+                          .filter(id => id && id !== PERSONAL_APPLICATION_ID),
+                      }))}
+                    />
+                    همه سامانه‌های در دسترس
+                  </label>
+                </div>
+                {profileForm.targetScope === 'selected' && (
+                  <div className="max-h-40 space-y-1 overflow-auto rounded border border-gray-100 bg-gray-50 p-2">
+                    {accessibleApplications
+                      .filter(app => app.id !== PERSONAL_APPLICATION_ID)
+                      .map(app => {
+                        const checked = profileForm.selectedApplicationIds.includes(app.id);
+                        return (
+                          <label key={app.id} className="flex items-center gap-2 text-sm text-gray-700">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => setProfileForm(value => ({
+                                ...value,
+                                selectedApplicationIds: checked
+                                  ? value.selectedApplicationIds.filter(id => id !== app.id)
+                                  : [...value.selectedApplicationIds, app.id],
+                              }))}
+                            />
+                            <span>{app.name}</span>
+                            <span className="font-mono text-[11px] text-gray-500" dir="ltr">{app.id}</span>
+                          </label>
+                        );
+                      })}
+                    {!accessibleApplications.some(app => app.id !== PERSONAL_APPLICATION_ID) && (
+                      <div className="text-xs text-gray-500">سامانه‌ای در محدوده دسترسی نیست.</div>
+                    )}
+                  </div>
+                )}
+                {profileForm.targetScope === 'all' && (
+                  <div className="text-xs text-gray-600">
+                    Originها روی {accessibleApplications.filter(app => app.id !== PERSONAL_APPLICATION_ID).length || 1} سامانه در دسترس اعمال می‌شوند.
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+          {!isSystemAdmin && (
+            <>
+              <Input label="نام Profile" value={profileForm.name} onChange={event => setProfileForm(value => ({ ...value, name: event.target.value }))} />
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                این Origin با مسیر <span className="font-mono" dir="ltr">/devlogin</span> و فقط برای محیط Development ذخیره می‌شود.
+              </div>
+            </>
+          )}
+          {isSystemAdmin && <details className="rounded-lg border border-gray-200 p-3" open={Boolean(profileForm.id) && !focusDataService}>
             <summary className="cursor-pointer text-sm font-medium text-gray-700">Advanced</summary>
             <div className="mt-3 grid gap-3 md:grid-cols-2">
               <Input label="نام Profile" value={profileForm.name} onChange={event => setProfileForm(value => ({ ...value, name: event.target.value }))} />
@@ -1868,18 +2060,15 @@ export function RuntimeWorkspace({
                 options={kindSelectOptions}
                 disabled={!isSystemAdmin}
               />
-              {!isSystemAdmin && (
-                <p className="md:col-span-2 text-xs text-amber-700">برای نقش غیر ادمین فقط محیط DEVELOPMENT مجاز است.</p>
-              )}
               <Input label="App referer path" dir="ltr" value={profileForm.appRefererPath} onChange={event => setProfileForm(value => ({ ...value, appRefererPath: event.target.value }))} placeholder="/community" />
               <Input label="Core base path" dir="ltr" value={profileForm.coreBasePath} onChange={event => setProfileForm(value => ({ ...value, coreBasePath: event.target.value }))} />
               <Input label="Login path" dir="ltr" value={profileForm.loginPath} onChange={event => setProfileForm(value => ({ ...value, loginPath: event.target.value }))} />
               <Select label="Project Service ID" value={profileForm.projectServiceId} onChange={event => setProfileForm(value => ({ ...value, projectServiceId: event.target.value }))} options={[{ value: '', label: 'تأیید نشده' }, ...candidates.map(item => ({ value: item.value, label: item.value }))]} />
               <Input label="prostage" dir="ltr" value={profileForm.prostage} onChange={event => setProfileForm(value => ({ ...value, prostage: event.target.value }))} />
             </div>
-          </details>
+          </details>}
 
-          <div className="rounded-lg border border-blue-100 bg-blue-50/40 p-3">
+          {isSystemAdmin && <div className="rounded-lg border border-blue-100 bg-blue-50/40 p-3">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-sm font-semibold text-gray-900">راه‌اندازی Data Service</h3>
               <div className="flex flex-wrap gap-1">
@@ -2002,11 +2191,11 @@ export function RuntimeWorkspace({
                 </div>
               </div>
             )}
-          </div>
+          </div>}
         </div>
         <div className="mt-4 flex flex-wrap justify-between gap-2">
           <div>
-            {profileForm.id && (
+            {isSystemAdmin && profileForm.id && (
               <Button
                 variant="danger"
                 icon={<Trash2 className="h-4 w-4" />}

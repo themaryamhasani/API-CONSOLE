@@ -291,6 +291,8 @@
 #### S10.01 — CRUD Environment از UI
 - **Status:** `DONE`
 - **Acceptance Criteria:**
+  - [x] بخش مدیریت Environment فقط برای SYSTEM_ADMIN / TECH_LEAD / QA_LEAD نمایش داده شود
+  - [x] DEVELOPER بتواند محیط‌های موجود را استفاده کند، اما CRUD Environment نداشته باشد
   - [x] ساخت/ویرایش/آرشیو environment (غیر از قفل productionProtected بدون نقش مجاز)
   - [x] ویرایش baseUrl، variables، defaultHeaders، secretReferences
   - [x] clone environment
@@ -352,7 +354,10 @@
 - **Status:** `DONE`
 - **Acceptance Criteria:**
   - [x] UI لیست originهای مجاز و profileهای provision‌شده را نشان دهد
-  - [x] افزودن origin فقط توسط SYSTEM_ADMIN و داخل allowlist
+  - [x] افزودن/ویرایش origin محیط Development توسط TECH_LEAD / SYSTEM_ADMIN، فقط داخل allowlist
+  - [x] provisioning چند Origin برای سامانه فعلی، چند سامانه انتخابی، یا همه سامانه‌های در دسترس
+  - [x] DEVELOPER فقط Originهای provision‌شده را انتخاب و استفاده کند
+  - [x] مدیریت originهای محافظت‌شده فقط توسط SYSTEM_ADMIN
 
 ---
 
@@ -748,7 +753,8 @@
 #### S31.04 — قفل تنظیمات حساس Runtime
 - **Status:** `DONE`
 - **Acceptance Criteria:**
-  - [x] تغییر origin/Data Service فقط SYSTEM_ADMIN
+  - [x] تغییر Data Service و origin محیط‌های محافظت‌شده فقط توسط SYSTEM_ADMIN
+  - [x] TECH_LEAD فقط نام/origin پروفایل Development را تغییر دهد
   - [x] rowVersion conflict درست به UI برسد
 
 ---

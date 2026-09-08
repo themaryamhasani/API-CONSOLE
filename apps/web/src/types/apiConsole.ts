@@ -1032,5 +1032,7 @@ export interface ApiConsolePermissionPolicy {
   canReviewShares: UserRole[];
   canViewUsageReports: UserRole[];
   canManageUsers: UserRole[];
+  canManageDevelopmentRuntimeProfiles: UserRole[];
+  canManageEnvironments: UserRole[];
   canManageProtectedEnvironments: UserRole[];
 }

@@ -242,6 +242,8 @@ const API_CONSOLE_POLICY = {
   canReviewShares: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
   canViewUsageReports: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
   canManageUsers: ['SYSTEM_ADMIN'],
+  canManageDevelopmentRuntimeProfiles: ['SYSTEM_ADMIN', 'TECH_LEAD'],
+  canManageEnvironments: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
   canManageProtectedEnvironments: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
 };
 
@@ -2484,7 +2486,7 @@ function listActiveEnvironments() {
 }
 
 function assertCanMutateEnvironment(context, environment, creating = false) {
-  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canEdit)) {
+  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canManageEnvironments)) {
     throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to manage environments.', 403);
   }
   const protectedEnv = creating
@@ -5357,6 +5359,156 @@ function assertRuntimeProjectAccess(projectKey, context) {
   return key;
 }
 
+function canManageDevelopmentRuntimeProfiles(context) {
+  return roleAllowed(context.role, API_CONSOLE_POLICY.canManageDevelopmentRuntimeProfiles);
+}
+
+function isSystemAdministratorContext(context) {
+  return roleAllowed(context.role, API_CONSOLE_POLICY.canManageUsers);
+}
+
+function assertCanManageRuntimeProfile(context, kind) {
+  if (isSystemAdministratorContext(context)) return;
+  if (!canManageDevelopmentRuntimeProfiles(context) || kind !== 'DEVELOPMENT') {
+    throw new ApiConsoleError(
+      'AUTHENTICATION_ERROR',
+      'Only System Admin or Tech Lead can manage Development Runtime origins.',
+      403,
+    );
+  }
+}
+
+function normalizeRuntimeOriginList(input) {
+  const raw = [];
+  if (Array.isArray(input?.origins)) raw.push(...input.origins);
+  if (input?.origin != null && input.origin !== '') raw.push(input.origin);
+  const origins = [...new Set(raw
+    .flatMap(value => String(value || '').split(/[\n,]+/))
+    .map(value => value.trim())
+    .filter(Boolean))];
+  if (!origins.length) {
+    throw new ApiConsoleError('RUNTIME_ORIGIN_REQUIRED', 'At least one Runtime origin is required.', 422);
+  }
+  return origins;
+}
+
+function normalizeRuntimeApplicationIdList(input, context, current = null) {
+  const raw = [];
+  if (Array.isArray(input?.applicationIds)) raw.push(...input.applicationIds);
+  if (input?.applicationId != null && input.applicationId !== '') raw.push(input.applicationId);
+  if (input?.projectKey != null && input.projectKey !== '') raw.push(input.projectKey);
+  if (current?.applicationId) raw.push(current.applicationId);
+
+  const expanded = [];
+  for (const value of raw) {
+    const token = String(value || '').trim();
+    if (!token) continue;
+    if (token === 'ALL') {
+      const scope = contextApplicationIds(context).filter(id => id && id !== PERSONAL_APPLICATION_ID);
+      if (!scope.length) {
+        throw new ApiConsoleError('RUNTIME_PROJECT_REQUIRED', 'No accessible systems are available for ALL.', 422);
+      }
+      expanded.push(...scope);
+      continue;
+    }
+    expanded.push(token);
+  }
+
+  const applicationIds = [...new Set(expanded.map(id => assertRuntimeProjectAccess(id, context)))];
+  if (!applicationIds.length) {
+    throw new ApiConsoleError('RUNTIME_PROJECT_REQUIRED', 'Runtime projectKey is required.', 422);
+  }
+  return applicationIds;
+}
+
+function runtimeProfileMutationInput(data, context, current = null) {
+  const input = data && typeof data === 'object' ? data : {};
+  const kind = String(input.kind || current?.kind || 'DEVELOPMENT').toUpperCase();
+  assertCanManageRuntimeProfile(context, kind);
+  if (isSystemAdministratorContext(context)) return input;
+
+  const applicationIds = normalizeRuntimeApplicationIdList(input, context, current);
+  const applicationId = current?.applicationId || applicationIds[0];
+  if (current && applicationId !== current.applicationId) {
+    throw new ApiConsoleError(
+      'AUTHENTICATION_ERROR',
+      'Non-administrators cannot move a Runtime Profile to another project.',
+      403,
+    );
+  }
+
+  const leadFields = new Set(['applicationId', 'applicationIds', 'projectKey', 'name', 'kind', 'origin', 'origins', 'rowVersion']);
+  const protectedFields = Object.keys(input).filter(key => !leadFields.has(key));
+  if (protectedFields.length) {
+    throw new ApiConsoleError(
+      'AUTHENTICATION_ERROR',
+      'Tech Lead can only change the name and origin of a Development Runtime Profile.',
+      403,
+    );
+  }
+
+  return {
+    applicationId,
+    projectKey: applicationId,
+    applicationIds,
+    name: input.name ?? current?.name,
+    kind: 'DEVELOPMENT',
+    origin: input.origin ?? current?.origin,
+    origins: input.origins,
+  };
+}
+
+function createRuntimeProfilesFromInput(input, context) {
+  const origins = normalizeRuntimeOriginList(input);
+  const applicationIds = normalizeRuntimeApplicationIdList(input, context);
+  const created = [];
+  const skipped = [];
+
+  for (const applicationId of applicationIds) {
+    for (const origin of origins) {
+      const profileInput = {
+        ...input,
+        applicationId,
+        projectKey: applicationId,
+        origin,
+        kind: isSystemAdministratorContext(context) ? (input.kind || 'DEVELOPMENT') : 'DEVELOPMENT',
+        name: input.name || undefined,
+      };
+      delete profileInput.origins;
+      delete profileInput.applicationIds;
+      const profile = normalizeRuntimeProfileInput(profileInput, context);
+      const duplicate = store.runtimeProfiles.some(item =>
+        item.applicationId === profile.applicationId
+        && item.origin === profile.origin
+        && item.kind === profile.kind
+        && item.enabled !== false
+      );
+      if (duplicate) {
+        skipped.push({ applicationId: profile.applicationId, origin: profile.origin, kind: profile.kind });
+        continue;
+      }
+      store.runtimeProfiles.unshift(profile);
+      audit('RUNTIME_PROFILE_CREATED', context, {
+        profileId: profile.id,
+        applicationId: profile.applicationId,
+        origin: profile.origin,
+      });
+      created.push(runtimeProfileView(profile));
+    }
+  }
+
+  if (!created.length) {
+    throw new ApiConsoleError(
+      'RUNTIME_PROFILE_DUPLICATE',
+      'An active Runtime Profile with this project, origin, and kind already exists.',
+      409,
+      { skipped },
+    );
+  }
+  saveStore(store);
+  return { created, skipped, profiles: created };
+}
+
 function latestDiscovery(projectKey, originFilter) {
   return store.discoverySnapshots
     .filter(snapshot => snapshot.projectKey === projectKey && matchesOriginId(snapshot, originFilter === undefined ? null : originFilter))
@@ -6967,25 +7119,32 @@ async function routeRequest(req, parsedUrl, body) {
       const targetKind = body.targetKind ?? body.data?.targetKind;
       return safeClone(promoteRuntimeProfile(third, targetKind, context));
     }
-    assertSystemAdministrator(context);
+    if (!canManageDevelopmentRuntimeProfiles(context)) {
+      assertSystemAdministrator(context);
+    }
     if (!third && req.method === 'POST') {
       assertCsrf(req);
-      const profile = normalizeRuntimeProfileInput(body.data || body, context);
-      if (store.runtimeProfiles.some(item => item.applicationId === profile.applicationId && item.origin === profile.origin && item.kind === profile.kind && item.enabled !== false)) {
-        throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project, origin, and kind already exists.', 409);
+      const rawInput = body.data || body || {};
+      const input = runtimeProfileMutationInput(rawInput, context);
+      const batchRequested = Array.isArray(rawInput.origins)
+        || Array.isArray(rawInput.applicationIds)
+        || String(rawInput.applicationId || '') === 'ALL'
+        || (typeof rawInput.origin === 'string' && /[\n,]/.test(rawInput.origin));
+      const result = createRuntimeProfilesFromInput(input, context);
+      if (!batchRequested && result.created.length === 1 && result.skipped.length === 0) {
+        return safeClone(result.created[0]);
       }
-      store.runtimeProfiles.unshift(profile);
-      audit('RUNTIME_PROFILE_CREATED', context, { profileId: profile.id, applicationId: profile.applicationId, origin: profile.origin });
-      saveStore(store);
-      return safeClone(runtimeProfileView(profile));
+      return safeClone(result);
     }
     const profile = store.runtimeProfiles.find(item => item.id === String(third));
     if (!profile) throw new ApiConsoleError('RUNTIME_PROFILE_NOT_FOUND', 'Runtime Profile was not found.', 404);
     assertRuntimeProjectAccess(profile.applicationId, context);
     if (!fourth && req.method === 'PUT') {
       assertCsrf(req);
+      assertCanManageRuntimeProfile(context, profile.kind);
       if (body.rowVersion && body.rowVersion !== profile.rowVersion) throw new ApiConsoleError('RUNTIME_PROFILE_CONFLICT', 'Runtime Profile changed in another session.', 409);
-      const next = normalizeRuntimeProfileInput(body.data || body, context, profile);
+      const input = runtimeProfileMutationInput(body.data || body, context, profile);
+      const next = normalizeRuntimeProfileInput(input, context, profile);
       if (store.runtimeProfiles.some(item => item.id !== next.id && item.applicationId === next.applicationId && item.origin === next.origin && item.kind === next.kind && item.enabled !== false)) {
         throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project, origin, and kind already exists.', 409);
       }
@@ -6995,6 +7154,7 @@ async function routeRequest(req, parsedUrl, body) {
       return safeClone(runtimeProfileView(next));
     }
     if (!fourth && req.method === 'DELETE') {
+      assertSystemAdministrator(context);
       assertCsrf(req);
       profile.enabled = false;
       profile.disabledAt = nowIso();
@@ -7008,6 +7168,7 @@ async function routeRequest(req, parsedUrl, body) {
     }
     if (fourth === 'validate' && req.method === 'POST') {
       assertCsrf(req);
+      assertCanManageRuntimeProfile(context, profile.kind);
       const validation = await validateRuntimeOrigin(profile.origin);
       profile.lastValidatedAt = nowIso();
       profile.lastValidation = { valid: true, addresses: validation.addresses, checkedAt: profile.lastValidatedAt };

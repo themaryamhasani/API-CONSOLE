@@ -68,7 +68,7 @@ npm run cli:run -w @api-console/api -- --collection <id> --cookie "api_console_s
 
 ## Runtime discovery (summary)
 
-Control-plane login is CDE; project APIs execute through administrator-approved **Runtime Profiles**. Details: [docs/OPENAPI.md](docs/OPENAPI.md), [docs/ONLINE_API_CONSOLE.md](docs/ONLINE_API_CONSOLE.md).
+Control-plane login is CDE; project APIs execute through **Runtime Profiles**. System Admins and Tech Leads can provision one or more allowlisted Development origins (including the `/devlogin` target) for one, several, or all accessible systems. Developers can select and use provisioned origins but cannot manage them. Protected environments and Data Service settings remain administrator-controlled. Details: [docs/OPENAPI.md](docs/OPENAPI.md), [docs/ONLINE_API_CONSOLE.md](docs/ONLINE_API_CONSOLE.md).
 
 ## Docs
 

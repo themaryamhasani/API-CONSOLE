@@ -25,7 +25,7 @@ function contextHeader({ userId, phoneNumber, fullName, role }) {
   return Buffer.from(JSON.stringify(context), 'utf8').toString('base64');
 }
 
-test('Environment CRUD supports create clone archive and protects production', async t => {
+test('Environment CRUD is hidden from developers, allows environment managers, and protects production', async t => {
   const server = createServer();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => {
@@ -44,6 +44,12 @@ test('Environment CRUD supports create clone archive and protects production', a
     phoneNumber: '9222222222',
     fullName: 'Developer',
     role: 'DEVELOPER',
+  });
+  const techLeadHeader = contextHeader({
+    userId: 'cde-tech-lead',
+    phoneNumber: '9333333333',
+    fullName: 'Tech Lead',
+    role: 'TECH_LEAD',
   });
 
   let response = await fetch(`${baseUrl}/environments`, {
@@ -68,6 +74,23 @@ test('Environment CRUD supports create clone archive and protects production', a
       },
     }),
   });
+  assert.equal(response.status, 403);
+
+  response = await fetch(`${baseUrl}/environments`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-console-context': techLeadHeader,
+    },
+    body: JSON.stringify({
+      data: {
+        name: 'Local Staging',
+        kind: 'CUSTOM',
+        baseUrl: 'https://staging.example.com',
+        variables: [{ key: 'baseUrl', currentValue: 'https://staging.example.com', sensitive: false }],
+      },
+    }),
+  });
   assert.equal(response.status, 200);
   const created = await response.json();
   assert.equal(created.name, 'Local Staging');
@@ -76,7 +99,7 @@ test('Environment CRUD supports create clone archive and protects production', a
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-console-context': developerHeader,
+      'x-api-console-context': techLeadHeader,
     },
     body: JSON.stringify({}),
   });
@@ -117,6 +140,16 @@ test('Environment CRUD supports create clone archive and protects production', a
     headers: {
       'content-type': 'application/json',
       'x-api-console-context': developerHeader,
+    },
+    body: JSON.stringify({}),
+  });
+  assert.equal(response.status, 403);
+
+  response = await fetch(`${baseUrl}/environments/${cloned.id}`, {
+    method: 'DELETE',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-console-context': techLeadHeader,
     },
     body: JSON.stringify({}),
   });

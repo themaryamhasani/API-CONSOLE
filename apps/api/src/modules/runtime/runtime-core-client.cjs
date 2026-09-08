@@ -53,7 +53,7 @@ function normalizePath(value, fallback) {
 }
 
 function originAllowlist() {
-  return String(process.env.RUNTIME_ORIGIN_ALLOWLIST || '*.m.edus.ir')
+  return String(process.env.RUNTIME_ORIGIN_ALLOWLIST || '*.m.edus.ir,*.medu.ir')
     .split(',')
     .map(item => item.trim().toLowerCase())
     .filter(Boolean);

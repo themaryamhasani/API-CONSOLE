@@ -1343,7 +1343,7 @@ export const OnlineApiConsolePage: React.FC = () => {
   const isSystemAdmin = role === 'SYSTEM_ADMIN';
 
   const canManageProtectedEnvironments = !!role && (role === 'SYSTEM_ADMIN' || policy.canManageProtectedEnvironments.includes(role));
-  const canManageEnvironments = canEdit;
+  const canManageEnvironments = !!role && (role === 'SYSTEM_ADMIN' || policy.canManageEnvironments.includes(role));
 
   const navGroups = useMemo(
     () => buildWorkspaceNav({
@@ -4137,7 +4137,7 @@ export const OnlineApiConsolePage: React.FC = () => {
                         {' · '}
                         path={selectedRequest.isGatewayBinding?.gatewayPath || selectedRequest.urlTemplate || '—'}
                         {' · '}
-                        source={selectedRequest.isGatewayBinding?.sourceKind || selectedRequest.sourceSync?.sourceKind || 'SPEC_SERVICE'}
+                        source={selectedRequest.isGatewayBinding?.sourceKind || 'SPEC_SERVICE'}
                       </div>
                       {(selectedRequest.isGatewayBinding?.specFolder || selectedRequest.isGatewayBinding?.controllerName) ? (
                         <div className="mt-1 font-mono text-[11px] text-emerald-800/80" dir="ltr">

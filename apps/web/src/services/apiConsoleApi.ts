@@ -68,6 +68,8 @@ const API_CONSOLE_POLICY: ApiConsolePermissionPolicy = {
   canReviewShares: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
   canViewUsageReports: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
   canManageUsers: ['SYSTEM_ADMIN'],
+  canManageDevelopmentRuntimeProfiles: ['SYSTEM_ADMIN', 'TECH_LEAD'],
+  canManageEnvironments: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
   canManageProtectedEnvironments: ['SYSTEM_ADMIN', 'TECH_LEAD', 'QA_LEAD'],
 };
 
@@ -494,7 +496,10 @@ export const apiConsoleApi = {
     return requestJson(withQuery('/runtime-profiles', { applicationId }), { context });
   },
 
-  createRuntimeProfile(data: RuntimeProfileInput, context: ActiveContext): Promise<RuntimeProfile> {
+  createRuntimeProfile(
+    data: RuntimeProfileInput & { origins?: string[]; applicationIds?: string[] },
+    context: ActiveContext,
+  ): Promise<RuntimeProfile | { created: RuntimeProfile[]; skipped: Array<{ applicationId: string; origin: string; kind: string }>; profiles: RuntimeProfile[] }> {
     return requestJson('/admin/runtime-profiles', { method: 'POST', context, body: { data } });
   },
 

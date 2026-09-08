@@ -145,6 +145,8 @@ test('generated Swagger can recover the connected Runtime login for the same use
 });
 
 test('runtime origin validation blocks private DNS answers and credentials', async () => {
+  const meduOrigin = await validateRuntimeOrigin('https://soha.medu.ir', { lookup: publicLookup });
+  assert.equal(meduOrigin.origin, 'https://soha.medu.ir');
   await assert.rejects(
     () => validateRuntimeOrigin('https://soha.m.edus.ir', { lookup: async () => [{ address: '127.0.0.1', family: 4 }] }),
     error => error.category === 'RUNTIME_SSRF_BLOCKED'
@@ -269,16 +271,20 @@ test('three-way discovery merge preserves local edits and reports a source confl
   assert.match(merged.bodyTemplate, /"page": 2/);
 });
 
-test('Runtime Profile HTTP API is admin-only and never returns or stores plaintext auth secrets', async t => {
+test('Runtime Profile HTTP API lets authorized Runtime roles manage Development origins without exposing protected settings or plaintext secrets', async t => {
   const server = createServer();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const baseUrl = `http://127.0.0.1:${server.address().port}/api/api-console`;
   const context = role => Buffer.from(JSON.stringify({
-    userId: role === 'SYSTEM_ADMIN' ? 'admin-runtime' : 'developer-runtime',
-    user: { id: role === 'SYSTEM_ADMIN' ? 'admin-runtime' : 'developer-runtime', phoneNumber: '9100000000', fullName: role },
+    userId: role === 'SYSTEM_ADMIN' ? 'admin-runtime' : `${role.toLowerCase()}-runtime`,
+    user: { id: role === 'SYSTEM_ADMIN' ? 'admin-runtime' : `${role.toLowerCase()}-runtime`, phoneNumber: '9100000000', fullName: role },
     applicationId: 'community',
-    scopeApplicationIds: ['community'],
+    scopeApplicationIds: ['community', 'portal'],
+    applications: [
+      { id: 'community', name: 'community', code: 'community', isActive: true },
+      { id: 'portal', name: 'portal', code: 'portal', isActive: true },
+    ],
     role,
     scope: 'SYSTEMS',
   }), 'utf8').toString('base64');
@@ -365,9 +371,130 @@ test('Runtime Profile HTTP API is admin-only and never returns or stores plainte
   assert.equal(created.dataService.authSecretRef, undefined);
   assert.doesNotMatch(JSON.stringify(created), new RegExp(secret));
 
+  const developerHeaders = {
+    'content-type': 'application/json',
+    'x-api-console-context': context('DEVELOPER'),
+    'x-csrf-token': session.csrfToken,
+    cookie,
+  };
+  response = await fetch(`${baseUrl}/admin/runtime-profiles`, {
+    method: 'POST',
+    headers: developerHeaders,
+    body: JSON.stringify({ data: {
+      applicationId: 'community',
+      projectKey: 'community',
+      name: 'community Development (tika.m.edus.ir)',
+      kind: 'DEVELOPMENT',
+      origin: 'https://tika.m.edus.ir',
+    } }),
+  });
+  assert.equal(response.status, 403, 'DEVELOPER cannot provision Runtime origins');
+
+  const techLeadHeaders = {
+    'content-type': 'application/json',
+    'x-api-console-context': context('TECH_LEAD'),
+    'x-csrf-token': session.csrfToken,
+    cookie,
+  };
+  response = await fetch(`${baseUrl}/admin/runtime-profiles`, {
+    method: 'POST',
+    headers: techLeadHeaders,
+    body: JSON.stringify({ data: {
+      applicationId: 'community',
+      projectKey: 'community',
+      name: 'community Development (tika.m.edus.ir)',
+      kind: 'DEVELOPMENT',
+      origin: 'https://tika.m.edus.ir',
+    } }),
+  });
+  assert.equal(response.status, 200);
+  const techLeadCreated = await response.json();
+  assert.equal(techLeadCreated.kind, 'DEVELOPMENT');
+  assert.equal(techLeadCreated.runtimeServiceId, 'tika.m.edus.ir');
+  assert.equal(techLeadCreated.loginPath, '/devlogin');
+
+  response = await fetch(`${baseUrl}/admin/runtime-profiles/${encodeURIComponent(techLeadCreated.id)}`, {
+    method: 'PUT',
+    headers: techLeadHeaders,
+    body: JSON.stringify({
+      data: {
+        applicationId: 'community',
+        projectKey: 'community',
+        name: 'community Development (soha.medu.ir)',
+        kind: 'DEVELOPMENT',
+        origin: 'https://soha.medu.ir',
+        rowVersion: techLeadCreated.rowVersion,
+      },
+      rowVersion: techLeadCreated.rowVersion,
+    }),
+  });
+  assert.equal(response.status, 200);
+  const techLeadUpdated = await response.json();
+  assert.equal(techLeadUpdated.origin, 'https://soha.medu.ir');
+  assert.equal(techLeadUpdated.runtimeServiceId, 'soha.medu.ir');
+
+  response = await fetch(`${baseUrl}/admin/runtime-profiles`, {
+    method: 'POST',
+    headers: techLeadHeaders,
+    body: JSON.stringify({ data: {
+      applicationIds: ['community', 'portal'],
+      origins: ['https://adib-2.m.edus.ir', 'https://tika-2.m.edus.ir'],
+      kind: 'DEVELOPMENT',
+    } }),
+  });
+  assert.equal(response.status, 200);
+  const batch = await response.json();
+  assert.equal(batch.created.length, 4);
+  assert.equal(batch.skipped.length, 0);
+  assert.ok(batch.created.every(item => item.kind === 'DEVELOPMENT'));
+  assert.deepEqual(
+    batch.created.map(item => `${item.applicationId}|${item.origin}`).sort(),
+    [
+      'community|https://adib-2.m.edus.ir',
+      'community|https://tika-2.m.edus.ir',
+      'portal|https://adib-2.m.edus.ir',
+      'portal|https://tika-2.m.edus.ir',
+    ].sort(),
+  );
+
+  response = await fetch(`${baseUrl}/admin/runtime-profiles`, {
+    method: 'POST',
+    headers: developerHeaders,
+    body: JSON.stringify({ data: {
+      applicationId: 'community',
+      kind: 'PRODUCTION',
+      origin: 'https://production.m.edus.ir',
+    } }),
+  });
+  assert.equal(response.status, 403);
+
+  response = await fetch(`${baseUrl}/admin/runtime-profiles/${encodeURIComponent(techLeadUpdated.id)}`, {
+    method: 'PUT',
+    headers: techLeadHeaders,
+    body: JSON.stringify({
+      data: {
+        applicationId: 'community',
+        projectKey: 'community',
+        name: techLeadUpdated.name,
+        kind: 'DEVELOPMENT',
+        origin: techLeadUpdated.origin,
+        dataService: { baseUrl: 'https://data.m.edus.ir/api', authMode: 'NONE' },
+      },
+      rowVersion: techLeadUpdated.rowVersion,
+    }),
+  });
+  assert.equal(response.status, 403);
+
+  response = await fetch(`${baseUrl}/admin/runtime-profiles/${encodeURIComponent(techLeadUpdated.id)}`, {
+    method: 'DELETE',
+    headers: techLeadHeaders,
+    body: JSON.stringify({}),
+  });
+  assert.equal(response.status, 403);
+
   response = await fetch(`${baseUrl}/runtime-profiles?applicationId=community`, { headers: { 'x-api-console-context': context('DEVELOPER') } });
   assert.equal(response.status, 200);
-  assert.equal((await response.json()).length, 2);
+  assert.equal((await response.json()).length, 5);
 
   response = await fetch(`${baseUrl}/admin/runtime-profiles`, {
     method: 'POST',

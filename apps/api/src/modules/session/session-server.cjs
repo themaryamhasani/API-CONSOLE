@@ -358,7 +358,11 @@ function buildConsoleContext(session) {
     isActive: true,
   };
   const managedScope = resolveManagedScopeApplicationIds(session.userLoginName, session.userId);
-  const scopeApplicationIds = managedScope?.length ? managedScope : [applicationId];
+  // Unrestricted users keep the full session project list in scope so Tech Lead / Admin
+  // can provision Runtime origins across one, several, or all accessible systems.
+  const scopeApplicationIds = managedScope?.length
+    ? managedScope
+    : projects.map(projectKey => String(projectKey)).filter(Boolean);
   const prefix = authApproach === 'IS' ? 'is' : authApproach === 'LOCAL' ? 'local' : 'cde';
   return {
     contextId: `${prefix}:${session.id}`,

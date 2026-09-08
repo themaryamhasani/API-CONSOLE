@@ -9,6 +9,7 @@ const testDataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'api-console-run
 process.env.NODE_ENV = 'test';
 process.env.API_CONSOLE_DATA_DIR = testDataDirectory;
 process.env.API_CONSOLE_REQUIRE_CSRF = 'true';
+process.env.API_CONSOLE_ALLOW_LEGACY_CONTEXT = 'true';
 
 const {
   executeCoreOperation,
@@ -19,6 +20,12 @@ const {
   validateRuntimeOrigin,
 } = require('../src/modules/runtime/runtime-core-client.cjs');
 const { discoverProjectSources } = require('../src/modules/cde/api-discovery.cjs');
+const {
+  deleteAllRuntimeSessions,
+  findConnectedRuntimeSession,
+  getRuntimeSession,
+  setRuntimeSession,
+} = require('../src/modules/runtime/runtime-session-store.cjs');
 const {
   buildRuntimeCurlExport,
   buildRuntimePostmanCollection,
@@ -111,6 +118,30 @@ test('runtime login honors nextStep, locks host serviceId, rotates cookies, and 
   assert.equal(calls[5].payload.formId, 'community/set-role');
   assert.equal(calls[5].init.headers.prostage, 'develop');
   assert.equal(calls[5].init.headers.referer, 'https://soha.m.edus.ir/community');
+});
+
+test('generated Swagger can recover the connected Runtime login for the same user and profile', async t => {
+  const ownerSessionId = 'console-session-owner';
+  const swaggerSessionId = 'console-session-swagger';
+  t.after(async () => {
+    await deleteAllRuntimeSessions(ownerSessionId);
+    await deleteAllRuntimeSessions(swaggerSessionId);
+  });
+  const state = {
+    profileId: profile.id,
+    phase: 'CONNECTED',
+    loginName: '09100000000',
+    clientId: 'runtime-client',
+    cookieJar: '{}',
+    connectedAt: '2026-09-08T10:00:00.000Z',
+  };
+  await setRuntimeSession(ownerSessionId, profile.id, state);
+
+  assert.equal(await getRuntimeSession(swaggerSessionId, profile.id), null);
+  assert.equal(await findConnectedRuntimeSession(profile.id, '09111111111', swaggerSessionId), null);
+  const recovered = await findConnectedRuntimeSession(profile.id, '+98 910 000 0000', swaggerSessionId);
+  assert.equal(recovered?.appSessionId, ownerSessionId);
+  assert.deepEqual(recovered?.state, state);
 });
 
 test('runtime origin validation blocks private DNS answers and credentials', async () => {
@@ -212,6 +243,9 @@ test('runtime OpenAPI, Postman, and cURL outputs contain bindings and placeholde
 
   const openapi = runtimeOpenApiDocument('community', profile, snapshot);
   assert.ok(openapi.paths['/api/api-console/runtime/operations/op-query/execute']);
+  assert.equal(openapi.paths['/api/api-console/runtime/operations/op-query/execute'].post.parameters, undefined);
+  assert.equal(openapi.components.securitySchemes.csrfToken.name, 'x-csrf-token');
+  assert.deepEqual(openapi.paths['/api/api-console/runtime/operations/op-query/execute'].post.security, [{ appSession: [], csrfToken: [] }]);
   assert.equal(JSON.stringify(openapi).includes('/core-api/v1/data-provider/get-data-source'), false);
 });
 

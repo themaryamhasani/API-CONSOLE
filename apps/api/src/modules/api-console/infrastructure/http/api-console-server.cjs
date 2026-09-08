@@ -35,6 +35,7 @@ const {
 } = require('../../../runtime/runtime-core-client.cjs');
 const {
   deleteRuntimeSession,
+  findConnectedRuntimeSession,
   getRuntimeSession,
   setRuntimeSession,
 } = require('../../../runtime/runtime-session-store.cjs');
@@ -6016,7 +6017,16 @@ async function executeRuntimeDiscoveredOperation(req, operationId, body, context
     }
   } else {
     const { appSession, phone } = runtimeSessionIdentity(req, context);
-    const state = await getRuntimeSession(appSession.id, profile.id);
+    let state = await getRuntimeSession(appSession.id, profile.id);
+    if (!state || state.phase !== 'CONNECTED' || normalizeCdeLoginName(state.loginName) !== phone) {
+      const recovered = await findConnectedRuntimeSession(profile.id, phone, appSession.id);
+      if (recovered) {
+        state = recovered.state;
+        // Rebind the encrypted Runtime state to the app session used by this
+        // request so subsequent Swagger calls take the normal direct path.
+        await setRuntimeSession(appSession.id, profile.id, state);
+      }
+    }
     if (!state || state.phase !== 'CONNECTED' || normalizeCdeLoginName(state.loginName) !== phone) {
       throw new ApiConsoleError('RUNTIME_SESSION_REQUIRED', 'Connect this Runtime Profile with the same CDE cellphone before execution.', 401);
     }
@@ -6082,7 +6092,6 @@ function runtimeOpenApiDocument(projectKey, profile, snapshot) {
         operationId: `execute_${operation.id.replace(/[^a-zA-Z0-9_]/g, '_')}`,
         summary: operation.name || operation.sourceId,
         description: `${operation.sourceKind} ${operation.sourceId}. Credentials and Runtime cookies are injected only by the API Console backend.`,
-        parameters: [{ name: 'x-csrf-token', in: 'header', required: true, schema: { type: 'string' }, description: 'API Console CSRF token; the generated docs fill this automatically.' }],
         requestBody: {
           required: true,
           content: {
@@ -6112,7 +6121,7 @@ function runtimeOpenApiDocument(projectKey, profile, snapshot) {
           403: { description: 'Role, CSRF, or environment policy rejected the operation' },
           409: { description: 'Profile configuration, confirmation, or Data Service credentials are incomplete' },
         },
-        security: [{ appSession: [] }],
+        security: [{ appSession: [], csrfToken: [] }],
         'x-runtime-binding': { profileId: profile.id, projectKey, operationId: operation.id, sourceFingerprint: operation.sourceFingerprint },
       },
     };
@@ -6123,7 +6132,12 @@ function runtimeOpenApiDocument(projectKey, profile, snapshot) {
     servers: [{ url: '/' }],
     tags: [{ name: 'Core Queries' }, { name: 'Core Commands' }, { name: 'Data Service' }],
     paths,
-    components: { securitySchemes: { appSession: { type: 'apiKey', in: 'cookie', name: process.env.API_CONSOLE_SESSION_COOKIE || 'api_console_session' } } },
+    components: {
+      securitySchemes: {
+        appSession: { type: 'apiKey', in: 'cookie', name: process.env.API_CONSOLE_SESSION_COOKIE || 'api_console_session' },
+        csrfToken: { type: 'apiKey', in: 'header', name: 'x-csrf-token', description: 'Injected automatically from the active API Console session.' },
+      },
+    },
   };
 }
 
@@ -6135,7 +6149,7 @@ function runtimeDocsHtml(projectKey, profile) {
 <body><div id="swagger-ui"></div><script src="/api/docs/swagger-ui-bundle.js"></script><script src="/api/docs/swagger-ui-standalone-preset.js"></script>
 <script>(async function(){
   const session = await fetch('/api/session',{credentials:'same-origin'}).then(r=>r.json());
-  window.ui=SwaggerUIBundle({url:${JSON.stringify(specUrl).replace(/</g, '\\u003c')},dom_id:'#swagger-ui',presets:[SwaggerUIBundle.presets.apis,SwaggerUIStandalonePreset],layout:'StandaloneLayout',requestInterceptor:function(request){request.credentials='same-origin';request.headers=request.headers||{};request.headers['x-csrf-token']=session.csrfToken||'';return request;}});
+  window.ui=SwaggerUIBundle({url:${JSON.stringify(specUrl).replace(/</g, '\\u003c')},dom_id:'#swagger-ui',presets:[SwaggerUIBundle.presets.apis,SwaggerUIStandalonePreset],layout:'StandaloneLayout',persistAuthorization:true,requestInterceptor:function(request){request.credentials='same-origin';request.headers=request.headers||{};request.headers['x-csrf-token']=session.csrfToken||'';return request;},onComplete:function(){if(session.csrfToken)window.ui.preauthorizeApiKey('csrfToken',session.csrfToken);}});
 })().catch(function(error){document.body.textContent='Swagger initialization failed: '+error.message;});</script></body></html>`;
 }
 

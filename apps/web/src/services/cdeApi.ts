@@ -131,6 +131,13 @@ export const sessionApi = {
     activeContext: import('../types').ActiveContext | null;
     applicationId: string | null;
     projects: string[];
+    workspaceAccess?: {
+      allowed: boolean;
+      requiredWorkspaces: string[];
+      grantedWorkspaces: string[];
+      mode?: string;
+    } | null;
+    user?: { id?: string; displayName?: string; phoneNumber?: string } | null;
   }>('/api/session'),
   selectContext: (projectKey: string, projects?: string[]) =>
     request<{ activeContext: import('../types').ActiveContext; csrfToken: string; authApproach?: string | null }>('/api/session/context', {
@@ -148,6 +155,33 @@ export const sessionApi = {
 
 export const cdeApi = {
   status: () => request<CdeConnectionStatus>('/api/cde/session'),
+  ssoConfig: () => request<{
+    enabled: boolean;
+    mode: string;
+    originId: string;
+    originUrl: string;
+    loginUrl: string;
+    returnUrl: string;
+    sameSiteEligible: boolean;
+    cookieForwardAvailable: boolean;
+    openInNewTab?: boolean;
+    messageFa?: string;
+  }>('/api/cde/sso/config'),
+  ssoProbe: () => request<{
+    connected: boolean;
+    reason?: string;
+    message?: string;
+    csrfToken?: string;
+    user?: CdeConnectionStatus['user'];
+    projects?: string[];
+    workspaceAccess?: {
+      allowed: boolean;
+      requiredWorkspaces: string[];
+      grantedWorkspaces: string[];
+      mode?: string;
+    };
+    config?: unknown;
+  }>('/api/cde/session/sso', { method: 'POST', body: '{}' }),
   startLogin: (userLoginName: string) => request<CdeConnectionStatus>('/api/cde/session/start', {
     method: 'POST', body: JSON.stringify({ userLoginName }),
   }),

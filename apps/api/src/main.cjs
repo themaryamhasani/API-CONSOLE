@@ -20,7 +20,7 @@ const {
 
 loadDotEnv();
 
-const { createServer } = require('./modules/api-console/infrastructure/http/api-console-server.cjs');
+const { createServer, initializeStore, STORE_BACKEND } = require('./modules/api-console/infrastructure/http/api-console-server.cjs');
 const { assertProductionSecrets } = require('./modules/api-console/infrastructure/security/production-secrets.cjs');
 
 if (!process.env.NODE_ENV) process.env.NODE_ENV = 'development';
@@ -43,6 +43,9 @@ function listenOnPort(server, port) {
 }
 
 async function listenWithFallback() {
+  await initializeStore();
+  console.log(`[store] backend=${STORE_BACKEND} ready`);
+
   const preferred = preferredApiPort();
   const webPreferred = preferredWebPort();
   if (!process.env.API_CONSOLE_CORS_ORIGIN) {

@@ -21,6 +21,12 @@ const secretMaterial = createHash('sha256')
 
 const memoryStore = new Map();
 let redis;
+/** Injected directory provider — prefers in-memory store over JSON file. */
+let directoryProvider = null;
+
+function registerDirectoryProvider(provider) {
+  directoryProvider = typeof provider === 'function' ? provider : null;
+}
 
 class SessionError extends Error {
   constructor(category, message, statusCode = 401) {
@@ -64,8 +70,16 @@ function appendSetCookie(res, value) {
   res.setHeader('set-cookie', [...list, value]);
 }
 
-function cookieOptions(maxAgeSeconds) {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+function cookieSecureEnabled(env = process.env) {
+  if (String(env.API_CONSOLE_COOKIE_SECURE || '').trim().toLowerCase() === 'true') return true;
+  if (String(env.NODE_ENV || '') === 'production') return true;
+  const publicUrl = String(env.API_CONSOLE_PUBLIC_URL || '').trim();
+  const corsOrigin = String(env.API_CONSOLE_CORS_ORIGIN || '').trim();
+  return /^https:\/\//i.test(publicUrl) || /^https:\/\//i.test(corsOrigin);
+}
+
+function cookieOptions(maxAgeSeconds, env = process.env) {
+  const secure = cookieSecureEnabled(env) ? '; Secure' : '';
   return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`;
 }
 
@@ -117,6 +131,14 @@ function loginListIncludes(value, login) {
 }
 
 function readDirectoryStore() {
+  if (typeof directoryProvider === 'function') {
+    try {
+      const provided = directoryProvider();
+      if (provided && typeof provided === 'object') return provided;
+    } catch {
+      // fall through to file
+    }
+  }
   try {
     if (!fs.existsSync(DIRECTORY_STORE_FILE)) return null;
     const parsed = JSON.parse(fs.readFileSync(DIRECTORY_STORE_FILE, 'utf8'));
@@ -341,13 +363,37 @@ function buildApplication(projectKey) {
 function buildConsoleContext(session) {
   if (!isSessionAuthenticated(session)) return null;
   const authApproach = session.authApproach || (session.cdeConnected ? 'CDE' : null);
-  const applicationId = session.applicationId || (session.projects?.[0] || null);
-  if (!applicationId) return null;
-  const application = buildApplication(applicationId);
-  const projects = Array.isArray(session.projects) && session.projects.length
-    ? session.projects
-    : [applicationId];
-  const applications = projects.map(buildApplication);
+  let projects = Array.isArray(session.projects) && session.projects.length
+    ? session.projects.map(String)
+    : [];
+
+  // Workspace gate — CDE users must hold required workspaces (default: medu-ai)
+  let workspaceAccess = null;
+  if (authApproach === 'CDE') {
+    try {
+      const {
+        evaluateWorkspaceAccess,
+        filterProjectsByPolicy,
+      } = require('../access/workspace-access.cjs');
+      workspaceAccess = evaluateWorkspaceAccess(projects);
+      if (!workspaceAccess.allowed) return null;
+      projects = filterProjectsByPolicy(projects);
+      if (!projects.length) return null;
+    } catch {
+      return null;
+    }
+  }
+
+  const applicationId = session.applicationId && projects.includes(String(session.applicationId))
+    ? session.applicationId
+    : (projects[0] || null);
+  if (!applicationId && authApproach === 'CDE') return null;
+  if (!applicationId && authApproach !== 'IS' && authApproach !== 'LOCAL') return null;
+  const effectiveApplicationId = applicationId || (authApproach === 'IS' || authApproach === 'LOCAL' ? (session.applicationId || 'PERSONAL') : null);
+  if (!effectiveApplicationId) return null;
+
+  const application = buildApplication(effectiveApplicationId);
+  const applications = (projects.length ? projects : [effectiveApplicationId]).map(buildApplication);
   const user = {
     id: session.userId,
     firstName: session.firstName || '',
@@ -362,15 +408,15 @@ function buildConsoleContext(session) {
   // can provision Runtime origins across one, several, or all accessible systems.
   const scopeApplicationIds = managedScope?.length
     ? managedScope
-    : projects.map(projectKey => String(projectKey)).filter(Boolean);
+    : applications.map(app => String(app.id)).filter(Boolean);
   const prefix = authApproach === 'IS' ? 'is' : authApproach === 'LOCAL' ? 'local' : 'cde';
   return {
     contextId: `${prefix}:${session.id}`,
     userId: session.userId,
     user,
-    assignmentId: `${prefix}:${session.userId}:${applicationId}`,
-    assignmentIds: [`${prefix}:${session.userId}:${applicationId}`],
-    applicationId,
+    assignmentId: `${prefix}:${session.userId}:${effectiveApplicationId}`,
+    assignmentIds: [`${prefix}:${session.userId}:${effectiveApplicationId}`],
+    applicationId: effectiveApplicationId,
     scopeApplicationIds,
     application,
     applications,
@@ -386,6 +432,7 @@ function buildConsoleContext(session) {
     isGatewayBaseUrl: authApproach === 'IS' ? session.isGatewayBaseUrl || undefined : undefined,
     // Server-only; used to forward Gateway session on IS executions (never expose in UI APIs).
     isGatewayCookie: authApproach === 'IS' ? session.isGatewayCookie || undefined : undefined,
+    workspaceAccess: workspaceAccess || undefined,
   };
 }
 
@@ -462,9 +509,17 @@ async function markIsDisconnected(session) {
 
 async function setSelectedProject(session, projectKey, projects = []) {
   session.applicationId = String(projectKey);
-  if (Array.isArray(projects) && projects.length) {
+  // CDE membership is server-discovered only — never trust client-supplied project lists
+  // (forging `medu-ai` here used to bypass the workspace gate after a denied login).
+  if (session.authApproach === 'CDE') {
+    const known = Array.isArray(session.projects) ? session.projects.map(String) : [];
+    if (known.length && !known.includes(String(projectKey))) {
+      throw new SessionError('CDE_PROJECT_ACCESS_DENIED', 'Selected project is not in the server-verified CDE project list.', 403);
+    }
+    // Keep existing server list; do not merge body.projects from the client.
+  } else if (Array.isArray(projects) && projects.length) {
     session.projects = projects.map(String);
-  } else if (!session.projects.includes(String(projectKey))) {
+  } else if (!Array.isArray(session.projects) || !session.projects.includes(String(projectKey))) {
     session.projects = [...(session.projects || []), String(projectKey)];
   }
   await saveSession(session);
@@ -481,6 +536,24 @@ async function handleSession(req, parsedUrl, body, res) {
   if (pathname === '/api/session' && req.method === 'GET') {
     const context = buildConsoleContext(session);
     const authApproach = session.authApproach || (session.cdeConnected ? 'CDE' : null);
+    let workspaceAccess = null;
+    if (authApproach === 'CDE' && Array.isArray(session.projects)) {
+      try {
+        const { evaluateWorkspaceAccess } = require('../access/workspace-access.cjs');
+        workspaceAccess = evaluateWorkspaceAccess(session.projects);
+      } catch {
+        workspaceAccess = null;
+      }
+    } else if (session.workspaceDenial) {
+      const denial = session.workspaceDenial;
+      workspaceAccess = {
+        allowed: false,
+        requiredWorkspaces: denial.requiredWorkspaces || ['medu-ai'],
+        grantedWorkspaces: [],
+        discoveredProjects: denial.discoveredProjects || [],
+        mode: 'GATE_ONLY',
+      };
+    }
     return {
       authenticated: Boolean(isSessionAuthenticated(session) && context),
       authApproach,
@@ -488,9 +561,14 @@ async function handleSession(req, parsedUrl, body, res) {
       isConnected: authApproach === 'IS',
       csrfToken: session.csrfToken,
       activeContext: publicConsoleContext(context),
-      user: context?.user || null,
+      user: context?.user || (session.userId ? {
+        id: session.userId,
+        displayName: session.displayName,
+        phoneNumber: session.userLoginName,
+      } : null),
       applicationId: session.applicationId,
       projects: session.projects || [],
+      workspaceAccess,
     };
   }
   if (pathname === '/api/session/context' && req.method === 'POST') {
@@ -500,12 +578,24 @@ async function handleSession(req, parsedUrl, body, res) {
     }
     const projectKey = String(body?.applicationId || body?.projectKey || '').trim();
     if (!projectKey) throw new SessionError('PROJECT_REQUIRED', 'projectKey is required.', 400);
-    await setSelectedProject(session, projectKey, body?.projects);
+    if (session.authApproach === 'CDE' || session.cdeConnected) {
+      const { assertWorkspaceAccess } = require('../access/workspace-access.cjs');
+      assertWorkspaceAccess(session.projects || []);
+      await setSelectedProject(session, projectKey);
+    } else {
+      await setSelectedProject(session, projectKey, body?.projects);
+    }
     const context = buildConsoleContext(session);
+    if ((session.authApproach === 'CDE' || session.cdeConnected) && !context) {
+      const { assertWorkspaceAccess } = require('../access/workspace-access.cjs');
+      assertWorkspaceAccess(session.projects || []);
+      throw new SessionError('SESSION_CONTEXT_MISSING', 'Workspace selection did not produce an active context.', 502);
+    }
     return {
       activeContext: publicConsoleContext(context),
       csrfToken: session.csrfToken,
       authApproach: session.authApproach || null,
+      workspaceAccess: context?.workspaceAccess || undefined,
     };
   }
   if (pathname === '/api/session/logout' && req.method === 'POST') {
@@ -598,6 +688,7 @@ async function listActiveSessions() {
 module.exports = {
   SessionError,
   COOKIE_NAME,
+  cookieSecureEnabled,
   // Legacy browser context headers are opt-in only (tests / emergency). Never enable in production.
   isLegacyContextEnabled() {
     return process.env.API_CONSOLE_ALLOW_LEGACY_CONTEXT === 'true'
@@ -631,4 +722,6 @@ module.exports = {
   saveSession,
   setSelectedProject,
   secretMaterial,
+  registerDirectoryProvider,
+  readDirectoryStore,
 };

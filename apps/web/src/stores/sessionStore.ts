@@ -4,6 +4,7 @@ import {
   cdeApi,
   sessionApi,
   setCsrfToken,
+  PlatformApiError,
   type CdeCatalog,
   type CdeConnectionStatus,
   type CdeProjectDescriptor,
@@ -12,6 +13,13 @@ import { isApi, type IsSystemDescriptor } from '../services/isApi';
 import { PERSONAL_APPLICATION_ID, PERSONAL_APPLICATION_LABEL } from '../types/apiConsole';
 
 export type AuthApproach = 'CDE' | 'IS' | 'LOCAL' | null;
+
+export type WorkspaceAccessState = {
+  allowed: boolean;
+  requiredWorkspaces: string[];
+  grantedWorkspaces: string[];
+  mode?: string;
+};
 
 function isSystemsToProjects(systems: IsSystemDescriptor[]): CdeProjectDescriptor[] {
   return systems.map(system => ({
@@ -57,8 +65,10 @@ type SessionState = {
   selectedProjectKey: string;
   catalog: CdeCatalog | null;
   error: string | null;
+  workspaceAccess: WorkspaceAccessState | null;
   bootstrap: () => Promise<void>;
   setActiveContext: (context: ActiveContext | null) => void;
+  setWorkspaceAccess: (access: WorkspaceAccessState | null) => void;
   refreshProjects: () => Promise<CdeProjectDescriptor[]>;
   selectProject: (projectKey: string) => Promise<void>;
   loadCatalog: (projectKey?: string) => Promise<CdeCatalog | null>;
@@ -81,14 +91,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   selectedProjectKey: '',
   catalog: null,
   error: null,
+  workspaceAccess: null,
 
   setActiveContext: (context) => set({ activeContext: context }),
+  setWorkspaceAccess: (access) => set({ workspaceAccess: access }),
 
   bootstrap: async () => {
     set({ loading: true, error: null });
     try {
       const session = await sessionApi.current();
       if (session.csrfToken) setCsrfToken(session.csrfToken);
+      if (session.workspaceAccess) set({ workspaceAccess: session.workspaceAccess });
       const authApproach = (session.authApproach || (session.cdeConnected ? 'CDE' : session.isConnected ? 'IS' : null)) as AuthApproach;
 
       if (authApproach === 'IS' || session.isConnected) {
@@ -122,6 +135,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           selectedProjectKey,
           activeContext,
           catalog: null,
+          workspaceAccess: { allowed: true, requiredWorkspaces: [], grantedWorkspaces: [] },
         });
         return;
       }
@@ -129,7 +143,40 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       let cdeStatus: CdeConnectionStatus | null = null;
       if (session.cdeConnected) {
         cdeStatus = await cdeApi.status();
+      } else if (!session.authenticated) {
+        // One SSO probe when not yet authenticated (same-site cookie forward)
+        try {
+          const config = await cdeApi.ssoConfig();
+          if (config.enabled && config.cookieForwardAvailable) {
+            const probe = await cdeApi.ssoProbe();
+            if (probe.csrfToken) setCsrfToken(probe.csrfToken);
+            if (probe.workspaceAccess) set({ workspaceAccess: probe.workspaceAccess });
+            if (probe.connected) {
+              cdeStatus = { connected: true, user: probe.user || null, csrfToken: probe.csrfToken };
+            }
+          }
+        } catch (error) {
+          if (error instanceof PlatformApiError && error.code === 'WORKSPACE_ACCESS_DENIED') {
+            const details = (error.details || {}) as WorkspaceAccessState;
+            set({
+              bootstrapped: true,
+              loading: false,
+              authenticated: false,
+              authApproach: 'CDE',
+              cdeConnected: true,
+              workspaceAccess: {
+                allowed: false,
+                requiredWorkspaces: details.requiredWorkspaces || ['medu-ai'],
+                grantedWorkspaces: details.grantedWorkspaces || [],
+                mode: details.mode,
+              },
+              activeContext: null,
+            });
+            return;
+          }
+        }
       }
+
       let projects: CdeProjectDescriptor[] = [];
       let selectedProjectKey = session.applicationId || '';
       let activeContext = session.activeContext;
@@ -267,6 +314,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       isSystems: [],
       selectedProjectKey: '',
       catalog: null,
+      workspaceAccess: null,
     });
   },
 
@@ -283,6 +331,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       isSystems: [],
       selectedProjectKey: '',
       catalog: null,
+      workspaceAccess: null,
     });
   },
 }));

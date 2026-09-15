@@ -8,14 +8,38 @@
 
 ## ورود
 
+### مسیر اصلی — SSO کوکی (same-site)
+
+وقتی کنسول زیر همان دامنه‌ی مادر CDE میزبانی شود (مثلاً `api-console.edus.ir`)، کوکی‌های مرورگر به بک‌اند می‌رسند و بدون فرم رمز، `who-am-i` زده می‌شود.
+
 ```mermaid
 sequenceDiagram
   actor U as کاربر
-  participant W as Web :5173
+  participant W as Web /login
+  participant C as CDE Bridge
+  participant CP as CDE Core
+  U->>W: باز کردن /
+  W->>C: POST /api/cde/session/sso
+  C->>CP: pages-app/who-am-i (cookie jar از مرورگر)
+  alt IsUserLogin
+    C->>CP: my-repo
+    C->>C: assertWorkspaceAccess(medu-ai)
+    W->>W: redirect به Console
+  else نشست نیست
+    W->>U: دکمه ورود از طریق CDE / فرم موبایل
+  end
+```
+
+### مسیر جایگزین — موبایل / رمز
+
+```mermaid
+sequenceDiagram
+  actor U as کاربر
+  participant W as Web
   participant S as Session API
   participant C as CDE Bridge
   participant CP as CDE Core
-  U->>W: باز کردن اپ
+  U->>W: باز کردن /login
   W->>C: GET /api/cde/origins
   U->>W: انتخاب origin + موبایل
   W->>C: POST /api/cde/session/start
@@ -23,6 +47,7 @@ sequenceDiagram
   U->>W: رمز CDE
   W->>C: POST /api/cde/session/password
   C->>CP: login + cookie jar
+  C->>C: assertWorkspaceAccess(medu-ai)
   C->>S: session authenticated + directory sync
   U->>W: انتخاب پروژه
   W->>S: POST /api/session/context
@@ -33,12 +58,21 @@ sequenceDiagram
 
 | مرحله | مسیر |
 | --- | --- |
+| SSO config | `GET /api/cde/sso/config` |
+| SSO probe | `POST /api/cde/session/sso` |
 | Origins | `GET /api/cde/origins` |
 | Start | `POST /api/cde/session/start` |
 | Password | `POST /api/cde/session/password` |
 | Projects | `GET /api/cde/projects` |
 | Context | `POST /api/session/context` |
+| Workspace gate | `API_CONSOLE_REQUIRED_WORKSPACES` (پیش‌فرض `medu-ai`) |
 | Bootstrap admins | `API_CONSOLE_ADMIN_LOGINS` / `API_CONSOLE_QA_LEAD_LOGINS` |
+
+### گیت ورک‌اسپیس
+
+فقط دارندگان project keyهای `API_CONSOLE_REQUIRED_WORKSPACES` (پیش‌فرض `medu-ai`) **وارد** کنسول می‌شوند. پیش‌فرض حالت `GATE_ONLY` است: عضویت فقط شرط ورود است و بعد از ورود همهٔ پروژه‌ها/سامانه‌های CDE قابل انتخاب‌اند. حالت `RESTRICT` فقط وقتی صریحاً ست شود لیست را به ورک‌اسپیس‌های allowlist محدود می‌کند. خطای استاندارد: `403 WORKSPACE_ACCESS_DENIED`.
+
+ورود با کوکی (SSO) فقط وقتی کنسول روی دامنهٔ مشترک با CDE باشد؛ روی localhost از شماره همراه و رمز استفاده کنید. UI می‌تواند پاپ‌آپ لاگین CDE را باز کند و سپس probe بزند.
 
 ## دو حالت کار بعد از ورود
 
@@ -68,7 +102,11 @@ flowchart TB
 
 ## فایل‌های مرجع
 
-- `apps/web/src/pages/CdeLoginPage.tsx`
-- `apps/api/src/modules/cde/`
+- `apps/web/src/pages/LandingPage.tsx` — SSO landing + probe
+- `apps/web/src/pages/WorkspaceDeniedPage.tsx` — خطای ورک‌اسپیس
+- `apps/web/src/pages/CdeLoginPage.tsx` — فرم موبایل/رمز (fallback)
+- `apps/api/src/modules/cde/` — bridge + `cde-sso.cjs`
+- `apps/api/src/modules/access/workspace-access.cjs` — گیت `medu-ai`
 - `apps/web/src/components/api-console/RuntimeWorkspace.tsx`
 - `docs/OPENAPI.md` — ds/fr mapping
+- `docs/persistence/POSTGRES.md` — اسکیماهای Postgres

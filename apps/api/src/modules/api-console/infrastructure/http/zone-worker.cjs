@@ -21,7 +21,7 @@ const { URL } = require('url');
 const REPOSITORY_ROOT = path.resolve(__dirname, '../../../../../../..');
 const resolveRepositoryPath = value => (path.isAbsolute(value) ? value : path.join(REPOSITORY_ROOT, value));
 const DATA_DIR = resolveRepositoryPath(process.env.API_CONSOLE_DATA_DIR || path.join('runtime', 'api-console'));
-const STORE_FILE = process.env.API_CONSOLE_STORE_FILE || path.join(DATA_DIR, 'api-console-store.json');
+const STORE_BACKEND = String(process.env.API_CONSOLE_STORE_BACKEND || 'FILE').trim().toUpperCase();
 const POLL_MS = Math.max(500, Number(process.env.API_CONSOLE_ZONE_WORKER_POLL_MS || 1500));
 const RUNNER_HOST = process.env.API_CONSOLE_RUNNER_HOST || os.hostname();
 
@@ -33,7 +33,16 @@ function makeId(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function loadStore() {
+let postgresHandle = null;
+
+async function loadStore() {
+  if (STORE_BACKEND === 'POSTGRES' || STORE_BACKEND === 'POSTGRESQL' || STORE_BACKEND === 'PG') {
+    if (!postgresHandle) {
+      const { createPostgresStore } = require('../persistence/postgres-store.cjs');
+      postgresHandle = createPostgresStore();
+    }
+    return postgresHandle.loadAsync();
+  }
   if (!fs.existsSync(STORE_FILE)) {
     return {
       executions: [],
@@ -44,7 +53,16 @@ function loadStore() {
   return JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
 }
 
-function saveStore(store) {
+async function saveStore(store) {
+  if (STORE_BACKEND === 'POSTGRES' || STORE_BACKEND === 'POSTGRESQL' || STORE_BACKEND === 'PG') {
+    if (!postgresHandle) {
+      const { createPostgresStore } = require('../persistence/postgres-store.cjs');
+      postgresHandle = createPostgresStore();
+    }
+    postgresHandle.save(store);
+    await postgresHandle.drain();
+    return;
+  }
   fs.mkdirSync(path.dirname(STORE_FILE), { recursive: true });
   const tmp = `${STORE_FILE}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8');
@@ -101,7 +119,7 @@ function executeTransport(transport) {
 }
 
 async function processQueueOnce() {
-  const store = loadStore();
+  const store = await loadStore();
   store.zoneWorkerHeartbeat = nowIso();
   if (!Array.isArray(store.executionQueue)) store.executionQueue = [];
   if (!Array.isArray(store.executions)) store.executions = [];
@@ -111,7 +129,7 @@ async function processQueueOnce() {
     job.status = 'RUNNING';
     job.claimedAt = nowIso();
     job.runnerHost = RUNNER_HOST;
-    saveStore(store);
+    await saveStore(store);
     try {
       const response = await executeTransport(job.transport || {});
       const execution = {
@@ -147,7 +165,7 @@ async function processQueueOnce() {
       store.executions.unshift(execution);
       store.executionQueue = store.executionQueue.filter(item => item.id !== job.id);
       store.zoneWorkerHeartbeat = nowIso();
-      saveStore(store);
+      await saveStore(store);
       console.log(`[zone-worker] completed ${job.id} -> ${execution.id} HTTP ${response.statusCode}`);
     } catch (error) {
       job.status = 'FAILED';
@@ -155,16 +173,16 @@ async function processQueueOnce() {
       job.errorMessage = error.message || 'Zone worker execution failed';
       job.failedAt = nowIso();
       store.zoneWorkerHeartbeat = nowIso();
-      saveStore(store);
+      await saveStore(store);
       console.error(`[zone-worker] failed ${job.id}: ${job.errorMessage}`);
     }
   }
 
-  if (!pending.length) saveStore(store);
+  if (!pending.length) await saveStore(store);
 }
 
 async function main() {
-  console.log(`[zone-worker] watching ${STORE_FILE} as ${RUNNER_HOST} (poll ${POLL_MS}ms)`);
+  console.log(`[zone-worker] backend=${STORE_BACKEND} host=${RUNNER_HOST} (poll ${POLL_MS}ms)`);
   for (;;) {
     try {
       await processQueueOnce();

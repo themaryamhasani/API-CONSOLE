@@ -1,0 +1,1048 @@
+// API Console — PostgreSQL multi-schema model
+// Schemas: identity | workspace | catalog | runtime | execution | governance | observability
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["identity", "workspace", "catalog", "runtime", "execution", "governance", "observability"]
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  SYSTEM_ADMIN
+  TECH_LEAD
+  QA_LEAD
+  SECURITY_REVIEWER
+  QA_SPECIALIST
+  BA
+  PRODUCT_OWNER
+  DEVELOPER
+
+  @@schema("identity")
+}
+
+enum CollectionStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@schema("catalog")
+}
+
+enum Visibility {
+  PRIVATE
+  PROJECT_SHARED
+
+  @@schema("catalog")
+}
+
+enum SharingStatus {
+  PRIVATE
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  RETURNED
+
+  @@schema("catalog")
+}
+
+enum ExecutionStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  QUEUED
+
+  @@schema("execution")
+}
+
+enum ShareStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  RETURNED
+  REJECTED
+
+  @@schema("governance")
+}
+
+enum NetworkZone {
+  PUBLIC
+  INTERNAL
+  RESTRICTED
+  TEST
+
+  @@schema("execution")
+}
+
+enum EnvironmentKind {
+  DEVELOPMENT
+  TEST
+  PREPROD
+  PRODUCTION
+  CUSTOM
+
+  @@schema("execution")
+}
+
+enum GrantStatus {
+  PENDING
+  APPROVED
+  DENIED
+  EXPIRED
+  REVOKED
+
+  @@schema("identity")
+}
+
+enum LoginEventKind {
+  SSO_PROBE
+  CDE_PASSWORD
+  IS_LOGIN
+  LOCAL_LOGIN
+  LOGOUT
+  WORKSPACE_DENIED
+
+  @@schema("identity")
+}
+
+// ─── identity ────────────────────────────────────────────────────────────────
+
+model DirectoryUser {
+  id          String   @id
+  originId    String?  @map("origin_id")
+  fullName    String   @map("full_name")
+  phoneNumber String?  @map("phone_number")
+  email       String?
+  source      String   @default("CDE")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  extra       Json?
+
+  roles             DirectoryRoleAssignment[]
+  memberships       WorkspaceMembership[]
+  jitGrants         JitAccessGrant[]
+  loginEvents       LoginEvent[]
+  accessDenials     AccessDenial[]
+  notifications     Notification[]
+
+  @@index([phoneNumber])
+  @@index([originId])
+  @@map("directory_users")
+  @@schema("identity")
+}
+
+model DirectoryRoleAssignment {
+  id            String   @id
+  originId      String?  @map("origin_id")
+  userId        String   @map("user_id")
+  role          UserRole
+  applicationId String?  @map("application_id")
+  scope         String?
+  isActive      Boolean  @default(true) @map("is_active")
+  source        String   @default("SESSION_SYNC")
+  createdBy     String?  @map("created_by")
+  updatedBy     String?  @map("updated_by")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime? @map("updated_at") @db.Timestamptz
+  extra         Json?
+
+  user DirectoryUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([applicationId])
+  @@map("directory_role_assignments")
+  @@schema("identity")
+}
+
+model WorkspaceMembership {
+  id            String   @id @default(cuid())
+  userId        String   @map("user_id")
+  workspaceKey  String   @map("workspace_key")
+  source        String   @default("CDE_SYNC")
+  isActive      Boolean  @default(true) @map("is_active")
+  syncedAt      DateTime @default(now()) @map("synced_at") @db.Timestamptz
+  extra         Json?
+
+  user DirectoryUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceKey])
+  @@index([workspaceKey])
+  @@map("workspace_memberships")
+  @@schema("identity")
+}
+
+model JitAccessGrant {
+  id            String      @id
+  originId      String?     @map("origin_id")
+  userId        String      @map("user_id")
+  applicationId String?     @map("application_id")
+  reason        String?
+  status        GrantStatus @default(PENDING)
+  requestedAt   DateTime    @default(now()) @map("requested_at") @db.Timestamptz
+  expiresAt     DateTime?   @map("expires_at") @db.Timestamptz
+  approvedBy    String?     @map("approved_by")
+  approvedAt    DateTime?   @map("approved_at") @db.Timestamptz
+  revokedAt     DateTime?   @map("revoked_at") @db.Timestamptz
+  extra         Json?
+
+  user DirectoryUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@map("jit_access_grants")
+  @@schema("identity")
+}
+
+model LoginEvent {
+  id        String         @id @default(cuid())
+  userId    String?        @map("user_id")
+  kind      LoginEventKind
+  success   Boolean        @default(false)
+  reason    String?
+  originId  String?        @map("origin_id")
+  details   Json?
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz
+
+  user DirectoryUser? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("login_events")
+  @@schema("identity")
+}
+
+model AccessDenial {
+  id                 String   @id @default(cuid())
+  userId             String?  @map("user_id")
+  requiredWorkspaces String[] @map("required_workspaces")
+  grantedWorkspaces  String[] @map("granted_workspaces")
+  details            Json?
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user DirectoryUser? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@map("access_denials")
+  @@schema("identity")
+}
+
+// ─── workspace ───────────────────────────────────────────────────────────────
+
+model Origin {
+  id        String   @id
+  label     String
+  baseUrl   String   @map("base_url")
+  isDefault Boolean  @default(false) @map("is_default")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  extra     Json?
+
+  workspaces Workspace[]
+
+  @@map("origins")
+  @@schema("workspace")
+}
+
+model Workspace {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  name        String?
+  originId    String?  @map("origin_id")
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  extra       Json?
+
+  origin Origin? @relation(fields: [originId], references: [id], onDelete: SetNull)
+
+  @@index([originId])
+  @@map("workspaces")
+  @@schema("workspace")
+}
+
+model WorkspaceAccessPolicy {
+  id                  String   @id @default(cuid())
+  requiredWorkspaces  String[] @map("required_workspaces")
+  mode                String   @default("RESTRICT") // RESTRICT | GATE_ONLY
+  updatedAt           DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  updatedBy           String?  @map("updated_by")
+  extra               Json?
+
+  @@map("workspace_access_policy")
+  @@schema("workspace")
+}
+
+model WorkspaceSyncState {
+  id           String   @id @default(cuid())
+  workspaceKey String   @map("workspace_key")
+  lastSyncedAt DateTime? @map("last_synced_at") @db.Timestamptz
+  fingerprint  String?
+  extra        Json?
+
+  @@unique([workspaceKey])
+  @@map("workspace_sync_state")
+  @@schema("workspace")
+}
+
+// ─── catalog ─────────────────────────────────────────────────────────────────
+
+model Collection {
+  id                                   String           @id
+  originId                             String?          @map("origin_id")
+  applicationId                        String?          @map("application_id")
+  workspaceName                        String?          @map("workspace_name")
+  name                                 String
+  description                          String?
+  ownerId                              String?          @map("owner_id")
+  status                               CollectionStatus @default(ACTIVE)
+  visibility                           Visibility?      @default(PRIVATE)
+  variables                            Json?
+  authenticationDocumentationProfileId String?          @map("authentication_documentation_profile_id")
+  createdAt                            DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt                            DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  extra                                Json?
+
+  requests           Request[]
+  testRuns           TestRun[]
+  contractBaselines  ContractBaseline[]
+  mocks              Mock[]
+
+  @@index([originId])
+  @@index([applicationId])
+  @@map("collections")
+  @@schema("catalog")
+}
+
+model Request {
+  id                String         @id
+  originId          String?        @map("origin_id")
+  collectionId      String         @map("collection_id")
+  applicationId     String?        @map("application_id")
+  apiId             String?        @map("api_id")
+  semanticVersion   String?        @map("semantic_version")
+  sharingStatus     SharingStatus? @map("sharing_status")
+  sourceType        String?        @map("source_type")
+  referenceId       String?        @map("reference_id")
+  sourceRequestId   String?        @map("source_request_id")
+  shareRequestId    String?        @map("share_request_id")
+  name              String
+  method            String
+  urlTemplate       String?        @map("url_template")
+  folderPath        String?        @map("folder_path")
+  queryParameters   Json?          @map("query_parameters")
+  headers           Json?
+  cookies           Json?
+  bodyType          String?        @map("body_type")
+  bodyTemplate      String?        @map("body_template")
+  authentication    Json?
+  tls               Json?
+  executionMode     String?        @map("execution_mode")
+  classification    String?
+  environmentId     String?        @map("environment_id")
+  runnerId          String?        @map("runner_id")
+  assertions        Json?
+  scripts           Json?
+  documentation     Json?
+  version           String?
+  status            String?
+  runtimeBinding    Json?          @map("runtime_binding")
+  isGatewayBinding  Json?          @map("is_gateway_binding")
+  sourceSync        Json?          @map("source_sync")
+  visibility        Visibility?
+  coOwnerIds        Json?          @map("co_owner_ids")
+  ownerId           String?        @map("owner_id")
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+  extra             Json?
+
+  collection           Collection            @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  executions           Execution[]
+  importedCurls        ImportedCurl[]
+  manualExamples       ManualExample[]
+  documentationResults DocumentationResult[]
+  shareRequests        ShareRequest[]
+  references           Reference[]
+  mocks                Mock[]
+  dualApprovals        DualApproval[]
+  portalShareTokens    PortalShareToken[]
+
+  @@index([originId])
+  @@index([collectionId])
+  @@index([apiId])
+  @@map("requests")
+  @@schema("catalog")
+}
+
+model Reference {
+  id              String    @id
+  originId        String?   @map("origin_id")
+  apiId           String?   @map("api_id")
+  version         String?
+  sourceRequestId String?   @map("source_request_id")
+  requestId       String?   @map("request_id")
+  collectionId    String?   @map("collection_id")
+  applicationId   String?   @map("application_id")
+  createdBy       String?   @map("created_by")
+  status          String?
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  removedAt       DateTime? @map("removed_at") @db.Timestamptz
+  extra           Json?
+
+  request Request? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+
+  @@index([originId])
+  @@index([apiId])
+  @@map("references")
+  @@schema("catalog")
+}
+
+model ImportedCurl {
+  id                     String   @id
+  originId               String?  @map("origin_id")
+  requestId              String?  @map("request_id")
+  originalTextReference  String?  @map("original_text_reference")
+  sanitizedPreview       String?  @map("sanitized_preview")
+  detectedDialect        String?  @map("detected_dialect")
+  parserVersion          String?  @map("parser_version")
+  importedBy             String?  @map("imported_by")
+  importedAt             DateTime @default(now()) @map("imported_at") @db.Timestamptz
+  extra                  Json?
+
+  request Request? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+
+  @@index([requestId])
+  @@map("imported_curls")
+  @@schema("catalog")
+}
+
+model ManualExample {
+  id                   String   @id
+  originId             String?  @map("origin_id")
+  requestId            String   @map("request_id")
+  statusCode           Int?     @map("status_code")
+  headers              Json?
+  body                 String?
+  claimedEnvironmentId String?  @map("claimed_environment_id")
+  source               String?
+  reason               String?
+  enteredBy            String?  @map("entered_by")
+  enteredAt            DateTime @default(now()) @map("entered_at") @db.Timestamptz
+  reviewStatus         String?  @map("review_status")
+  reviewedBy           String?  @map("reviewed_by")
+  evidenceAttachmentId String?  @map("evidence_attachment_id")
+  extra                Json?
+
+  request Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@map("manual_examples")
+  @@schema("catalog")
+}
+
+model DocumentationResult {
+  id                 String   @id
+  originId           String?  @map("origin_id")
+  requestId          String   @map("request_id")
+  generatedAt        DateTime @default(now()) @map("generated_at") @db.Timestamptz
+  generatedBy        String?  @map("generated_by")
+  approved           Boolean  @default(false)
+  markdown           String?
+  warnings           Json?
+  wordDocumentBase64 String?  @map("word_document_base64")
+  wordFileName       String?  @map("word_file_name")
+  wordMimeType       String?  @map("word_mime_type")
+  extra              Json?
+
+  request Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@map("documentation_results")
+  @@schema("catalog")
+}
+
+model ContractBaseline {
+  id            String   @id
+  originId      String?  @map("origin_id")
+  collectionId  String?  @map("collection_id")
+  applicationId String?  @map("application_id")
+  name          String
+  fingerprint   String?
+  schemaSummary Json?    @map("schema_summary")
+  version       String?
+  spec          Json?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  createdBy     String?  @map("created_by")
+  extra         Json?
+
+  collection Collection? @relation(fields: [collectionId], references: [id], onDelete: SetNull)
+
+  @@index([collectionId])
+  @@map("contract_baselines")
+  @@schema("catalog")
+}
+
+// ─── runtime ─────────────────────────────────────────────────────────────────
+
+model RuntimeProfile {
+  id            String   @id
+  originId      String?  @map("origin_id")
+  applicationId String?  @map("application_id")
+  projectKey    String?  @map("project_key")
+  name          String
+  kind          String?
+  origin        String?
+  coreBasePath  String?  @map("core_base_path")
+  loginPath     String?  @map("login_path")
+  appRefererPath String? @map("app_referer_path")
+  runtimeServiceId String? @map("runtime_service_id")
+  projectServiceId String? @map("project_service_id")
+  serviceIdEvidence Json? @map("service_id_evidence")
+  userSource    String?  @map("user_source")
+  prostage      String?
+  dataService   Json?    @map("data_service")
+  enabled       Boolean  @default(true)
+  rowVersion    String?  @map("row_version")
+  createdBy     String?  @map("created_by")
+  updatedBy     String?  @map("updated_by")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  extra         Json?
+
+  discoverySnapshots DiscoverySnapshot[]
+  executions         Execution[]
+
+  @@index([applicationId])
+  @@index([projectKey])
+  @@map("runtime_profiles")
+  @@schema("runtime")
+}
+
+model DiscoverySnapshot {
+  id                       String   @id
+  originId                 String?  @map("origin_id")
+  projectKey               String?  @map("project_key")
+  applicationId            String?  @map("application_id")
+  runtimeProfileId         String?  @map("runtime_profile_id")
+  status                   String?
+  parserVersion            String?  @map("parser_version")
+  serviceIdStatus          String?  @map("service_id_status")
+  projectServiceIdCandidates Json?  @map("project_service_id_candidates")
+  operations               Json?
+  removedOperations        Json?    @map("removed_operations")
+  warnings                 Json?
+  stats                    Json?
+  sourceFingerprint        String?  @map("source_fingerprint")
+  scannedBy                String?  @map("scanned_by")
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz
+  extra                    Json?
+
+  runtimeProfile RuntimeProfile? @relation(fields: [runtimeProfileId], references: [id], onDelete: SetNull)
+  discoveredOps  DiscoveredOperation[]
+
+  @@index([projectKey])
+  @@index([applicationId])
+  @@map("discovery_snapshots")
+  @@schema("runtime")
+}
+
+model DiscoveredOperation {
+  id         String   @id @default(cuid())
+  snapshotId String   @map("snapshot_id")
+  operationId String? @map("operation_id")
+  method     String?
+  path       String?
+  summary    String?
+  payload    Json?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  snapshot DiscoverySnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@index([snapshotId])
+  @@index([operationId])
+  @@map("discovered_operations")
+  @@schema("runtime")
+}
+
+// ─── execution ───────────────────────────────────────────────────────────────
+
+model Environment {
+  id                                   String           @id
+  originId                             String?          @map("origin_id")
+  name                                 String
+  kind                                 EnvironmentKind?
+  baseUrl                              String?          @map("base_url")
+  variables                            Json?
+  defaultHeaders                       Json?            @map("default_headers")
+  secretReferences                     Json?            @map("secret_references")
+  productionProtected                  Boolean          @default(false) @map("production_protected")
+  archived                             Boolean          @default(false)
+  seeded                               Boolean          @default(false)
+  clonedFrom                           String?          @map("cloned_from")
+  authenticationDocumentationProfileId String?          @map("authentication_documentation_profile_id")
+  runnerId                             String?          @map("runner_id")
+  webhookUrl                           String?          @map("webhook_url")
+  webhookSecret                        String?          @map("webhook_secret")
+  createdAt                            DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt                            DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  extra                                Json?
+
+  executions Execution[]
+  testRuns   TestRun[]
+  mocks      Mock[]
+
+  @@map("environments")
+  @@schema("execution")
+}
+
+model Runner {
+  id                     String       @id
+  originId               String?      @map("origin_id")
+  name                   String
+  networkZone            NetworkZone? @map("network_zone")
+  enabled                Boolean      @default(true)
+  allowedOriginPatterns  Json?        @map("allowed_origin_patterns")
+  createdAt              DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt              DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+  extra                  Json?
+
+  executions     Execution[]
+  executionQueue ExecutionQueueItem[]
+
+  @@map("runners")
+  @@schema("execution")
+}
+
+model Execution {
+  id                   String           @id
+  originId             String?          @map("origin_id")
+  requestId            String?          @map("request_id")
+  collectionId         String?          @map("collection_id")
+  environmentId        String?          @map("environment_id")
+  runnerId             String?          @map("runner_id")
+  operationId          String?          @map("operation_id")
+  applicationId        String?          @map("application_id")
+  runtimeProfileId     String?          @map("runtime_profile_id")
+  sourceKind           String?          @map("source_kind")
+  executedBy           String?          @map("executed_by")
+  status               ExecutionStatus?
+  statusCode           Int?             @map("status_code")
+  responseSize         Int?             @map("response_size")
+  durationMs           Int?             @map("duration_ms")
+  correlationId        String?          @map("correlation_id")
+  startedAt            DateTime?        @map("started_at") @db.Timestamptz
+  completedAt          DateTime?        @map("completed_at") @db.Timestamptz
+  requestSnapshot      Json?            @map("request_snapshot")
+  response             Json?
+  tlsVerification      Json?            @map("tls_verification")
+  transportResult      Json?            @map("transport_result")
+  businessResult       Json?            @map("business_result")
+  assertionResults     Json?            @map("assertion_results")
+  scriptResults        Json?            @map("script_results")
+  errorCategory        String?          @map("error_category")
+  sanitizedError       String?          @map("sanitized_error")
+  environmentName      String?          @map("environment_name")
+  evidenceType         String?          @map("evidence_type")
+  businessJustification String?         @map("business_justification")
+  queueJobId           String?          @map("queue_job_id")
+  networkZone          String?          @map("network_zone")
+  runnerHost           String?          @map("runner_host")
+  extra                Json?
+
+  request        Request?        @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  environment    Environment?    @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+  runner         Runner?         @relation(fields: [runnerId], references: [id], onDelete: SetNull)
+  runtimeProfile RuntimeProfile? @relation(fields: [runtimeProfileId], references: [id], onDelete: SetNull)
+
+  @@index([originId])
+  @@index([requestId, startedAt(sort: Desc)])
+  @@index([operationId])
+  @@map("executions")
+  @@schema("execution")
+}
+
+model ExecutionQueueItem {
+  id                    String    @id
+  status                String    @default("PENDING")
+  requestId             String?   @map("request_id")
+  collectionId          String?   @map("collection_id")
+  environmentId         String?   @map("environment_id")
+  environmentName       String?   @map("environment_name")
+  runnerId              String?   @map("runner_id")
+  networkZone           String?   @map("network_zone")
+  runnerHost            String?   @map("runner_host")
+  executedBy            String?   @map("executed_by")
+  startedAt             DateTime? @map("started_at") @db.Timestamptz
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  businessJustification String?   @map("business_justification")
+  requestSnapshot       Json?     @map("request_snapshot")
+  transport             Json?
+  assertions            Json?
+  scripts               Json?
+  preScriptResults      Json?     @map("pre_script_results")
+  errorCategory         String?   @map("error_category")
+  errorMessage          String?   @map("error_message")
+  extra                 Json?
+
+  runner Runner? @relation(fields: [runnerId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@map("execution_queue")
+  @@schema("execution")
+}
+
+model TestRun {
+  id            String    @id
+  originId      String?   @map("origin_id")
+  collectionId  String?   @map("collection_id")
+  applicationId String?   @map("application_id")
+  environmentId String?   @map("environment_id")
+  actorUserId   String?   @map("actor_user_id")
+  actorRole     String?   @map("actor_role")
+  stopOnFail    Boolean   @default(false) @map("stop_on_fail")
+  summary       Json?
+  webhookDelivery Json?   @map("webhook_delivery")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  extra         Json?
+
+  collection  Collection?  @relation(fields: [collectionId], references: [id], onDelete: SetNull)
+  environment Environment? @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+  results     TestRunResult[]
+
+  @@index([collectionId])
+  @@map("test_runs")
+  @@schema("execution")
+}
+
+model TestRunResult {
+  id         String   @id @default(cuid())
+  testRunId  String   @map("test_run_id")
+  requestId  String?  @map("request_id")
+  status     String?
+  payload    Json?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  testRun TestRun @relation(fields: [testRunId], references: [id], onDelete: Cascade)
+
+  @@index([testRunId])
+  @@map("test_run_results")
+  @@schema("execution")
+}
+
+model Mock {
+  id            String    @id
+  originId      String?   @map("origin_id")
+  requestId     String?   @map("request_id")
+  collectionId  String?   @map("collection_id")
+  applicationId String?   @map("application_id")
+  environmentId String?   @map("environment_id")
+  method        String?
+  pathMatch     String?   @map("path_match")
+  statusCode    Int?      @map("status_code")
+  responseBody  String?   @map("response_body")
+  responseHeaders Json?   @map("response_headers")
+  status        String?
+  expiresAt     DateTime? @map("expires_at") @db.Timestamptz
+  hitCount      Int       @default(0) @map("hit_count")
+  createdBy     String?   @map("created_by")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  extra         Json?
+
+  request     Request?     @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  collection  Collection?  @relation(fields: [collectionId], references: [id], onDelete: SetNull)
+  environment Environment? @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+  callLogs    MockCallLog[]
+
+  @@index([applicationId])
+  @@map("mocks")
+  @@schema("execution")
+}
+
+model MockCallLog {
+  id            String   @id
+  originId      String?  @map("origin_id")
+  mockId        String   @map("mock_id")
+  method        String?
+  path          String?
+  at            DateTime @default(now()) @db.Timestamptz
+  applicationId String?  @map("application_id")
+  extra         Json?
+
+  mock Mock @relation(fields: [mockId], references: [id], onDelete: Cascade)
+
+  @@index([mockId])
+  @@map("mock_call_logs")
+  @@schema("execution")
+}
+
+model ZoneWorkerState {
+  id          String   @id @default("main")
+  heartbeatAt DateTime? @map("heartbeat_at") @db.Timestamptz
+  extra       Json?
+
+  @@map("zone_worker_state")
+  @@schema("execution")
+}
+
+// ─── governance ──────────────────────────────────────────────────────────────
+
+model ShareRequest {
+  id                    String      @id
+  originId              String?     @map("origin_id")
+  requestId             String?     @map("request_id")
+  apiId                 String?     @map("api_id")
+  apiTitle              String?     @map("api_title")
+  applicationId         String?     @map("application_id")
+  version               String?
+  submittedBy           String?     @map("submitted_by")
+  status                ShareStatus?
+  currentRevisionNumber Int?        @map("current_revision_number")
+  purpose               String?
+  introduction          String?
+  description           String?
+  ticketId              String?     @map("ticket_id")
+  ticketUrl             String?     @map("ticket_url")
+  returnReason          String?     @map("return_reason")
+  reviewedBy            String?     @map("reviewed_by")
+  reviewedAt            DateTime?   @map("reviewed_at") @db.Timestamptz
+  comments              Json?
+  checklist             Json?
+  rowVersion            String?     @map("row_version")
+  createdAt             DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+  extra                 Json?
+
+  request   Request?         @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  revisions ShareRevision[]
+
+  @@index([status])
+  @@index([applicationId])
+  @@map("share_requests")
+  @@schema("governance")
+}
+
+model ShareRevision {
+  id            String   @id @default(cuid())
+  shareRequestId String  @map("share_request_id")
+  revisionNumber Int     @map("revision_number")
+  payload       Json?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  createdBy     String?  @map("created_by")
+
+  shareRequest ShareRequest @relation(fields: [shareRequestId], references: [id], onDelete: Cascade)
+
+  @@index([shareRequestId])
+  @@map("share_revisions")
+  @@schema("governance")
+}
+
+model Consumer {
+  id            String   @id
+  originId      String?  @map("origin_id")
+  apiId         String?  @map("api_id")
+  version       String?
+  consumerType  String?  @map("consumer_type")
+  userId        String?  @map("user_id")
+  roleKey       String?  @map("role_key")
+  applicationId String?  @map("application_id")
+  status        String?
+  createdBy     String?  @map("created_by")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  extra         Json?
+
+  @@index([apiId, version])
+  @@map("consumers")
+  @@schema("governance")
+}
+
+model ReadReceipt {
+  id         String    @id
+  originId   String?   @map("origin_id")
+  userId     String?   @map("user_id")
+  apiId      String?   @map("api_id")
+  version    String?
+  notifiedAt DateTime? @map("notified_at") @db.Timestamptz
+  readAt     DateTime? @map("read_at") @db.Timestamptz
+  extra      Json?
+
+  @@index([userId])
+  @@map("read_receipts")
+  @@schema("governance")
+}
+
+model DualApproval {
+  id            String    @id
+  originId      String?   @map("origin_id")
+  requestId     String?   @map("request_id")
+  userId        String?   @map("user_id")
+  applicationId String?   @map("application_id")
+  reason        String?
+  status        String?
+  requestedAt   DateTime  @default(now()) @map("requested_at") @db.Timestamptz
+  approvedBy    String?   @map("approved_by")
+  approvedAt    DateTime? @map("approved_at") @db.Timestamptz
+  expiresAt     DateTime? @map("expires_at") @db.Timestamptz
+  extra         Json?
+
+  request Request? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+
+  @@index([requestId])
+  @@map("dual_approvals")
+  @@schema("governance")
+}
+
+model PortalShareToken {
+  id            String    @id
+  originId      String?   @map("origin_id")
+  token         String
+  tokenHash     String?   @map("token_hash")
+  apiId         String?   @map("api_id")
+  version       String?
+  requestId     String?   @map("request_id")
+  applicationId String?   @map("application_id")
+  expiresAt     DateTime? @map("expires_at") @db.Timestamptz
+  createdBy     String?   @map("created_by")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  urlPath       String?   @map("url_path")
+  extra         Json?
+
+  request Request? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+
+  @@index([token])
+  @@map("portal_share_tokens")
+  @@schema("governance")
+}
+
+model OrgPolicy {
+  id        String   @id @default("main")
+  originId  String?  @map("origin_id")
+  policyKey String?  @map("policy_key")
+  scope     String?
+  payload   Json
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  updatedBy String?  @map("updated_by")
+  extra     Json?
+
+  @@map("org_policies")
+  @@schema("governance")
+}
+
+model ItsmWebhookQueueItem {
+  id          String    @id
+  originId    String?   @map("origin_id")
+  eventType   String?   @map("event_type")
+  payload     Json?
+  status      String    @default("PENDING")
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  deliveredAt DateTime? @map("delivered_at") @db.Timestamptz
+  extra       Json?
+
+  @@index([status, createdAt])
+  @@map("itsm_webhook_queue")
+  @@schema("governance")
+}
+
+model GlobalVariable {
+  id           String   @id
+  originId     String?  @map("origin_id")
+  key          String
+  currentValue String?  @map("current_value")
+  initialValue String?  @map("initial_value")
+  sensitive    Boolean  @default(false)
+  scope        String   @default("GLOBAL")
+  description  String?
+  extra        Json?
+
+  @@map("global_variables")
+  @@schema("governance")
+}
+
+model BrandingTemplate {
+  id               String   @id @default("main")
+  originId         String?  @map("origin_id")
+  activeTemplateId String?  @map("active_template_id")
+  templates        Json?
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  extra            Json?
+
+  @@map("branding_templates")
+  @@schema("governance")
+}
+
+// ─── observability ───────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String   @id
+  originId    String?  @map("origin_id")
+  eventType   String   @map("event_type")
+  actorUserId String?  @map("actor_user_id")
+  actorRole   String?  @map("actor_role")
+  details     Json?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  extra       Json?
+
+  @@index([createdAt(sort: Desc)])
+  @@index([originId])
+  @@index([actorUserId])
+  @@map("audit_log")
+  @@schema("observability")
+}
+
+model UsageEvent {
+  id              String   @id
+  originId        String?  @map("origin_id")
+  eventType       String   @map("event_type")
+  userId          String?  @map("user_id")
+  userDisplayName String?  @map("user_display_name")
+  activeRole      String?  @map("active_role")
+  applicationId   String?  @map("application_id")
+  apiId           String?  @map("api_id")
+  apiTitle        String?  @map("api_title")
+  version         String?
+  referenceId     String?  @map("reference_id")
+  eventAt         DateTime @default(now()) @map("event_at") @db.Timestamptz
+  environmentId   String?  @map("environment_id")
+  correlationId   String?  @map("correlation_id")
+  extra           Json?
+
+  @@index([applicationId])
+  @@index([eventAt(sort: Desc)])
+  @@map("usage_events")
+  @@schema("observability")
+}
+
+model Notification {
+  id             String    @id
+  originId       String?   @map("origin_id")
+  userId         String?   @map("user_id")
+  title          String?
+  message        String?
+  type           String?
+  entityType     String?   @map("entity_type")
+  entityId       String?   @map("entity_id")
+  channels       Json?
+  deliveryStatus String?   @map("delivery_status")
+  correlationId  String?   @map("correlation_id")
+  isRead         Boolean   @default(false) @map("is_read")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  readAt         DateTime? @map("read_at") @db.Timestamptz
+  extra          Json?
+
+  user DirectoryUser? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, isRead])
+  @@index([createdAt(sort: Desc)])
+  @@map("notifications")
+  @@schema("observability")
+}

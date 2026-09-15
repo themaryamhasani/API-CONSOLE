@@ -13,6 +13,9 @@ Living matrix of automated tests in this repository (`apps/api/test`). Status re
 | `phase3-platform.test.cjs` | `test:phase3` | Portal, OpenAPI export, mocks, JIT, compliance, branding, ITSM hooks, contract suite/baseline smoke | E24–E31 surface |
 | `vault-provider.test.cjs` | `test:vault` | Vault provider (`local`/`env`), org policy + dual approval flow | E06, E08 |
 | `persistence.test.cjs` | `test:persist` | Store adapter FILE vs SQLITE, migrate blob/entity tables | E01 |
+| `cde-sso.test.cjs` | `test:sso` | Cookie allowlist, same-site checks, `GET /api/cde/sso/config`, probe without cookies → `NO_CDE_COOKIES` | CDE SSO |
+| `workspace-access.test.cjs` | `test:workspace` | `medu-ai` allow/deny, default GATE_ONLY (all projects), RESTRICT filter, `WORKSPACE_ACCESS_DENIED` | Workspace gate |
+| `postgres-store.test.cjs` | `test:postgres` | Round-trip store via Prisma (skipped unless `DATABASE_URL_TEST`) | E01 Postgres |
 | `system-smoke.test.cjs` | `test:system` | Scope-negative collection/request; SSRF localhost block | S23.01 |
 
 ## Aggregate runner
@@ -21,9 +24,9 @@ Living matrix of automated tests in this repository (`apps/api/test`). Status re
 npm run test:all -w @api-console/api
 ```
 
-Includes: phase2, phase3, persist, vault, promote, environments, session, system-smoke, admin.
+Includes: phase2, phase3, persist, vault, promote, environments, session, system-smoke, admin, cde-sso, workspace-access.
 
-`test:runtime` remains available individually (longer / more env-sensitive).
+`test:runtime` and `test:postgres` remain available individually (env-sensitive).
 
 ## Known gaps
 
@@ -38,6 +41,10 @@ Includes: phase2, phase3, persist, vault, promote, environments, session, system
 | `npm run self-check -w @api-console/api` | In-process self-check (parser/docs/vault smoke) |
 | `npm run typecheck` | Workspace TypeScript check (`apps/web`) |
 | `npm run migrate:db -w @api-console/api` | JSON store → SQLite |
+| `npm run migrate:pg -w @api-console/api` | FILE/SQLITE store → PostgreSQL |
+| `npm run db:bootstrap -w @api-console/api` | Apply SQL schemas/tables via `pg` (no Prisma engines) |
+| `npm run db:generate -w @api-console/api` | Prisma client generate |
+| `npm run db:migrate:dev -w @api-console/api` | Prisma migrate (dev) |
 | `npm run zone-worker -w @api-console/api` | Zone execution worker process |
 | `npm run backend:session-check` | Root alias for `test:session` |
 | `npm run dev:kill-ports` | Kill listeners on WEB/API ports (+ project node on Windows) |

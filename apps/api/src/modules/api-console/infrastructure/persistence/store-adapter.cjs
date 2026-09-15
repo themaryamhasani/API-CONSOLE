@@ -39,7 +39,9 @@ const STORE_ARRAY_KEYS = [
 
 function resolveBackend(env = process.env) {
   const raw = String(env.API_CONSOLE_STORE_BACKEND || 'FILE').trim().toUpperCase();
-  return raw === 'SQLITE' || raw === 'DB' ? 'SQLITE' : 'FILE';
+  if (raw === 'POSTGRES' || raw === 'POSTGRESQL' || raw === 'PG') return 'POSTGRES';
+  if (raw === 'SQLITE' || raw === 'DB') return 'SQLITE';
+  return 'FILE';
 }
 
 function resolveSqlitePath(env = process.env, dataDir) {
@@ -573,7 +575,8 @@ function createSqliteHandle(options = {}) {
 }
 
 /**
- * Repository adapter: FILE keeps injected load/save; SQLITE uses node:sqlite blob + entity tables.
+ * Repository adapter: FILE keeps injected load/save; SQLITE uses node:sqlite blob + entity tables;
+ * POSTGRES uses Prisma multi-schema with queued async flush.
  */
 function createStoreAdapter(options = {}) {
   const env = options.env || process.env;
@@ -588,6 +591,52 @@ function createStoreAdapter(options = {}) {
       load: () => options.loadStore(),
       save: store => options.saveStore(store),
       close() {},
+    };
+  }
+
+  if (backend === 'POSTGRES') {
+    const { createPostgresStore } = require('./postgres-store.cjs');
+    const handle = options.postgresHandle || createPostgresStore({ env, prisma: options.prisma });
+    let cached = null;
+    return {
+      backend: 'POSTGRES',
+      handle,
+      load() {
+        if (cached) {
+          return typeof options.normalizeStore === 'function' ? options.normalizeStore(cached) : cached;
+        }
+        const empty = typeof options.defaultStore === 'function' ? options.defaultStore() : { version: 2 };
+        return typeof options.normalizeStore === 'function' ? options.normalizeStore(empty) : empty;
+      },
+      async loadAsync() {
+        const loaded = await handle.loadAsync();
+        const normalized = typeof options.normalizeStore === 'function'
+          ? options.normalizeStore(loaded)
+          : loaded;
+        // Seed defaults when DB is empty
+        if (!normalized.environments?.length && typeof options.defaultStore === 'function') {
+          const defaults = options.defaultStore();
+          if (!normalized.environments?.length) normalized.environments = defaults.environments;
+          if (!normalized.runners?.length) normalized.runners = defaults.runners;
+          if (!normalized.globalVariables?.length) normalized.globalVariables = defaults.globalVariables;
+          if (!normalized.orgPolicies || (typeof normalized.orgPolicies === 'object' && !Object.keys(normalized.orgPolicies).length)) {
+            normalized.orgPolicies = defaults.orgPolicies;
+          }
+        }
+        cached = normalized;
+        return normalized;
+      },
+      save(store) {
+        cached = store;
+        handle.save(store);
+      },
+      async drain() {
+        if (typeof handle.drain === 'function') await handle.drain();
+      },
+      close: async () => {
+        if (typeof handle.close === 'function') await handle.close();
+      },
+      recordLoginEvent: event => (typeof handle.recordLoginEvent === 'function' ? handle.recordLoginEvent(event) : undefined),
     };
   }
 

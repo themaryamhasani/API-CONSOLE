@@ -23,6 +23,16 @@ const {
   saveSession,
   setSelectedProject,
 } = require('../session/session-server.cjs');
+const {
+  assertWorkspaceAccess,
+  evaluateWorkspaceAccess,
+  filterProjectsByPolicy,
+  requiredWorkspaces,
+  WorkspaceAccessError,
+} = require('../access/workspace-access.cjs');
+const { ssoConfig, ssoProbe } = require('./cde-sso.cjs');
+const { itemsOf, resultOf, projectKeysFromMyRepoResponse } = require('./repo-projects.cjs');
+const { probeRequiredWorkspaceKeys } = require('./workspace-probe.cjs');
 
 const REPOSITORY_CONFIG = {
   WEB_UI: { mappingField: 'webUiRepoName', key: 'cde/repository/web-ui/list/fetch', root: 'web-ui', suffix: 'web-ui' },
@@ -39,19 +49,6 @@ class CdeApiError extends Error {
     this.statusCode = statusCode;
     this.details = details;
   }
-}
-
-function resultOf(response) {
-  return response?.Result || {};
-}
-
-function itemsOf(response) {
-  const result = resultOf(response);
-  if (Array.isArray(result)) return result;
-  if (Array.isArray(result?.items)) return result.items;
-  if (Array.isArray(result?.list)) return result.list;
-  if (Array.isArray(result?.data)) return result.data;
-  return [];
 }
 
 function displayCdeUser(loginUser) {
@@ -153,8 +150,7 @@ async function startCdeLogin(req, body) {
   if (resultOf(callResult.response).IsUserLogin) {
     await setCdeSession(session.id, state);
     const user = displayCdeUser(resultOf(callResult.response).LoginUser);
-    await markCdeConnected(session, user);
-    return { connected: true, user, csrfToken: session.csrfToken };
+    return finalizeCdeLogin(req, session, user, { ecreq: resultOf(callResult.response).ecreq });
   }
   callResult = await storeFormData(state, 'auth/signin/iran-cellphone', {
     userSource: 'rayadevelopers',
@@ -165,8 +161,7 @@ async function startCdeLogin(req, body) {
   if (loginResult.IsUserLogin === true) {
     await setCdeSession(session.id, callResult.state);
     const user = displayCdeUser(loginResult.LoginUser);
-    await markCdeConnected(session, { ...user, userLoginName });
-    return { connected: true, user, ecreq: Boolean(loginResult.ecreq), csrfToken: session.csrfToken };
+    return finalizeCdeLogin(req, session, { ...user, userLoginName }, { ecreq: loginResult.ecreq });
   }
   const nextStep = requireCdePasswordStep(callResult.response);
   await setCdeSession(session.id, callResult.state, 5 * 60);
@@ -215,8 +210,7 @@ async function finishCdePassword(req, body) {
   }
   await setCdeSession(session.id, callResult.state);
   const user = displayCdeUser(result.LoginUser);
-  await markCdeConnected(session, { ...user, userLoginName });
-  return { connected: true, user, ecreq: Boolean(result.ecreq), csrfToken: session.csrfToken };
+  return finalizeCdeLogin(req, session, { ...user, userLoginName }, { ecreq: result.ecreq });
 }
 
 async function disconnectCde(req) {
@@ -231,21 +225,75 @@ async function disconnectCde(req) {
 
 async function accessibleProjects(req, force = false) {
   const session = requireSession(req);
-  const state = await loadCdeState(req);
+  let state = await loadCdeState(req);
   if (!force && Array.isArray(state.accessibleProjects) && Date.now() - Number(state.accessibleProjectsAt || 0) < 60_000) {
-    return state.accessibleProjects;
+    session.projects = state.accessibleProjects;
+    assertWorkspaceAccess(session.projects);
+    return filterProjectsByPolicy(state.accessibleProjects);
   }
   const response = await callDataSource(req, 'cde/repository/list/my-repo', {}, { state });
-  const projects = itemsOf(response).map(item => (typeof item === 'string' ? item.trim() : '')).filter(Boolean);
-  state.accessibleProjects = Array.from(new Set(projects));
-  state.accessibleProjectsAt = Date.now();
+  state = await loadCdeState(req);
+  const fromMyRepo = projectKeysFromMyRepoResponse(response);
+  // my-repo can omit workspaces the user still opens in CDE UI (/workspace/medu-ai).
+  const probed = await probeRequiredWorkspaceKeys(state, fromMyRepo);
+  state = {
+    ...probed.state,
+    accessibleProjects: Array.from(new Set(probed.projects)),
+    accessibleProjectsAt: Date.now(),
+  };
   await setCdeSession(session.id, state);
   session.projects = state.accessibleProjects;
-  if (!session.applicationId && state.accessibleProjects[0]) {
-    session.applicationId = state.accessibleProjects[0];
+  assertWorkspaceAccess(session.projects);
+  const visible = filterProjectsByPolicy(session.projects);
+  if (!session.applicationId || !visible.includes(session.applicationId)) {
+    session.applicationId = visible[0] || null;
   }
   await saveSession(session);
-  return state.accessibleProjects;
+  return visible;
+}
+
+async function revokeDeniedCdeLogin(session, discoveredProjects = []) {
+  const { deleteCdeSession } = require('./cde-session-store.cjs');
+  const discovered = Array.isArray(discoveredProjects) ? discoveredProjects.map(String) : [];
+  try {
+    await deleteCdeSession(session.id);
+  } catch {
+    // best-effort
+  }
+  await markCdeDisconnected(session);
+  // Breadcrumb for /api/session so the denied UI can show required vs discovered workspaces.
+  session.workspaceDenial = {
+    requiredWorkspaces: requiredWorkspaces(),
+    discoveredProjects: discovered,
+    at: new Date().toISOString(),
+  };
+  await saveSession(session);
+  return session;
+}
+
+async function finalizeCdeLogin(req, session, user, extras = {}) {
+  await markCdeConnected(session, user);
+  try {
+    const projects = await accessibleProjects(req, true);
+    session.workspaceDenial = null;
+    await saveSession(session);
+    return {
+      connected: true,
+      user,
+      projects,
+      workspaceAccess: evaluateWorkspaceAccess(session.projects),
+      ecreq: Boolean(extras.ecreq),
+      csrfToken: session.csrfToken,
+    };
+  } catch (error) {
+    if (error instanceof WorkspaceAccessError) {
+      const discovered = Array.isArray(error.details?.discoveredProjects)
+        ? error.details.discoveredProjects
+        : (session.projects || []);
+      await revokeDeniedCdeLogin(session, discovered);
+    }
+    throw error;
+  }
 }
 
 function normalizeProjectKey(value) {
@@ -555,6 +603,12 @@ async function handleCde(req, parsedUrl, body) {
   if (pathname === '/api/cde/origins' && req.method === 'GET') {
     return { data: parseConfiguredOrigins() };
   }
+  if (pathname === '/api/cde/sso/config' && req.method === 'GET') {
+    return ssoConfig(req);
+  }
+  if (pathname === '/api/cde/session/sso' && req.method === 'POST') {
+    return ssoProbe(req);
+  }
   if (pathname === '/api/cde/origins/select' && req.method === 'POST') {
     assertCsrf(req);
     const session = requireSession(req);
@@ -590,4 +644,5 @@ module.exports = {
   handleCde,
   normalizeCdeLoginName,
   projectRepositoryName,
+  WorkspaceAccessError,
 };

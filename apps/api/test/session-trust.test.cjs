@@ -41,6 +41,7 @@ async function provisionDeveloperSession() {
     lastName: 'User',
     displayName: 'Dev User',
   });
+  session.projects = ['sample-app'];
   await setSelectedProject(session, 'sample-app');
   await saveSession(session);
   return session;

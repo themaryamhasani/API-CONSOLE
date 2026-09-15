@@ -18,8 +18,12 @@ const {
   loginListIncludes,
   listActiveSessions,
   requireSession,
+  registerDirectoryProvider,
+  isSessionAuthenticated,
 } = require('../../../session/session-server.cjs');
 const { canHandleCde, collectProjectSourceFiles, handleCde, normalizeCdeLoginName } = require('../../../cde/cde-server.cjs');
+const { registerLoginEventRecorder } = require('../../../cde/cde-sso.cjs');
+const { evaluateWorkspaceAccess } = require('../../../access/workspace-access.cjs');
 const { canHandleIs, handleIs } = require('../../../is/is-auth-server.cjs');
 const { discoverProjectSources } = require('../../../cde/api-discovery.cjs');
 const { createPhase2Router, REVIEW_CHECKLIST_KEYS } = require('./phase2-routes.cjs');
@@ -59,8 +63,9 @@ const STORE_BACKEND = resolveStoreBackend();
 const SQLITE_FILE = process.env.API_CONSOLE_SQLITE_FILE
   ? resolveRepositoryPath(process.env.API_CONSOLE_SQLITE_FILE)
   : resolveSqlitePath(process.env, DATA_DIR);
-/** @type {null | { backend: string, load: Function, save: Function, close?: Function }} */
+/** @type {null | { backend: string, load: Function, save: Function, close?: Function, loadAsync?: Function, drain?: Function, recordLoginEvent?: Function }} */
 let activeStoreAdapter = null;
+let storeReady = false;
 const SECRET_VAULT_FILE = process.env.API_CONSOLE_SECRET_VAULT_FILE || path.join(DATA_DIR, 'api-console-secrets.json');
 const SECRET_KEY_FILE = process.env.API_CONSOLE_SECRET_KEY_FILE || path.join(DATA_DIR, 'api-console-secret.key');
 const DOCX_TEMPLATE_FILE = process.env.API_CONSOLE_DOCX_TEMPLATE_FILE || path.join(__dirname, '..', 'templates', 'api-console-document-template.docx');
@@ -1916,9 +1921,18 @@ function saveStoreToFile(nextStore) {
 
 /**
  * Low-risk persistence entry: FILE keeps current JSON behavior; SQLITE loads
- * store_blob into the same in-memory shape (entity tables updated on save).
+ * store_blob into the same in-memory shape; POSTGRES uses Prisma with async init.
  */
 function loadStore() {
+  if (STORE_BACKEND === 'POSTGRES') {
+    activeStoreAdapter = createStoreAdapter({
+      backend: 'POSTGRES',
+      normalizeStore: normalizeStoreShape,
+      defaultStore,
+    });
+    storeReady = false;
+    return normalizeStoreShape(defaultStore());
+  }
   if (STORE_BACKEND === 'SQLITE') {
     const { adapter, store: loaded } = loadStoreViaAdapter({
       backend: 'SQLITE',
@@ -1934,6 +1948,7 @@ function loadStore() {
       },
     });
     activeStoreAdapter = adapter;
+    storeReady = true;
     return loaded;
   }
   activeStoreAdapter = createStoreAdapter({
@@ -1941,6 +1956,7 @@ function loadStore() {
     loadStore: loadStoreFromFile,
     saveStore: saveStoreToFile,
   });
+  storeReady = true;
   return activeStoreAdapter.load();
 }
 
@@ -1952,7 +1968,31 @@ function saveStore(nextStore) {
   saveStoreToFile(nextStore);
 }
 
+async function initializeStore() {
+  if (STORE_BACKEND === 'POSTGRES' && activeStoreAdapter && typeof activeStoreAdapter.loadAsync === 'function') {
+    store = await activeStoreAdapter.loadAsync();
+    if (typeof activeStoreAdapter.recordLoginEvent === 'function') {
+      registerLoginEventRecorder(event => activeStoreAdapter.recordLoginEvent(event));
+    }
+  }
+  registerDirectoryProvider(() => ({
+    directoryUsers: store.directoryUsers || [],
+    directoryRoleAssignments: store.directoryRoleAssignments || [],
+  }));
+  storeReady = true;
+  return store;
+}
+
+function isStoreReady() {
+  return storeReady;
+}
+
 let store = loadStore();
+registerDirectoryProvider(() => ({
+  directoryUsers: store.directoryUsers || [],
+  directoryRoleAssignments: store.directoryRoleAssignments || [],
+}));
+if (STORE_BACKEND !== 'POSTGRES') storeReady = true;
 
 const tryHandlePhase2 = createPhase2Router({
   ApiConsoleError,
@@ -2751,6 +2791,20 @@ function runnerHostTag() {
 }
 
 function reloadStoreFromDisk() {
+  if (STORE_BACKEND === 'POSTGRES') {
+    if (activeStoreAdapter && typeof activeStoreAdapter.loadAsync === 'function') {
+      activeStoreAdapter.loadAsync().then(loaded => {
+        store = loaded;
+      }).catch(() => undefined);
+    }
+    return;
+  }
+  if (STORE_BACKEND === 'SQLITE' && activeStoreAdapter) {
+    try {
+      store = normalizeStoreShape(activeStoreAdapter.load());
+    } catch {}
+    return;
+  }
   if (!fs.existsSync(STORE_FILE)) return;
   try {
     store = normalizeStoreShape(JSON.parse(fs.readFileSync(STORE_FILE, 'utf8')));
@@ -8571,10 +8625,19 @@ function resolveCorsOrigin(req) {
   const configured = String(process.env.API_CONSOLE_CORS_ORIGIN || '').trim();
   const requestOrigin = String(req.headers.origin || '').trim();
   const env = process.env.NODE_ENV || 'development';
-  // In local/dev, reflect the Vite origin so auto-bumped ports (5280→5281…) keep working
-  // alongside sibling projects like Integrated Systems on 5173.
-  if ((env === 'development' || env === 'test') && requestOrigin.startsWith('http://localhost:')) {
-    return requestOrigin;
+  // In local/dev, reflect Vite origin so auto-bumped ports keep working,
+  // and reflect the local SSO proxy host (https://api-console.edus.ir).
+  if (env === 'development' || env === 'test') {
+    if (requestOrigin.startsWith('http://localhost:')) return requestOrigin;
+    if (requestOrigin.startsWith('http://127.0.0.1:')) return requestOrigin;
+    try {
+      const originHost = new URL(requestOrigin).hostname.toLowerCase();
+      if (originHost === 'api-console.edus.ir' || originHost === 'cde.edus.ir' || originHost.endsWith('.edus.ir')) {
+        return requestOrigin;
+      }
+    } catch {
+      // fall through
+    }
   }
   if (configured) return configured;
   return `http://localhost:${Number(process.env.WEB_PORT || 5280)}`;
@@ -8596,13 +8659,19 @@ function createServer() {
       const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       if (await serveOpenApiDocs(req, res, parsedUrl)) return;
 
+      if (!storeReady && parsedUrl.pathname !== '/api/health') {
+        throw new ApiConsoleError('STORE_NOT_READY', 'Persistence layer is still initializing.', 503);
+      }
+
       await attachSession(req, res);
       attachConsoleContext(req);
 
       if (parsedUrl.pathname === '/api/health' && req.method === 'GET') {
         sendJson(res, 200, {
-          status: 'ok',
+          status: storeReady ? 'ok' : 'starting',
           service: 'api-console',
+          storeBackend: STORE_BACKEND,
+          storeReady,
           checkedAt: nowIso(),
           modules: ['api-console', 'cde-bridge', 'is-bridge', 'session'],
         });
@@ -8640,6 +8709,18 @@ function createServer() {
         || /^\/api\/api-console\/mock-serve\/[^/]+$/.test(parsedUrl.pathname)
         || /^\/api\/api-console\/health(?:\/config)?$/.test(parsedUrl.pathname);
       if (!req.utmsContext && !isLegacyContextEnabled() && !isPublicApiPath) {
+        const session = req.apiConsoleSession;
+        if (session && isSessionAuthenticated(session) && session.authApproach === 'CDE') {
+          const access = evaluateWorkspaceAccess(session.projects || []);
+          if (!access.allowed) {
+            throw new ApiConsoleError(
+              'WORKSPACE_ACCESS_DENIED',
+              `دسترسی فقط برای دارندگان ورک‌اسپیس‌های ${access.requiredWorkspaces.join('، ')} مجاز است.`,
+              403,
+              access,
+            );
+          }
+        }
         throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Login and workspace selection are required.', 401);
       }
       const body = await readJsonBody(req);
@@ -8691,13 +8772,15 @@ module.exports = {
   API_CONSOLE_POLICY,
   assertProductionSecrets,
   inspectProductionSecrets,
-  // E01 persistence helpers (FILE default; SQLITE via env)
+  // E01 persistence helpers (FILE default; SQLITE / POSTGRES via env)
   resolveStoreBackend,
   createStoreAdapter,
   loadStoreViaAdapter,
   writeStoreViaAdapter,
   loadStoreFromFile,
   saveStoreToFile,
+  initializeStore,
+  isStoreReady,
   STORE_BACKEND,
   SQLITE_FILE,
   ensureIsGatewayEnvironment,

@@ -582,9 +582,19 @@ export interface ApiConsoleDirectoryUser {
     fullName: string;
     phoneNumber?: string | undefined;
     email?: string | undefined;
-    source: 'CDE' | string;
+    username?: string | null;
+    source: 'CDE' | 'LOCAL' | string;
     isActive: boolean;
+    hasPassword?: boolean;
+    lastLoginAt?: string | null;
+    passwordUpdatedAt?: string | null;
     roles: UserRole[];
+    roleAssignments?: Array<{
+      id?: string;
+      role: UserRole;
+      applicationId?: string;
+      source?: string;
+    }>;
     isSystemAdmin: boolean;
     isBootstrapAdmin: boolean;
     isBootstrapQaLead?: boolean | undefined;

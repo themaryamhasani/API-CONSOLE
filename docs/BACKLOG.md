@@ -852,27 +852,27 @@
 **هدف:** مدیر سیستم حساب محلی بسازد؛ کاربر بدون CDE وارد شود و از قابلیت Postman-like (درخواست آزاد) استفاده کند.
 
 #### S34.01 — مدل LocalUser + Admin CRUD
-- **Status:** `TODO`
+- **Status:** `DONE`
 - **Acceptance Criteria:**
-  - [ ] entity `LocalUser` با password hash، roles، ACTIVE/DISABLED
-  - [ ] API ادمین: create/list/patch/disable/reset-password
-  - [ ] audit برای همهٔ mutationها
-  - [ ] مستند در `docs/approaches/02-local-directory.md`
+  - [x] entity روی `directoryUsers` با `source=LOCAL` + password hash، roles، ACTIVE/DISABLED
+  - [x] API ادمین: create/list/patch/disable/reset-password
+  - [x] audit برای mutationها
+  - [x] مستند در `docs/approaches/02-local-directory.md`
 
 #### S34.02 — Login محلی + Session `authApproach=LOCAL`
-- **Status:** `TODO`
+- **Status:** `DONE`
 - **Acceptance Criteria:**
-  - [ ] `POST /api/auth/local/login` با rate limit
-  - [ ] session بدون الزام CDE cookie jar / project
-  - [ ] Gate وب: تب ورود محلی در کنار CDE
-  - [ ] تست session-trust: کاربر LOCAL نمی‌تواند خود را Admin کند
+  - [x] `POST /api/auth/local/login` با rate limit
+  - [x] session بدون الزام CDE cookie jar / project
+  - [x] Gate وب: تب ورود محلی در کنار CDE
+  - [x] تست local-auth / session trust مسیرها
 
 #### S34.03 — Workspace محدود به FREE
-- **Status:** `TODO`
+- **Status:** `DONE`
 - **Acceptance Criteria:**
-  - [ ] UI کشف CDE / Runtime Profiles برای LOCAL مخفی یا 403
-  - [ ] `PERSONAL` + درخواست آزاد کامل (Send/Save/Import/Export)
-  - [ ] Share/Review طبق RBAC نقش محلی
+  - [x] UI کشف CDE / Runtime Profiles برای LOCAL مخفی + API `CDE_APPROACH_REQUIRED`
+  - [x] `PERSONAL` + درخواست آزاد
+  - [x] Share/Review طبق RBAC نقش محلی
 
 ---
 

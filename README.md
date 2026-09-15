@@ -1,6 +1,6 @@
 # API Console
 
-Standalone Online API Console. **ورود فعلی: CDE.** رویکردهای Local Directory و Integrated Systems در PRD طراحی شده‌اند.
+Standalone Online API Console. **ورود: CDE + Local Directory (E34).** رویکرد Integrated Systems هم موجود است (feature flag).
 
 ## Quick start
 
@@ -23,20 +23,20 @@ npm run dev              # Web — پیش‌فرض :5280 (Vite در صورت ا�
 
 ## Auth (امروز)
 
-1. Open `/` → redirect to `/login`. On same-site deploy under `*.edus.ir`, cookie SSO can detect an existing CDE session (`POST /api/cde/session/sso`).
-2. Otherwise open the **CDE login popup** (optional) then sign in with cellphone + password (multi-origin picker when configured). On **localhost**, cookie SSO cannot work — use phone/password.
-3. Access is **gated** (not filtered) by `API_CONSOLE_REQUIRED_WORKSPACES` (default: `medu-ai`). Users without that workspace see `403 WORKSPACE_ACCESS_DENIED` / `/access-denied`. With default `API_CONSOLE_WORKSPACE_ALLOWLIST_MODE=GATE_ONLY`, after login **all** CDE projects still load in Runtime. Set `RESTRICT` only if you want the project list limited to the allowlist.
+1. Open `/` → redirect to `/login`. Tabs: **CDE** | **Local**.
+2. **CDE:** On same-site `*.edus.ir`, cookie SSO may detect a session (`POST /api/cde/session/sso`). Otherwise use the CDE popup or cellphone + password. Access is **gated** by `API_CONSOLE_REQUIRED_WORKSPACES` (default: `medu-ai`). With `GATE_ONLY`, after login **all** CDE projects remain visible.
+3. **Local (E34):** SYSTEM_ADMIN creates users under **ادمین → کاربران**. Login with username/password → `authApproach=LOCAL`, workspace `PERSONAL` (FREE only; no CDE Discovery/Runtime).
 4. Identity and role for API calls come from the **server session** — browser context headers are not trusted (opt-in legacy only via `API_CONSOLE_ALLOW_LEGACY_CONTEXT` outside production).
 
-Role allowlists (comma-separated CDE login names, e.g. `9121234567`):
+Role allowlists (comma-separated CDE login names, e.g. `09022849799`):
 
 - `API_CONSOLE_ADMIN_LOGINS` → bootstrap SYSTEM_ADMIN
 - `API_CONSOLE_QA_LEAD_LOGINS` → QA_LEAD
 - everyone else → DEVELOPER until a System Administrator assigns another directory role
 
-After CDE login, display name and cellphone sync into the local directory. Admins grant roles in **Users**. Authentication itself still happens only through CDE until **E34 (Local)** / **E35 (IS)** ship.
+After CDE login, display name and cellphone sync into the local directory. Admins grant roles (and manage local accounts) in **Users**.
 
-**SSO note:** Cookie-forward SSO only works when the console is hosted on the same registrable domain as CDE (e.g. `api-console.edus.ir`). Local development uses the phone/password form.
+**SSO note:** Cookie-forward SSO only works when the console is hosted on the same registrable domain as CDE (e.g. `api-console.edus.ir`). Local development uses the phone/password form or Local Directory accounts.
 
 ### Planned approaches
 
@@ -44,7 +44,7 @@ After CDE login, display name and cellphone sync into the local directory. Admin
 | Approach           | Who                                                    | Status                                                     |
 | ------------------ | ------------------------------------------------------ | ---------------------------------------------------------- |
 | CDE                | تیم‌های کنترل‌پلن CDE                                  | Implemented                                                |
-| Local Directory    | کاربران با یوزر/پسورد تعریف‌شده توسط مدیر              | PRD + Backlog E34                                          |
+| Local Directory    | کاربران با یوزر/پسورد تعریف‌شده توسط مدیر              | **Implemented** (E34)                                      |
 | Integrated Systems | پل با Gateway/SSO در `D:\AllApp\IS\integrated-systems` | **Implemented** (login + systems + Gateway cookie forward) |
 
 

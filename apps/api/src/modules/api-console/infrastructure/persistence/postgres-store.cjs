@@ -289,13 +289,20 @@ function createPostgresStore(options = {}) {
     await prisma.$transaction(async tx => {
       // Identity
       await upsertArray(tx, 'directoryUser', (store.directoryUsers || []).map(u => {
-        const mapped = entityToDb(u, new Set(['id', 'originId', 'fullName', 'phoneNumber', 'email', 'source', 'isActive', 'createdAt', 'updatedAt']));
+        const mapped = entityToDb(u, new Set([
+          'id', 'originId', 'fullName', 'phoneNumber', 'email', 'username', 'passwordHash',
+          'passwordUpdatedAt', 'lastLoginAt', 'source', 'isActive', 'createdAt', 'updatedAt',
+        ]));
         return {
           id: String(u.id),
           originId: u.originId || null,
           fullName: String(u.fullName || u.displayName || u.id),
           phoneNumber: u.phoneNumber || null,
           email: u.email || null,
+          username: u.username || null,
+          passwordHash: u.passwordHash || null,
+          passwordUpdatedAt: asDate(u.passwordUpdatedAt) || null,
+          lastLoginAt: asDate(u.lastLoginAt) || null,
           source: u.source || 'CDE',
           isActive: u.isActive !== false,
           createdAt: asDate(u.createdAt) || new Date(),

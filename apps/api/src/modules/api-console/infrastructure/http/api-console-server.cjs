@@ -25,6 +25,16 @@ const { canHandleCde, collectProjectSourceFiles, handleCde, normalizeCdeLoginNam
 const { registerLoginEventRecorder } = require('../../../cde/cde-sso.cjs');
 const { evaluateWorkspaceAccess } = require('../../../access/workspace-access.cjs');
 const { canHandleIs, handleIs } = require('../../../is/is-auth-server.cjs');
+const {
+  LocalAuthError,
+  canHandleLocalAuth,
+  handleLocalAuth,
+  registerLocalAuthStore,
+  createLocalDirectoryUser,
+  patchLocalDirectoryUser,
+  resetLocalPassword,
+  listLocalDirectoryUsers,
+} = require('../../../auth/local-auth.cjs');
 const { discoverProjectSources } = require('../../../cde/api-discovery.cjs');
 const { createPhase2Router, REVIEW_CHECKLIST_KEYS } = require('./phase2-routes.cjs');
 const { createPhase3Router, deliverWebhook: deliverItsmWebhook, scanTextForSecrets, parseConfiguredOrigins } = require('./phase3-routes.cjs');
@@ -1979,6 +1989,15 @@ async function initializeStore() {
     directoryUsers: store.directoryUsers || [],
     directoryRoleAssignments: store.directoryRoleAssignments || [],
   }));
+  registerLocalAuthStore({
+    getStore: () => store,
+    saveStore,
+    audit,
+    makeId,
+    directoryUserView,
+    USER_ROLES,
+    systemAdministratorCount,
+  });
   storeReady = true;
   return store;
 }
@@ -1992,6 +2011,15 @@ registerDirectoryProvider(() => ({
   directoryUsers: store.directoryUsers || [],
   directoryRoleAssignments: store.directoryRoleAssignments || [],
 }));
+registerLocalAuthStore({
+  getStore: () => store,
+  saveStore,
+  audit,
+  makeId,
+  directoryUserView,
+  USER_ROLES,
+  systemAdministratorCount,
+});
 if (STORE_BACKEND !== 'POSTGRES') storeReady = true;
 
 const tryHandlePhase2 = createPhase2Router({
@@ -2153,17 +2181,48 @@ function activeRolesForDirectoryUser(userId) {
     .filter(role => USER_ROLES.includes(role))));
 }
 
+function activeRoleAssignmentsForDirectoryUser(userId) {
+  return (Array.isArray(store.directoryRoleAssignments) ? store.directoryRoleAssignments : [])
+    .filter(assignment =>
+      assignment.userId === userId &&
+      assignment.isActive !== false &&
+      (
+        (assignment.role === 'SYSTEM_ADMIN' && assignment.source === 'ADMIN_APPROVAL') ||
+        (assignment.role !== 'SYSTEM_ADMIN' && assignment.role !== 'DEVELOPER' && assignment.source === 'ADMIN_APPROVAL') ||
+        (assignment.role === 'DEVELOPER' && (assignment.source === 'SESSION_SYNC' || assignment.source === 'ADMIN_APPROVAL'))
+      ) &&
+      USER_ROLES.includes(assignment.role)
+    )
+    .map(assignment => ({
+      id: assignment.id,
+      role: assignment.role,
+      applicationId: assignment.applicationId || 'ALL',
+      source: assignment.source,
+    }));
+}
+
 function directoryUserView(user) {
   const roles = activeRolesForDirectoryUser(user.id);
-  const bootstrapAdmin = isBootstrapSystemAdmin(user.phoneNumber);
-  const bootstrapQaLead = loginListIncludes(process.env.API_CONSOLE_QA_LEAD_LOGINS, user.phoneNumber);
+  const roleAssignments = activeRoleAssignmentsForDirectoryUser(user.id);
+  const bootstrapLogin = user.phoneNumber || user.username || '';
+  const bootstrapAdmin = isBootstrapSystemAdmin(bootstrapLogin);
+  const bootstrapQaLead = loginListIncludes(process.env.API_CONSOLE_QA_LEAD_LOGINS, bootstrapLogin);
   if (bootstrapAdmin && !roles.includes('SYSTEM_ADMIN')) roles.unshift('SYSTEM_ADMIN');
   if (bootstrapQaLead && !roles.includes('QA_LEAD') && !roles.includes('SYSTEM_ADMIN')) roles.push('QA_LEAD');
   if (!roles.length) roles.push('DEVELOPER');
+  const {
+    passwordHash: _passwordHash,
+    ...safeUser
+  } = user;
   return {
-    ...user,
+    ...safeUser,
     source: user.source || 'CDE',
+    username: user.username || null,
+    hasPassword: Boolean(user.passwordHash),
+    lastLoginAt: user.lastLoginAt || null,
+    passwordUpdatedAt: user.passwordUpdatedAt || null,
     roles: Array.from(new Set(roles)),
+    roleAssignments,
     isSystemAdmin: bootstrapAdmin || roles.includes('SYSTEM_ADMIN'),
     isBootstrapAdmin: bootstrapAdmin,
     isBootstrapQaLead: bootstrapQaLead,
@@ -5407,10 +5466,22 @@ function runtimeKindLabel(kind) {
 }
 
 function assertRuntimeProjectAccess(projectKey, context) {
+  assertCdeAuthApproach(context);
   const key = String(projectKey || '').trim();
   if (!key) throw new ApiConsoleError('RUNTIME_PROJECT_REQUIRED', 'Runtime projectKey is required.', 422);
   assertApplicationInContext(key, context);
   return key;
+}
+
+function assertCdeAuthApproach(context) {
+  if (context?.authApproach && context.authApproach !== 'CDE') {
+    throw new ApiConsoleError(
+      'CDE_APPROACH_REQUIRED',
+      'CDE discovery and Runtime are only available for CDE sessions.',
+      403,
+      { authApproach: context.authApproach },
+    );
+  }
 }
 
 function canManageDevelopmentRuntimeProfiles(context) {
@@ -7282,10 +7353,10 @@ async function routeRequest(req, parsedUrl, body) {
     assertSystemAdministrator(context);
     if (!third && req.method === 'GET') {
       return safeClone(store.directoryUsers
-        .filter(user => user.isActive !== false)
         .map(directoryUserView)
         .sort((left, right) => Number(right.isSystemAdmin) - Number(left.isSystemAdmin) ||
-          String(left.fullName || left.id).localeCompare(String(right.fullName || right.id), 'fa')));
+          Number(right.isActive !== false) - Number(left.isActive !== false) ||
+          String(left.fullName || left.username || left.id).localeCompare(String(right.fullName || right.username || right.id), 'fa')));
     }
     if (third && fourth === 'system-admin' && req.method === 'PUT') {
       return safeClone(setManagedSystemAdministrator(decodeURIComponent(third), body.enabled === true, context));
@@ -7303,6 +7374,48 @@ async function routeRequest(req, parsedUrl, body) {
       ));
     }
     throw new ApiConsoleError('INVALID_URL', 'User management endpoint not found.', 404);
+  }
+
+  if (first === 'admin' && second === 'local-users') {
+    const context = requireContext(req, body);
+    assertSystemAdministrator(context);
+    const helpers = {
+      makeId,
+      audit,
+      saveStore,
+      directoryUserView,
+      USER_ROLES,
+      systemAdministratorCount,
+    };
+    try {
+      if (!third && req.method === 'GET') {
+        return safeClone(listLocalDirectoryUsers(store, helpers));
+      }
+      if (!third && req.method === 'POST') {
+        assertCsrf(req);
+        return safeClone(await createLocalDirectoryUser(store, body.data || body, context, helpers));
+      }
+      if (third && !fourth && req.method === 'PATCH') {
+        assertCsrf(req);
+        return safeClone(await patchLocalDirectoryUser(store, decodeURIComponent(third), body.data || body, context, helpers));
+      }
+      if (third && fourth === 'reset-password' && req.method === 'POST') {
+        assertCsrf(req);
+        return safeClone(await resetLocalPassword(
+          store,
+          decodeURIComponent(third),
+          String((body.data || body).password || ''),
+          context,
+          helpers,
+        ));
+      }
+    } catch (error) {
+      if (error instanceof LocalAuthError) {
+        throw new ApiConsoleError(error.category, error.message, error.statusCode || 400);
+      }
+      throw error;
+    }
+    throw new ApiConsoleError('INVALID_URL', 'Local user management endpoint not found.', 404);
   }
 
   if (first === 'admin' && second === 'sessions' && req.method === 'GET') {
@@ -8688,6 +8801,26 @@ function createServer() {
         const body = await readJsonBody(req, 1024 * 1024);
         const result = await handleSession(req, parsedUrl, body, res);
         sendJson(res, 200, result);
+        return;
+      }
+      if (canHandleLocalAuth(parsedUrl.pathname)) {
+        const body = await readJsonBody(req, 1024 * 1024);
+        try {
+          const result = await handleLocalAuth(req, parsedUrl, body);
+          sendJson(res, 200, result);
+        } catch (error) {
+          if (error instanceof LocalAuthError) {
+            sendJson(res, error.statusCode || 400, {
+              error: {
+                category: error.category,
+                message: error.message,
+                ...(error.details ? { details: error.details } : {}),
+              },
+            });
+            return;
+          }
+          throw error;
+        }
         return;
       }
       if (canHandleCde(parsedUrl.pathname)) {

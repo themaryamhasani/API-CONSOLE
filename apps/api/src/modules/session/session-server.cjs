@@ -150,9 +150,11 @@ function readDirectoryStore() {
 
 function directoryUserForIdentity(store, userLoginName, userId) {
   const login = comparableLogin(userLoginName);
+  const username = String(userLoginName || '').trim().toLowerCase();
   return (Array.isArray(store?.directoryUsers) ? store.directoryUsers : []).find(user =>
     String(user.id || '') === String(userId || '') ||
-    (login && comparableLogin(user.phoneNumber) === login)
+    (login && comparableLogin(user.phoneNumber) === login) ||
+    (username && String(user.username || '').trim().toLowerCase() === username)
   );
 }
 
@@ -195,6 +197,11 @@ function managedApprovalRoles(userLoginName, userId) {
 
 function isBootstrapSystemAdmin(userLoginName) {
   return loginListIncludes(process.env.API_CONSOLE_ADMIN_LOGINS, userLoginName);
+}
+
+/** Normalize Iranian cellphone / login for bootstrap allowlists (0902… ≡ 902… ≡ 98902…). */
+function normalizeBootstrapLogin(value) {
+  return comparableLogin(value);
 }
 
 function pickPrimaryRole(roles) {
@@ -507,6 +514,26 @@ async function markIsDisconnected(session) {
   return markCdeDisconnected(session);
 }
 
+async function markLocalConnected(session, user) {
+  const loginName = String(user?.userLoginName || user?.username || user?.phoneNumber || session.userLoginName || '');
+  session.authApproach = 'LOCAL';
+  session.cdeConnected = false;
+  session.isGatewayCookie = null;
+  session.isGatewayBaseUrl = null;
+  session.isRoles = [];
+  session.userLoginName = loginName;
+  session.userId = String(user?.id || user?.userId || loginName || session.id);
+  session.firstName = String(user?.firstName || '');
+  session.lastName = String(user?.lastName || '');
+  session.displayName = String(user?.displayName || user?.fullName || `${session.firstName} ${session.lastName}`.trim() || loginName);
+  session.role = resolveRole(loginName, session.userId);
+  session.applicationId = 'PERSONAL';
+  session.projects = ['PERSONAL'];
+  session.workspaceDenial = null;
+  await saveSession(session);
+  return session;
+}
+
 async function setSelectedProject(session, projectKey, projects = []) {
   session.applicationId = String(projectKey);
   // CDE membership is server-discovered only — never trust client-supplied project lists
@@ -711,9 +738,12 @@ module.exports = {
   markCdeDisconnected,
   markIsConnected,
   markIsDisconnected,
+  markLocalConnected,
   isSessionAuthenticated,
   isBootstrapSystemAdmin,
   loginListIncludes,
+  comparableLogin,
+  normalizeBootstrapLogin,
   pickPrimaryRole,
   requireSession,
   resolveRole,

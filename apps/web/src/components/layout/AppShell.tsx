@@ -56,14 +56,26 @@ export function buildWorkspaceNav(opts: {
   canManageGeneralSettings: boolean;
   isSystemAdmin: boolean;
   canViewUsageReports: boolean;
+  authApproach?: 'CDE' | 'IS' | 'LOCAL' | null;
 }): NavGroup[] {
+  const isLocal = opts.authApproach === 'LOCAL';
   const groups: NavGroup[] = [
     {
       title: 'کار روزانه',
       items: [
         { id: 'requests' as const, label: 'درخواست‌ها', icon: <LayoutDashboard className="h-4 w-4" /> },
-        { id: 'repository' as const, label: 'مخزن', icon: <BookOpen className="h-4 w-4" /> },
-        { id: 'runtime' as const, label: 'Runtime', icon: <PlayCircle className="h-4 w-4" /> },
+        {
+          id: 'repository' as const,
+          label: 'مخزن',
+          icon: <BookOpen className="h-4 w-4" />,
+          hidden: isLocal,
+        },
+        {
+          id: 'runtime' as const,
+          label: 'Runtime',
+          icon: <PlayCircle className="h-4 w-4" />,
+          hidden: isLocal,
+        },
         {
           id: 'environments' as const,
           label: 'محیط‌ها',

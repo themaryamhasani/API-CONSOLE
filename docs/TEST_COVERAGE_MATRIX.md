@@ -15,6 +15,7 @@ Living matrix of automated tests in this repository (`apps/api/test`). Status re
 | `persistence.test.cjs` | `test:persist` | Store adapter FILE vs SQLITE, migrate blob/entity tables | E01 |
 | `cde-sso.test.cjs` | `test:sso` | Cookie allowlist, same-site checks, `GET /api/cde/sso/config`, probe without cookies → `NO_CDE_COOKIES` | CDE SSO |
 | `workspace-access.test.cjs` | `test:workspace` | `medu-ai` allow/deny, default GATE_ONLY (all projects), RESTRICT filter, `WORKSPACE_ACCESS_DENIED` | Workspace gate |
+| `local-auth.test.cjs` | `test:local-auth` | scrypt hash, bootstrap phone normalize, local-users CRUD, `POST /api/auth/local/login` | E34 Local Directory |
 | `postgres-store.test.cjs` | `test:postgres` | Round-trip store via Prisma (skipped unless `DATABASE_URL_TEST`) | E01 Postgres |
 | `system-smoke.test.cjs` | `test:system` | Scope-negative collection/request; SSRF localhost block | S23.01 |
 
@@ -51,5 +52,4 @@ Includes: phase2, phase3, persist, vault, promote, environments, session, system
 
 ## Product docs
 
-PRD and multi-approach identity (CDE / Local / IS): [`PRD.md`](./PRD.md), [`approaches/`](./approaches/README.md). When E34/E35 land, add dedicated auth tests to this matrix.
-
+PRD and multi-approach identity (CDE / Local / IS): [`PRD.md`](./PRD.md), [`approaches/`](./approaches/README.md).

@@ -73,6 +73,11 @@ type SessionState = {
   selectProject: (projectKey: string) => Promise<void>;
   loadCatalog: (projectKey?: string) => Promise<CdeCatalog | null>;
   applyIsLogin: (systems?: IsSystemDescriptor[]) => Promise<void>;
+  applyLocalLogin: (result: {
+    csrfToken?: string;
+    activeContext: ActiveContext | null;
+    user?: { id?: string; displayName?: string; username?: string };
+  }) => Promise<void>;
   disconnect: () => Promise<void>;
   logout: () => Promise<void>;
 };
@@ -103,6 +108,37 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (session.csrfToken) setCsrfToken(session.csrfToken);
       if (session.workspaceAccess) set({ workspaceAccess: session.workspaceAccess });
       const authApproach = (session.authApproach || (session.cdeConnected ? 'CDE' : session.isConnected ? 'IS' : null)) as AuthApproach;
+
+      if (authApproach === 'LOCAL') {
+        const projects = [personalProject()];
+        let selectedProjectKey = session.applicationId || PERSONAL_APPLICATION_ID;
+        let activeContext = session.activeContext;
+        if (!activeContext) {
+          const selected = await sessionApi.selectContext(
+            PERSONAL_APPLICATION_ID,
+            projects.map(project => project.projectKey),
+          );
+          activeContext = selected.activeContext;
+          if (selected.csrfToken) setCsrfToken(selected.csrfToken);
+          selectedProjectKey = PERSONAL_APPLICATION_ID;
+        }
+        set({
+          bootstrapped: true,
+          loading: false,
+          authenticated: Boolean(session.authenticated || activeContext),
+          authApproach: 'LOCAL',
+          cdeConnected: false,
+          isConnected: false,
+          cdeStatus: null,
+          projects,
+          isSystems: [],
+          selectedProjectKey,
+          activeContext,
+          catalog: null,
+          workspaceAccess: { allowed: true, requiredWorkspaces: [], grantedWorkspaces: [] },
+        });
+        return;
+      }
 
       if (authApproach === 'IS' || session.isConnected) {
         let systems: IsSystemDescriptor[] = [];
@@ -242,11 +278,45 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     });
   },
 
+  applyLocalLogin: async (result) => {
+    if (result.csrfToken) setCsrfToken(result.csrfToken);
+    const projects = [personalProject()];
+    let activeContext = result.activeContext;
+    if (!activeContext) {
+      const selected = await sessionApi.selectContext(
+        PERSONAL_APPLICATION_ID,
+        projects.map(project => project.projectKey),
+      );
+      activeContext = selected.activeContext;
+      if (selected.csrfToken) setCsrfToken(selected.csrfToken);
+    }
+    set({
+      bootstrapped: true,
+      loading: false,
+      authenticated: Boolean(activeContext),
+      authApproach: 'LOCAL',
+      cdeConnected: false,
+      isConnected: false,
+      cdeStatus: null,
+      projects,
+      isSystems: [],
+      selectedProjectKey: PERSONAL_APPLICATION_ID,
+      activeContext,
+      catalog: null,
+      workspaceAccess: { allowed: true, requiredWorkspaces: [], grantedWorkspaces: [] },
+    });
+  },
+
   refreshProjects: async () => {
     if (get().authApproach === 'IS') {
       const systems = (await isApi.systems()).systems || [];
       const projects = [personalProject(), ...isSystemsToProjects(systems)];
       set({ projects, isSystems: systems, isConnected: true, authenticated: true, authApproach: 'IS' });
+      return projects;
+    }
+    if (get().authApproach === 'LOCAL') {
+      const projects = [personalProject()];
+      set({ projects, cdeConnected: false, authenticated: true, authApproach: 'LOCAL' });
       return projects;
     }
     const projects = await cdeApi.projects();

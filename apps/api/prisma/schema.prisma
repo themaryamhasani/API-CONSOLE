@@ -115,16 +115,20 @@ enum LoginEventKind {
 // ─── identity ────────────────────────────────────────────────────────────────
 
 model DirectoryUser {
-  id          String   @id
-  originId    String?  @map("origin_id")
-  fullName    String   @map("full_name")
-  phoneNumber String?  @map("phone_number")
-  email       String?
-  source      String   @default("CDE")
-  isActive    Boolean  @default(true) @map("is_active")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
-  extra       Json?
+  id                 String    @id
+  originId           String?   @map("origin_id")
+  fullName           String    @map("full_name")
+  phoneNumber        String?   @map("phone_number")
+  email              String?
+  username           String?   @unique
+  passwordHash       String?   @map("password_hash")
+  passwordUpdatedAt  DateTime? @map("password_updated_at") @db.Timestamptz
+  lastLoginAt        DateTime? @map("last_login_at") @db.Timestamptz
+  source             String    @default("CDE")
+  isActive           Boolean   @default(true) @map("is_active")
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  extra              Json?
 
   roles             DirectoryRoleAssignment[]
   memberships       WorkspaceMembership[]
@@ -135,6 +139,7 @@ model DirectoryUser {
 
   @@index([phoneNumber])
   @@index([originId])
+  @@index([username])
   @@map("directory_users")
   @@schema("identity")
 }

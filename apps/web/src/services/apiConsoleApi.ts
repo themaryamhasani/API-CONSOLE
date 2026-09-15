@@ -757,6 +757,43 @@ export const apiConsoleApi = {
     return requestJson('/admin/users', { context });
   },
 
+  createLocalUser(payload: {
+    username: string;
+    password: string;
+    fullName?: string;
+    role?: string;
+    applicationId?: string;
+    phoneNumber?: string;
+    email?: string;
+  }, context: ActiveContext): Promise<ApiConsoleDirectoryUser> {
+    return requestJson('/admin/local-users', {
+      method: 'POST',
+      context,
+      body: payload,
+    });
+  },
+
+  patchLocalUser(userId: string, payload: {
+    fullName?: string;
+    email?: string;
+    phoneNumber?: string;
+    isActive?: boolean;
+  }, context: ActiveContext): Promise<ApiConsoleDirectoryUser> {
+    return requestJson(`/admin/local-users/${encodeURIComponent(userId)}`, {
+      method: 'PATCH',
+      context,
+      body: payload,
+    });
+  },
+
+  resetLocalPassword(userId: string, password: string, context: ActiveContext): Promise<ApiConsoleDirectoryUser> {
+    return requestJson(`/admin/local-users/${encodeURIComponent(userId)}/reset-password`, {
+      method: 'POST',
+      context,
+      body: { password },
+    });
+  },
+
   setSystemAdmin(userId: string, enabled: boolean, context: ActiveContext): Promise<ApiConsoleDirectoryUser> {
     return requestJson(`/admin/users/${encodeURIComponent(userId)}/system-admin`, {
       method: 'PUT',

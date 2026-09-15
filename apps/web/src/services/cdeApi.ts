@@ -137,7 +137,7 @@ export const sessionApi = {
       grantedWorkspaces: string[];
       mode?: string;
     } | null;
-    user?: { id?: string; displayName?: string; phoneNumber?: string } | null;
+    user?: { id?: string; displayName?: string; phoneNumber?: string; username?: string } | null;
   }>('/api/session'),
   selectContext: (projectKey: string, projects?: string[]) =>
     request<{ activeContext: import('../types').ActiveContext; csrfToken: string; authApproach?: string | null }>('/api/session/context', {
@@ -151,6 +151,22 @@ export const sessionApi = {
       setCsrfToken(null);
     }
   },
+};
+
+export const localAuthApi = {
+  login: (username: string, password: string) => request<{
+    connected: boolean;
+    authApproach: 'LOCAL';
+    authenticated: boolean;
+    csrfToken: string;
+    activeContext: import('../types').ActiveContext | null;
+    applicationId: string;
+    projects: string[];
+    user?: { id: string; displayName: string; username: string };
+  }>('/api/auth/local/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  }),
 };
 
 export const cdeApi = {

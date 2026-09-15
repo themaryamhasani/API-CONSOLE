@@ -1,14 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { ExternalLink, Loader2, LogIn, RefreshCw, ShieldAlert } from 'lucide-react';
+import { ExternalLink, KeyRound, Loader2, LogIn, RefreshCw, ShieldAlert, UserRound } from 'lucide-react';
 import { Button } from '../components/ui/Button';
+import { Input } from '../components/ui/Input';
 import { toast } from '../components/ui/Toast';
 import { CdeLoginPage } from './CdeLoginPage';
-import { PlatformApiError, cdeApi, sessionApi, setCsrfToken } from '../services/cdeApi';
+import { PlatformApiError, cdeApi, localAuthApi, sessionApi, setCsrfToken } from '../services/cdeApi';
 import { useSessionStore } from '../stores/sessionStore';
 import { consumeReturnTo, rememberReturnTo } from '../utils/returnTo';
 
 type ProbeState = 'checking' | 'idle' | 'connected' | 'denied';
+type LoginTab = 'cde' | 'local';
 
 const LOCALHOST_SSO_HINT =
   'روی localhost کوکی‌های CDE به کنسول نمی‌رسند. می‌توانید پنجرهٔ ورود CDE را باز کنید، ولی برای ورود به کنسول از فرم شماره همراه و رمز استفاده کنید.';
@@ -20,10 +22,16 @@ export const LandingPage: React.FC = () => {
   const refreshProjects = useSessionStore(state => state.refreshProjects);
   const selectProject = useSessionStore(state => state.selectProject);
   const setWorkspaceAccess = useSessionStore(state => state.setWorkspaceAccess);
+  const applyLocalLogin = useSessionStore(state => state.applyLocalLogin);
 
   const [probeState, setProbeState] = useState<ProbeState>('checking');
+  const [loginTab, setLoginTab] = useState<LoginTab>('cde');
   const [ssoConfig, setSsoConfig] = useState<Awaited<ReturnType<typeof cdeApi.ssoConfig>> | null>(null);
   const [message, setMessage] = useState('');
+  const [localUsername, setLocalUsername] = useState('');
+  const [localPassword, setLocalPassword] = useState('');
+  const [localLoading, setLocalLoading] = useState(false);
+  const [localError, setLocalError] = useState('');
   const [deniedDetails, setDeniedDetails] = useState<{
     requiredWorkspaces?: string[];
     grantedWorkspaces?: string[];
@@ -89,7 +97,6 @@ export const LandingPage: React.FC = () => {
         return;
       }
 
-      // Phone/password login stores CDE on the server — resume without cookie SSO (localhost).
       if (session.cdeConnected) {
         try {
           const status = await cdeApi.status();
@@ -160,18 +167,17 @@ export const LandingPage: React.FC = () => {
 
   useEffect(() => {
     const onVisible = () => {
-      if (document.visibilityState === 'visible' && probeState === 'idle') {
+      if (document.visibilityState === 'visible' && probeState === 'idle' && loginTab === 'cde') {
         void runProbe();
       }
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [probeState, runProbe]);
+  }, [probeState, runProbe, loginTab]);
 
   const openCdePopup = () => {
     const url = ssoConfig?.loginUrl || 'https://cde.edus.ir/';
     stopPopupPoll();
-    // Do not use noopener — we need popup.closed for the poll.
     const popup = window.open(url, 'cde-sso', 'width=980,height=780,menubar=no,toolbar=no');
     if (!popup) {
       setMessage('پنجرهٔ ورود CDE مسدود شد. pop-up را مجاز کنید یا با شماره و رمز وارد شوید.');
@@ -192,6 +198,28 @@ export const LandingPage: React.FC = () => {
     }, 700);
   };
 
+  const handleLocalLogin = async () => {
+    if (!localUsername.trim() || !localPassword) {
+      setLocalError('نام کاربری و رمز عبور را وارد کنید.');
+      return;
+    }
+    setLocalLoading(true);
+    setLocalError('');
+    try {
+      const session = await sessionApi.current();
+      if (session.csrfToken) setCsrfToken(session.csrfToken);
+      const result = await localAuthApi.login(localUsername.trim(), localPassword);
+      if (result.csrfToken) setCsrfToken(result.csrfToken);
+      await applyLocalLogin(result);
+      toast.success('ورود محلی برقرار شد.');
+      navigate(consumeReturnTo(), { replace: true });
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : 'ورود محلی ناموفق بود.');
+    } finally {
+      setLocalLoading(false);
+    }
+  };
+
   if (probeState === 'denied') {
     return (
       <div className="ac-login-stage">
@@ -201,36 +229,20 @@ export const LandingPage: React.FC = () => {
           </div>
           <h1 className="text-xl font-semibold text-[var(--theme-text)]">دسترسی به ورک‌اسپیس لازم است</h1>
           <p className="mt-3 text-sm leading-7 text-[var(--theme-text-muted)]">
-            فقط کسانی که به ورک‌اسپیس‌های زیر دسترسی دارند می‌توانند وارد API Console شوند:
+            فقط کسانی که به ورک‌اسپیس‌های زیر دسترسی دارند می‌توانند با حساب CDE وارد API Console شوند:
           </p>
           <ul className="mt-3 list-inside list-disc text-sm font-medium text-[var(--theme-text)]">
             {(deniedDetails?.requiredWorkspaces || ['medu-ai']).map(key => (
               <li key={key} dir="ltr">{key}</li>
             ))}
           </ul>
-          {deniedDetails?.grantedWorkspaces?.length ? (
-            <p className="mt-3 text-xs text-[var(--theme-text-subtle)]" dir="ltr">
-              detected: {deniedDetails.grantedWorkspaces.join(', ')}
-            </p>
-          ) : (
-            <p className="mt-3 text-xs text-[var(--theme-text-subtle)]">
-              هنوز <span dir="ltr">medu-ai</span> در پروژه‌های دریافتی از CDE دیده نشد. با شماره/رمز وارد شوید یا دسترسی ورک‌اسپیس را بررسی کنید.
-            </p>
-          )}
           <div className="mt-6 flex flex-wrap gap-2">
             <Button type="button" onClick={() => void runProbe()}>
               <RefreshCw className="ml-1 h-4 w-4" />
               بررسی مجدد
             </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={async () => {
-                await sessionApi.logout();
-                setProbeState('idle');
-              }}
-            >
-              خروج
+            <Button type="button" variant="secondary" onClick={() => { setProbeState('idle'); setLoginTab('local'); }}>
+              ورود محلی
             </Button>
           </div>
         </div>
@@ -244,7 +256,7 @@ export const LandingPage: React.FC = () => {
         <div className="relative z-10 flex flex-col items-center gap-3 text-white">
           <Loader2 className="h-8 w-8 animate-spin" />
           <p className="text-sm text-white/80">
-            {probeState === 'connected' ? 'در حال ورود…' : 'در حال بررسی نشست CDE…'}
+            {probeState === 'connected' ? 'در حال ورود…' : 'در حال بررسی نشست…'}
           </p>
         </div>
       </div>
@@ -259,41 +271,100 @@ export const LandingPage: React.FC = () => {
         <div className="ac-rise px-2 text-white lg:px-4">
           <p className="font-display text-5xl font-bold tracking-tight sm:text-6xl">API Console</p>
           <p className="mt-4 max-w-md text-base leading-8 text-white/70">
-            {sameSite
-              ? 'اگر در همین مرورگر وارد CDE هستید، نشست از روی کوکی تشخیص داده می‌شود.'
-              : 'برای توسعهٔ محلی از شماره همراه و رمز CDE استفاده کنید. ورود با کوکی فقط روی دامنهٔ مشترک با CDE فعال است.'}
+            ورود با CDE (کشف و Runtime) یا حساب محلی تعریف‌شده توسط مدیر سیستم (درخواست آزاد).
           </p>
           <div className="mt-8 flex flex-wrap gap-2 text-xs text-white/55">
             <span className="rounded-full border border-white/15 px-3 py-1">CDE</span>
+            <span className="rounded-full border border-white/15 px-3 py-1">Local Directory</span>
             <span className="rounded-full border border-white/15 px-3 py-1">workspace: medu-ai</span>
           </div>
         </div>
 
         <div className="ac-rise-delay space-y-4">
-          <div className="rounded-2xl border border-white/10 bg-white/95 p-6 shadow-2xl backdrop-blur dark:bg-[var(--theme-surface)]/95 sm:p-8">
-            <h2 className="text-base font-semibold text-[var(--theme-text)]">ورود یکپارچه با CDE</h2>
-            <p className="mt-2 text-xs leading-6 text-[var(--theme-text-subtle)]">
-              {sameSite
-                ? 'پنجرهٔ ورود CDE را باز کنید، وارد شوید، سپس آن را ببندید تا نشست بررسی شود.'
-                : LOCALHOST_SSO_HINT}
-            </p>
-            {message ? <p className="mt-3 text-sm text-[var(--theme-danger)]">{message}</p> : null}
-            <div className="mt-5 flex flex-col gap-2">
-              <Button type="button" className="w-full" onClick={openCdePopup}>
-                <LogIn className="ml-1 h-4 w-4" />
-                باز کردن ورود CDE
-                <ExternalLink className="mr-1 h-3.5 w-3.5 opacity-70" />
-              </Button>
-              <Button type="button" variant="secondary" className="w-full" onClick={() => void runProbe()}>
-                <RefreshCw className="ml-1 h-4 w-4" />
-                بررسی مجدد نشست
-              </Button>
-            </div>
+          <div className="grid grid-cols-2 gap-2 rounded-2xl border border-white/10 bg-black/20 p-1">
+            <button
+              type="button"
+              className={`rounded-xl px-3 py-2 text-sm font-medium transition ${loginTab === 'cde' ? 'bg-white text-gray-900' : 'text-white/70 hover:text-white'}`}
+              onClick={() => setLoginTab('cde')}
+            >
+              ورود CDE
+            </button>
+            <button
+              type="button"
+              className={`rounded-xl px-3 py-2 text-sm font-medium transition ${loginTab === 'local' ? 'bg-white text-gray-900' : 'text-white/70 hover:text-white'}`}
+              onClick={() => setLoginTab('local')}
+            >
+              ورود محلی
+            </button>
           </div>
 
-          <div className="overflow-hidden rounded-2xl border border-white/10">
-            <CdeLoginPage embedded />
-          </div>
+          {loginTab === 'cde' ? (
+            <>
+              <div className="rounded-2xl border border-white/10 bg-white/95 p-6 shadow-2xl backdrop-blur dark:bg-[var(--theme-surface)]/95 sm:p-8">
+                <h2 className="text-base font-semibold text-[var(--theme-text)]">ورود یکپارچه با CDE</h2>
+                <p className="mt-2 text-xs leading-6 text-[var(--theme-text-subtle)]">
+                  {sameSite
+                    ? 'پنجرهٔ ورود CDE را باز کنید، وارد شوید، سپس آن را ببندید تا نشست بررسی شود.'
+                    : LOCALHOST_SSO_HINT}
+                </p>
+                {message ? <p className="mt-3 text-sm text-[var(--theme-danger)]">{message}</p> : null}
+                <div className="mt-5 flex flex-col gap-2">
+                  <Button type="button" className="w-full" onClick={openCdePopup}>
+                    <LogIn className="ml-1 h-4 w-4" />
+                    باز کردن ورود CDE
+                    <ExternalLink className="mr-1 h-3.5 w-3.5 opacity-70" />
+                  </Button>
+                  <Button type="button" variant="secondary" className="w-full" onClick={() => void runProbe()}>
+                    <RefreshCw className="ml-1 h-4 w-4" />
+                    بررسی مجدد نشست
+                  </Button>
+                </div>
+              </div>
+              <div className="overflow-hidden rounded-2xl border border-white/10">
+                <CdeLoginPage embedded />
+              </div>
+            </>
+          ) : (
+            <form
+              className="rounded-2xl border border-white/10 bg-white/95 p-6 shadow-2xl backdrop-blur dark:bg-[var(--theme-surface)]/95 sm:p-8"
+              onSubmit={event => {
+                event.preventDefault();
+                if (!localLoading) void handleLocalLogin();
+              }}
+            >
+              <div className="mb-5 flex items-center gap-2">
+                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]">
+                  <UserRound className="h-4 w-4" />
+                </div>
+                <div>
+                  <h2 className="text-base font-semibold text-[var(--theme-text)]">ورود محلی</h2>
+                  <p className="text-xs text-[var(--theme-text-subtle)]">حساب تعریف‌شده توسط مدیر سیستم — فقط درخواست آزاد</p>
+                </div>
+              </div>
+              <div className="space-y-3">
+                <Input
+                  label="نام کاربری"
+                  value={localUsername}
+                  onChange={event => setLocalUsername(event.target.value)}
+                  autoComplete="username"
+                  dir="ltr"
+                />
+                <Input
+                  label="رمز عبور"
+                  type="password"
+                  value={localPassword}
+                  onChange={event => setLocalPassword(event.target.value)}
+                  autoComplete="current-password"
+                  dir="ltr"
+                />
+              </div>
+              {localError ? <p className="mt-3 text-sm text-[var(--theme-danger)]">{localError}</p> : null}
+              <Button type="submit" className="mt-5 w-full" loading={localLoading}>
+                <KeyRound className="ml-1 h-4 w-4" />
+                ورود
+              </Button>
+            </form>
+          )}
         </div>
       </div>
     </div>

@@ -10,12 +10,13 @@ Covered surfaces:
 
 - Session (`/api/session*`)
 - CDE bridge (`/api/cde/session*`, projects, catalog, package)
+- Local auth (`/api/auth/local/login`, `/api/auth/local/logout`)
+- Admin local users (`/api/api-console/admin/local-users*`)
 - Online API Console (`/api/api-console/*`)
 
-Planned (E34/E35 — not in host OpenAPI until implemented):
+Also documented in approach docs; host OpenAPI may lag until regenerated:
 
-- Local auth: `/api/auth/local/*`
-- IS bridge: `/api/auth/is/*`, `/api/api-console/is/*`
+- IS bridge: `/api/auth/is/*`, `/api/api-console/is/*` (feature-flagged)
 
 This Swagger UI documents the **host APIs**. Per-request markdown/DOCX documentation inside the Online API Console UI is unchanged. Product approaches: [approaches/README.md](./approaches/README.md).
 

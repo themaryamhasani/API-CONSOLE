@@ -3346,13 +3346,13 @@ export const OnlineApiConsolePage: React.FC = () => {
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain pe-1">
-                  <button type="button" className={`w-full rounded-md px-2 py-1.5 text-right text-xs ${!filters.folderPath ? 'bg-[var(--theme-sidebar)] text-white' : 'hover:bg-[var(--theme-surface-muted)]'}`} onClick={() => setFilters(prev => ({ ...prev, folderPath: '', page: 1 }))}>همه</button>
-                  <button type="button" className={`w-full rounded-md px-2 py-1.5 text-right text-xs ${filters.folderPath === '__root__' ? 'bg-[var(--theme-sidebar)] text-white' : 'hover:bg-[var(--theme-surface-muted)]'}`} onClick={() => setFilters(prev => ({ ...prev, folderPath: '__root__', page: 1 }))}>(root)</button>
+                  <button type="button" className={`w-full rounded-md px-2 py-1.5 text-right text-xs ${!filters.folderPath ? 'bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]' : 'hover:bg-[var(--theme-surface-muted)]'}`} onClick={() => setFilters(prev => ({ ...prev, folderPath: '', page: 1 }))}>همه</button>
+                  <button type="button" className={`w-full rounded-md px-2 py-1.5 text-right text-xs ${filters.folderPath === '__root__' ? 'bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]' : 'hover:bg-[var(--theme-surface-muted)]'}`} onClick={() => setFilters(prev => ({ ...prev, folderPath: '__root__', page: 1 }))}>(root)</button>
                   {knownFolders.map(folder => (
                     <div key={folder} className="flex items-center gap-1">
                       <button
                         type="button"
-                        className={`min-w-0 flex-1 rounded-md px-2 py-1.5 text-left font-mono text-xs ${filters.folderPath === folder ? 'bg-[var(--theme-sidebar)] text-white' : 'hover:bg-[var(--theme-surface-muted)]'}`}
+                        className={`min-w-0 flex-1 rounded-md px-2 py-1.5 text-left font-mono text-xs ${filters.folderPath === folder ? 'bg-[var(--theme-accent-soft)] text-[var(--theme-accent-ink)]' : 'hover:bg-[var(--theme-surface-muted)]'}`}
                         dir="ltr"
                         onClick={() => setFilters(prev => ({ ...prev, folderPath: folder, page: 1 }))}
                         onDragOver={(event) => event.preventDefault()}

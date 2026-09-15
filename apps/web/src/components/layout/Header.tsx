@@ -85,7 +85,7 @@ export const Header: React.FC<HeaderProps> = ({
   const menuRef = useRef<HTMLDivElement>(null);
 
   const apiModule = catalog?.repositories.find(repository => repository.type === 'API_MODULE');
-  const approachLabel = authApproach === 'IS' ? 'IS' : authApproach === 'CDE' ? 'CDE' : null;
+  const approachLabel = authApproach === 'IS' ? 'IS' : authApproach === 'LOCAL' ? 'Local' : authApproach === 'CDE' ? 'CDE' : null;
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -163,7 +163,7 @@ export const Header: React.FC<HeaderProps> = ({
                 menuOpen && 'bg-[var(--theme-surface-muted)] text-[var(--theme-text)]',
               )}
             >
-              <span className="flex h-6 w-6 items-center justify-center rounded-md bg-[var(--theme-sidebar)] text-[10px] font-semibold text-white">
+              <span className="flex h-6 w-6 items-center justify-center rounded-md bg-[var(--theme-accent)] text-[10px] font-semibold text-white">
                 {(activeContext?.user.fullName || activeContext?.user.displayName || '?')
                   .trim()
                   .slice(0, 1)}

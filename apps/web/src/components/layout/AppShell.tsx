@@ -191,18 +191,18 @@ export function AppShell({
 
       <aside
         className={cn(
-          'ac-sidebar fixed inset-y-0 right-0 z-50 w-[15.5rem] lg:static lg:z-auto',
+          'ac-sidebar fixed inset-y-0 right-0 z-50 w-[min(18rem,86vw)] lg:static lg:z-auto lg:w-auto',
           mobileOpen ? 'translate-x-0' : 'translate-x-full lg:translate-x-0',
           'transition-transform duration-200',
         )}
       >
-        <div className="shrink-0 border-b border-white/5 px-4 py-3.5">
+        <div className="shrink-0 border-b border-[var(--theme-sidebar-border)] px-4 py-3.5">
           <Link to="/" className="block" onClick={onMobileClose}>
-            <p className="font-display text-lg font-bold tracking-tight text-white">API Console</p>
+            <p className="font-display text-lg font-bold tracking-tight text-[var(--theme-sidebar-text)]">API Console</p>
           </Link>
           {activeContext ? (
-            <div className="mt-3 rounded-xl bg-white/5 px-3 py-2">
-              <p className="truncate text-xs font-medium text-white">
+            <div className="mt-3 rounded-xl bg-[var(--theme-sidebar-chip)] px-3 py-2">
+              <p className="truncate text-xs font-medium text-[var(--theme-sidebar-text)]">
                 {activeContext.user.fullName || activeContext.user.displayName}
               </p>
               <p className="mt-0.5 text-[11px] text-[var(--theme-sidebar-muted)]">

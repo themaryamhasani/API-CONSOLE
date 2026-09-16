@@ -9,6 +9,7 @@ import { OnlineApiConsolePage } from './pages/OnlineApiConsolePage';
 import { PortalPage } from './pages/PortalPage';
 import { PublicPortalPage } from './pages/PublicPortalPage';
 import { useSessionStore } from './stores/sessionStore';
+import { WORKSPACE_ROUTE_PATHS } from './pages/workspaceRouting';
 
 function Gate({ children }: { children: ReactNode }) {
   const location = useLocation();
@@ -45,6 +46,14 @@ function Gate({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+function WorkspaceRoutes() {
+  return (
+    <Gate>
+      <OnlineApiConsolePage />
+    </Gate>
+  );
+}
+
 export default function App() {
   return (
     <BrowserRouter>
@@ -53,8 +62,11 @@ export default function App() {
         <Route path="/login" element={<LandingPage />} />
         <Route path="/auth/callback" element={<AuthCallbackPage />} />
         <Route path="/access-denied" element={<WorkspaceDeniedPage />} />
-        <Route path="/" element={<Gate><OnlineApiConsolePage /></Gate>} />
-        <Route path="/api-console" element={<Gate><OnlineApiConsolePage /></Gate>} />
+        <Route path="/" element={<WorkspaceRoutes />} />
+        <Route path="/api-console" element={<WorkspaceRoutes />} />
+        {WORKSPACE_ROUTE_PATHS.map(path => (
+          <Route key={path} path={path} element={<WorkspaceRoutes />} />
+        ))}
         <Route path="/portal" element={<Gate><PortalPage /></Gate>} />
         <Route path="/portal/shared/:token" element={<PublicPortalPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

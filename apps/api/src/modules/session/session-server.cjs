@@ -71,7 +71,9 @@ function appendSetCookie(res, value) {
 }
 
 function cookieSecureEnabled(env = process.env) {
-  if (String(env.API_CONSOLE_COOKIE_SECURE || '').trim().toLowerCase() === 'true') return true;
+  const forced = String(env.API_CONSOLE_COOKIE_SECURE || '').trim().toLowerCase();
+  if (forced === 'false' || forced === '0' || forced === 'off') return false;
+  if (forced === 'true' || forced === '1' || forced === 'on') return true;
   if (String(env.NODE_ENV || '') === 'production') return true;
   const publicUrl = String(env.API_CONSOLE_PUBLIC_URL || '').trim();
   const corsOrigin = String(env.API_CONSOLE_CORS_ORIGIN || '').trim();

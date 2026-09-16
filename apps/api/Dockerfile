@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+# Avoid apt-get (corporate/restricted networks often block deb.debian.org).
+FROM node:22-bookworm-slim AS base
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json package-lock.json ./
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+# Keep prisma CLI (devDependency) for generate + migrate deploy in the image.
+RUN npm ci --workspace=@api-console/api --include-workspace-root
+
+FROM base AS runtime
+ENV NODE_ENV=production
+ENV API_CONSOLE_PORT=5281
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/apps/api/node_modules ./apps/api/node_modules
+COPY package.json package-lock.json ./
+COPY apps/api/package.json apps/api/
+COPY apps/api/prisma apps/api/prisma
+COPY apps/api/src apps/api/src
+COPY apps/api/bin apps/api/bin
+COPY scripts scripts
+COPY docker/api-entrypoint.sh /usr/local/bin/api-entrypoint.sh
+RUN chmod +x /usr/local/bin/api-entrypoint.sh \
+  && npm run db:generate -w @api-console/api \
+  && mkdir -p /app/runtime/api-console
+
+EXPOSE 5281
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=8 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.API_CONSOLE_PORT||5281)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["/usr/local/bin/api-entrypoint.sh"]
+CMD ["node", "apps/api/src/main.cjs"]

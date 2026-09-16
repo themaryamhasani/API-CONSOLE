@@ -33,6 +33,11 @@ function inspectProductionSecrets(env = process.env) {
   for (const item of SECRET_CHECKS) {
     issues.push(...inspectSecretValue(env[item.env], item.label));
   }
+  if (String(env.NODE_ENV || '') === 'production' || env.__FORCE_PROD_INSPECT__) {
+    if (!String(env.REDIS_URL || '').trim()) {
+      issues.push('REDIS_URL is missing (required for durable sessions in production)');
+    }
+  }
   return {
     ok: issues.length === 0,
     issues,
@@ -42,8 +47,12 @@ function inspectProductionSecrets(env = process.env) {
 function assertProductionSecrets(env = process.env) {
   if (String(env.NODE_ENV || '') !== 'production') return;
   const result = inspectProductionSecrets(env);
-  if (!result.ok) {
-    throw new Error(`Production secrets misconfigured:\n- ${result.issues.join('\n- ')}`);
+  const issues = [...result.issues];
+  if (String(env.API_CONSOLE_STORE_BACKEND || '').toUpperCase() === 'POSTGRES' && !String(env.DATABASE_URL || '').trim()) {
+    issues.push('DATABASE_URL is required when API_CONSOLE_STORE_BACKEND=POSTGRES');
+  }
+  if (issues.length) {
+    throw new Error(`Production secrets misconfigured:\n- ${issues.join('\n- ')}`);
   }
 }
 

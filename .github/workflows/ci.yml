@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build -w @api-console/api
+      - run: npm run build:web
+      - name: Unit/integration tests
+        run: npm run test:all -w @api-console/api
+        env:
+          NODE_ENV: test
+          API_CONSOLE_IS_ENABLED: "false"
+          API_CONSOLE_CSRF_SECRET: test-csrf-secret-at-least-32-chars!!
+          API_CONSOLE_SECRET_KEY: test-vault-secret-key-at-least-32!!
+          CDE_SESSION_ENCRYPTION_KEY: test-cde-session-key-at-least-32!!
+          RUNTIME_SESSION_ENCRYPTION_KEY: test-runtime-session-key-32chars!
+      - name: Frontend smoke tests
+        run: npm run test:web
+      - name: Playwright e2e
+        working-directory: apps/web
+        run: npx playwright install chromium --with-deps && npm run test:e2e
+        env:
+          CI: "true"
+          E2E_BROWSER: chromium
+          E2E_WEB_PORT: "5290"
+          E2E_API_PORT: "5291"
+      - name: Production example keeps IS off
+        run: |
+          grep -q 'API_CONSOLE_IS_ENABLED=false' .env.production.example
+          test -f docs/deploy/PRODUCTION.md
+          test -f docker-compose.yml

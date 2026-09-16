@@ -281,9 +281,10 @@ export const LandingPage: React.FC = () => {
         </div>
 
         <div className="ac-rise-delay space-y-4">
-          <div className="grid grid-cols-2 gap-2 rounded-2xl border border-white/10 bg-black/20 p-1">
+          <div className="grid grid-cols-2 gap-2 rounded-2xl border border-white/10 bg-black/20 p-1" data-testid="login-tabs">
             <button
               type="button"
+              data-testid="login-tab-cde"
               className={`rounded-xl px-3 py-2 text-sm font-medium transition ${loginTab === 'cde' ? 'bg-white text-gray-900' : 'text-white/70 hover:text-white'}`}
               onClick={() => setLoginTab('cde')}
             >
@@ -291,6 +292,7 @@ export const LandingPage: React.FC = () => {
             </button>
             <button
               type="button"
+              data-testid="login-tab-local"
               className={`rounded-xl px-3 py-2 text-sm font-medium transition ${loginTab === 'local' ? 'bg-white text-gray-900' : 'text-white/70 hover:text-white'}`}
               onClick={() => setLoginTab('local')}
             >
@@ -327,6 +329,7 @@ export const LandingPage: React.FC = () => {
           ) : (
             <form
               className="rounded-2xl border border-white/10 bg-white/95 p-6 shadow-2xl backdrop-blur dark:bg-[var(--theme-surface)]/95 sm:p-8"
+              data-testid="local-login-form"
               onSubmit={event => {
                 event.preventDefault();
                 if (!localLoading) void handleLocalLogin();
@@ -344,6 +347,7 @@ export const LandingPage: React.FC = () => {
               <div className="space-y-3">
                 <Input
                   label="نام کاربری"
+                  data-testid="local-username"
                   value={localUsername}
                   onChange={event => setLocalUsername(event.target.value)}
                   autoComplete="username"
@@ -351,6 +355,7 @@ export const LandingPage: React.FC = () => {
                 />
                 <Input
                   label="رمز عبور"
+                  data-testid="local-password"
                   type="password"
                   value={localPassword}
                   onChange={event => setLocalPassword(event.target.value)}
@@ -358,8 +363,8 @@ export const LandingPage: React.FC = () => {
                   dir="ltr"
                 />
               </div>
-              {localError ? <p className="mt-3 text-sm text-[var(--theme-danger)]">{localError}</p> : null}
-              <Button type="submit" className="mt-5 w-full" loading={localLoading}>
+              {localError ? <p className="mt-3 text-sm text-[var(--theme-danger)]" data-testid="local-login-error">{localError}</p> : null}
+              <Button type="submit" className="mt-5 w-full" loading={localLoading} data-testid="local-login-submit">
                 <KeyRound className="ml-1 h-4 w-4" />
                 ورود
               </Button>

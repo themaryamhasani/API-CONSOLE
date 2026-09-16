@@ -36,8 +36,13 @@ const {
   listLocalDirectoryUsers,
 } = require('../../../auth/local-auth.cjs');
 const { discoverProjectSources } = require('../../../cde/api-discovery.cjs');
-const { createPhase2Router, REVIEW_CHECKLIST_KEYS } = require('./phase2-routes.cjs');
+const { createPhase2Router } = require('./phase2-routes.cjs');
 const { createPhase3Router, deliverWebhook: deliverItsmWebhook, scanTextForSecrets, parseConfiguredOrigins } = require('./phase3-routes.cjs');
+const { createSharingRouter } = require('./sharing-routes.cjs');
+const { createRuntimeHttpRouter } = require('./runtime-http-routes.cjs');
+const { createCurlParser } = require('./curl-parser.cjs');
+const { createExecutionRunner } = require('./execution-runner.cjs');
+const { createObjectStore } = require('../persistence/object-store.cjs');
 const {
   executeCoreOperation,
   finishRuntimeLogin,
@@ -79,42 +84,8 @@ let storeReady = false;
 const SECRET_VAULT_FILE = process.env.API_CONSOLE_SECRET_VAULT_FILE || path.join(DATA_DIR, 'api-console-secrets.json');
 const SECRET_KEY_FILE = process.env.API_CONSOLE_SECRET_KEY_FILE || path.join(DATA_DIR, 'api-console-secret.key');
 const DOCX_TEMPLATE_FILE = process.env.API_CONSOLE_DOCX_TEMPLATE_FILE || path.join(__dirname, '..', 'templates', 'api-console-document-template.docx');
-const PARSER_VERSION = 'api-console-curl-parser/2.0.0';
-
 const CORE_COMMAND_ENDPOINT = '/core-api/v1/data-provider/store-form-data';
 const CORE_QUERY_ENDPOINT = '/core-api/v1/data-provider/get-data-source';
-const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
-const BODY_OPTIONS = new Set(['-d', '--data', '--data-raw', '--data-binary', '--data-ascii', '--data-urlencode']);
-const FORM_OPTIONS = new Set(['-F', '--form']);
-const HEADER_OPTIONS = new Set(['-H', '--header']);
-const COOKIE_OPTIONS = new Set(['-b', '--cookie']);
-const REQUEST_OPTIONS = new Set(['-X', '--request']);
-const URL_OPTIONS = new Set(['--url']);
-const LOCATION_OPTIONS = new Set(['--location', '-L']);
-const UNSUPPORTED_OPTIONS_WITH_VALUE = new Set([
-  '--cert',
-  '--key',
-  '--cacert',
-  '--connect-timeout',
-  '--max-time',
-  '--proxy',
-  '--resolve',
-  '--user-agent',
-  '-A',
-  '-u',
-  '--user',
-]);
-const UNSUPPORTED_FLAGS = new Set([
-  '--compressed',
-  '--http1.1',
-  '--http2',
-  '--include',
-  '-i',
-  '--silent',
-  '-s',
-  '--verbose',
-  '-v',
-]);
 const BROWSER_HEADERS = new Set([
   'sec-ch-ua',
   'sec-ch-ua-mobile',
@@ -600,462 +571,106 @@ function detectCoreClassification(urlText, body) {
   return buildClassification('GENERIC_HTTP', null, null);
 }
 
-function normalizeWindowsCmdCurl(input) {
-  const withoutLineContinuation = input.replace(/\^\r?\n/g, ' ');
-  let normalized = '';
-  for (let i = 0; i < withoutLineContinuation.length; i += 1) {
-    const char = withoutLineContinuation[i];
-    if (char === '^' && i + 1 < withoutLineContinuation.length) {
-      normalized += withoutLineContinuation[i + 1];
-      i += 1;
-    } else {
-      normalized += char;
-    }
-  }
-  return normalized;
-}
+const curlParser = createCurlParser({
+  ApiConsoleError,
+  makeId,
+  nowIso,
+  createHeader,
+  createCookie,
+  buildClassification,
+  detectCoreClassification,
+  parseJsonSafely,
+  isSensitiveName,
+  sanitizeText,
+  protectRequestSecrets,
+  refreshDocumentationMetadata,
+});
+const {
+  PARSER_VERSION,
+  parseHeaderLine,
+  createDefaultAssertions,
+  createDefaultScripts,
+  createBlankNormalizedRequest,
+  parseCurlInternal,
+  definitionFromNormalized,
+} = curlParser;
 
-function normalizePowerShellCurl(input) {
-  return input
-    .replace(/`\r?\n/g, ' ')
-    .replace(/`(["'`$])/g, '$1');
-}
+const OBJECT_STORE_TTL_DAYS = Number(process.env.API_CONSOLE_OBJECT_STORE_TTL_DAYS || 7);
+const OBJECT_STORE_MAX_BYTES = Number(process.env.API_CONSOLE_OBJECT_STORE_MAX_BYTES || 0);
+const objectStore = createObjectStore({
+  rootDir: process.env.API_CONSOLE_OBJECT_STORE_DIR
+    ? resolveRepositoryPath(process.env.API_CONSOLE_OBJECT_STORE_DIR)
+    : path.join(DATA_DIR, 'object-storage'),
+});
+let objectStoreCleanupTimer = null;
 
-function normalizeBashCurl(input) {
-  return input.replace(/\\\r?\n/g, ' ');
-}
-
-function stripWrappingQuote(input) {
-  const trimmed = String(input || '').trim();
-  if (trimmed.length < 2) return input;
-  const first = trimmed[0];
-  const last = trimmed[trimmed.length - 1];
-  if ((first === '"' || first === "'") && first === last && trimmed.slice(1).trimStart().toLowerCase().startsWith('curl')) {
-    return trimmed.slice(1, -1);
-  }
-  return input;
-}
-
-function detectCurlDialect(input) {
-  const normalized = stripWrappingQuote(input);
-  const lower = normalized.toLowerCase();
-  if (/\^\r?\n|(\s|^)\^\S|curl\.exe/i.test(normalized)) return 'WINDOWS_CMD';
-  if (/`\r?\n|invoke-webrequest|invoke-restmethod/i.test(normalized)) return 'POWERSHELL';
-  if (lower.includes('sec-ch-ua') || lower.includes('sec-fetch-') || lower.includes('--compressed')) return 'CHROME_EDGE';
-  if (/curl\s+'https?:\/\//i.test(normalized) || normalized.includes("\\\n")) return 'BASH';
-  if (/curl\s+https?:\/\//i.test(normalized)) return 'LINUX_MAC';
-  return 'UNKNOWN';
-}
-
-function normalizeCurlText(input, dialect) {
-  const unwrapped = stripWrappingQuote(input);
-  if (dialect === 'WINDOWS_CMD') return normalizeWindowsCmdCurl(unwrapped);
-  if (dialect === 'POWERSHELL') return normalizePowerShellCurl(unwrapped);
-  return normalizeBashCurl(unwrapped);
-}
-
-function tokenizeCurl(input) {
-  const tokens = [];
-  let current = '';
-  let quote = null;
-  let escaping = false;
-
-  for (let i = 0; i < input.length; i += 1) {
-    const char = input[i];
-    if (escaping) {
-      current += char;
-      escaping = false;
-      continue;
-    }
-    if (char === '\\' && quote !== "'") {
-      escaping = true;
-      continue;
-    }
-    if ((char === '"' || char === "'") && !quote) {
-      quote = char;
-      continue;
-    }
-    if (char === quote) {
-      quote = null;
-      continue;
-    }
-    if (!quote && /\s/.test(char)) {
-      if (current) {
-        tokens.push(current);
-        current = '';
-      }
-      continue;
-    }
-    current += char;
-  }
-
-  if (escaping) current += '\\';
-  if (current) tokens.push(current);
-  return tokens;
-}
-
-function splitOptionToken(token) {
-  const eqIndex = token.indexOf('=');
-  if (eqIndex > 2 && token.startsWith('--')) {
-    return { option: token.slice(0, eqIndex), value: token.slice(eqIndex + 1) };
-  }
-  return { option: token };
-}
-
-function parseHeaderLine(line) {
-  const index = String(line || '').indexOf(':');
-  if (index <= 0) return null;
-  return {
-    name: line.slice(0, index).trim(),
-    value: line.slice(index + 1).trim(),
-  };
-}
-
-function parseCookieHeader(value) {
-  return String(value || '')
-    .split(';')
-    .map(part => part.trim())
-    .filter(Boolean)
-    .map(part => {
-      const eq = part.indexOf('=');
-      if (eq === -1) return { name: part, value: '' };
-      return { name: part.slice(0, eq).trim(), value: part.slice(eq + 1).trim() };
-    })
-    .filter(cookie => cookie.name.length > 0);
-}
-
-function parseSetCookie(value) {
-  const rows = Array.isArray(value) ? value : [value].filter(Boolean);
-  return rows.map((row, index) => {
-    const parts = String(row || '').split(';').map(part => part.trim());
-    const first = parts.shift() || '';
-    const eq = first.indexOf('=');
-    const cookie = createCookie(eq >= 0 ? first.slice(0, eq) : first, eq >= 0 ? first.slice(eq + 1) : '', index, 'SYSTEM');
-    parts.forEach(part => {
-      const [key, ...rest] = part.split('=');
-      const lower = key.toLowerCase();
-      const val = rest.join('=');
-      if (lower === 'domain') cookie.domain = val;
-      if (lower === 'path') cookie.path = val;
-      if (lower === 'expires') cookie.expiresAt = val;
-    });
-    return cookie;
-  });
-}
-
-function createQueryParametersFromUrl(urlText) {
+function runObjectStoreCleanup() {
   try {
-    const parsed = new URL(urlText);
-    const params = [];
-    let order = 0;
-    parsed.searchParams.forEach((value, name) => {
-      params.push({
-        id: makeId('qp'),
-        name,
-        value,
-        enabled: true,
-        sensitive: isSensitiveName(name),
-        source: 'IMPORTED_CURL',
-        displayOrder: order,
-      });
-      order += 1;
+    return objectStore.cleanupExpired({
+      maxAgeMs: Math.max(1, OBJECT_STORE_TTL_DAYS) * 24 * 60 * 60 * 1000,
+      ...(OBJECT_STORE_MAX_BYTES > 0 ? { maxTotalBytes: OBJECT_STORE_MAX_BYTES } : {}),
     });
-    parsed.search = '';
-    return { urlWithoutQuery: parsed.toString().replace(/\/$/, parsed.pathname === '/' ? '/' : ''), queryParameters: params };
-  } catch {
-    return { urlWithoutQuery: urlText, queryParameters: [] };
+  } catch (error) {
+    console.error('[api-console] object-store cleanup failed:', error?.message || error);
+    return null;
   }
 }
 
-function inferBody(dataParts, formParts, headers) {
-  if (formParts.length > 0) {
-    return {
-      type: 'multipart',
-      value: formParts.map(part => {
-        const eq = part.indexOf('=');
-        return eq === -1 ? { name: part, value: '' } : { name: part.slice(0, eq), value: part.slice(eq + 1) };
-      }),
-      raw: formParts.join('\n'),
-      contentType: 'multipart/form-data',
-    };
-  }
-
-  if (dataParts.length === 0) {
-    return { type: 'none', value: null, raw: '' };
-  }
-
-  const raw = dataParts.join('&');
-  const contentType = headers.find(header => header.name.toLowerCase() === 'content-type')?.valueTemplate.toLowerCase() || '';
-  const json = parseJsonSafely(raw);
-  if (json.ok) {
-    return { type: 'json', value: json.value, raw, contentType: 'application/json' };
-  }
-  if (contentType.includes('json')) {
-    return { type: 'json', value: null, raw, contentType: 'application/json' };
-  }
-  if (contentType.includes('xml') || raw.trim().startsWith('<')) {
-    return { type: 'xml', value: raw, raw, contentType: contentType || 'application/xml' };
-  }
-  if (contentType.includes('x-www-form-urlencoded') || /^[^=&\s]+=[\s\S]*/.test(raw)) {
-    const value = Object.fromEntries(new URLSearchParams(raw));
-    return { type: 'form-urlencoded', value, raw, contentType: 'application/x-www-form-urlencoded' };
-  }
-  return { type: 'raw', value: raw, raw, contentType: contentType || 'text/plain' };
+function startObjectStoreCleanupInterval() {
+  if (objectStoreCleanupTimer) return objectStoreCleanupTimer;
+  runObjectStoreCleanup();
+  objectStoreCleanupTimer = setInterval(runObjectStoreCleanup, 60 * 60 * 1000);
+  if (typeof objectStoreCleanupTimer.unref === 'function') objectStoreCleanupTimer.unref();
+  return objectStoreCleanupTimer;
 }
 
-function normalizeMethod(method) {
-  const normalized = String(method || '').trim().toUpperCase();
-  if (!normalized) return undefined;
-  return HTTP_METHODS.includes(normalized) ? normalized : undefined;
-}
-
-function dedupeCookies(cookies) {
-  const map = new Map();
-  cookies.forEach(cookie => map.set(cookie.name, cookie));
-  return Array.from(map.values()).map((cookie, index) => ({ ...cookie, displayOrder: index }));
-}
-
-function createDefaultAssertions() {
-  return [
-    {
-      id: makeId('asrt'),
-      assertionType: 'EXPECTED_HTTP_STATUS',
-      configuration: { expectedHttpStatuses: [200] },
-      enabled: true,
-    },
-    {
-      id: makeId('asrt'),
-      assertionType: 'MAX_RESPONSE_TIME',
-      configuration: { maximumResponseTimeMs: 5000 },
-      enabled: true,
-    },
-  ];
-}
-
-function createDefaultScripts() {
-  return {
-    preRequest: [
-      '// Pre-request script امن API Console',
-      '// نمونه: setVar("page", "0")',
-      '// نمونه: setHeader("x-trace-id", "{{traceId}}")',
-    ].join('\n'),
-    postResponse: [
-      '// Post-response script برای تست API',
-      '// نمونه: testStatus(200)',
-      '// نمونه: testJsonPath("$.data")',
-      '// نمونه: testResponseTimeBelow(5000)',
-    ].join('\n'),
-    preRequestEnabled: false,
-    postResponseEnabled: false,
-  };
-}
-
-function createBlankNormalizedRequest(url = 'https://example.com/api/health') {
-  return {
-    method: 'GET',
-    url,
-    queryParameters: [],
-    headers: [createHeader('accept', 'application/json', 0, 'USER')],
-    cookies: [],
-    body: { type: 'none', value: null, raw: '' },
-    authentication: { type: 'none' },
-    tls: { verifyCertificate: true },
-    executionMode: 'RECOMMENDED',
-    classification: buildClassification('GENERIC_HTTP', null, null),
-  };
-}
-
-function parseCurlInternal(originalCurl) {
-  if (!String(originalCurl || '').trim()) {
-    throw new ApiConsoleError('CURL_PARSE_ERROR', 'Empty cURL input.');
-  }
-
-  const dialect = detectCurlDialect(originalCurl);
-  const normalizedText = normalizeCurlText(originalCurl, dialect);
-  const tokens = tokenizeCurl(normalizedText);
-  const curlIndex = tokens.findIndex(token => ['curl', 'curl.exe'].includes(token.toLowerCase()));
-  const requestTokens = curlIndex >= 0 ? tokens.slice(curlIndex + 1) : tokens;
-  const warnings = [];
-  const unsupportedOptions = [];
-  const headers = [];
-  const cookies = [];
-  const dataParts = [];
-  const formParts = [];
-  let explicitMethod;
-  let urlText = '';
-  let tlsVerifyCertificate = true;
-  let authentication = { type: 'none' };
-
-  const readValue = (index, inline) => {
-    if (inline !== undefined) return { value: inline, nextIndex: index };
-    return { value: requestTokens[index + 1] || '', nextIndex: index + 1 };
-  };
-
-  for (let i = 0; i < requestTokens.length; i += 1) {
-    const rawToken = requestTokens[i];
-    const { option, value: inlineValue } = splitOptionToken(rawToken);
-
-    if (REQUEST_OPTIONS.has(option)) {
-      const { value, nextIndex } = readValue(i, inlineValue);
-      explicitMethod = normalizeMethod(value);
-      if (!explicitMethod) warnings.push(`Unsupported HTTP method "${value}" imported as editable value.`);
-      i = nextIndex;
-      continue;
-    }
-
-    if (HEADER_OPTIONS.has(option)) {
-      const { value, nextIndex } = readValue(i, inlineValue);
-      const parsed = parseHeaderLine(value);
-      if (parsed) {
-        const header = createHeader(parsed.name, parsed.value, headers.length, 'IMPORTED_CURL');
-        if (parsed.name.toLowerCase() === 'cookie') {
-          header.enabled = false;
-          header.replayNote = 'Parsed into the cookie editor to avoid duplicate Cookie transmission in recommended replay.';
-          parseCookieHeader(parsed.value).forEach(cookie => cookies.push(createCookie(cookie.name, cookie.value, cookies.length)));
-        }
-        headers.push(header);
-      } else {
-        warnings.push(`Ignored malformed header: ${value}`);
-      }
-      i = nextIndex;
-      continue;
-    }
-
-    if (COOKIE_OPTIONS.has(option)) {
-      const { value, nextIndex } = readValue(i, inlineValue);
-      parseCookieHeader(value).forEach(cookie => cookies.push(createCookie(cookie.name, cookie.value, cookies.length)));
-      i = nextIndex;
-      continue;
-    }
-
-    if (BODY_OPTIONS.has(option)) {
-      const { value, nextIndex } = readValue(i, inlineValue);
-      dataParts.push(value);
-      i = nextIndex;
-      continue;
-    }
-
-    if (FORM_OPTIONS.has(option)) {
-      const { value, nextIndex } = readValue(i, inlineValue);
-      formParts.push(value);
-      i = nextIndex;
-      continue;
-    }
-
-    if (URL_OPTIONS.has(option)) {
-      const { value, nextIndex } = readValue(i, inlineValue);
-      urlText = value;
-      i = nextIndex;
-      continue;
-    }
-
-    if (option === '--insecure' || option === '-k') {
-      tlsVerifyCertificate = false;
-      warnings.push('TLS certificate verification is disabled by imported --insecure/-k.');
-      continue;
-    }
-
-    if (LOCATION_OPTIONS.has(option)) {
-      warnings.push('Redirect following was imported from --location/-L and is handled by the backend Runner.');
-      continue;
-    }
-
-    if (option === '-u' || option === '--user') {
-      const { value, nextIndex } = readValue(i, inlineValue);
-      const [username] = value.split(':');
-      authentication = {
-        type: 'basic',
-        basicUsername: username,
-        basicPasswordReference: '{{basicPassword}}',
-      };
-      unsupportedOptions.push(option);
-      warnings.push('Basic credentials were converted to a secret reference.');
-      i = nextIndex;
-      continue;
-    }
-
-    if (UNSUPPORTED_OPTIONS_WITH_VALUE.has(option)) {
-      const { nextIndex } = readValue(i, inlineValue);
-      unsupportedOptions.push(option);
-      i = nextIndex;
-      continue;
-    }
-
-    if (UNSUPPORTED_FLAGS.has(option)) {
-      unsupportedOptions.push(option);
-      continue;
-    }
-
-    if (option.startsWith('-')) {
-      unsupportedOptions.push(option);
-      continue;
-    }
-
-    if (!urlText) {
-      urlText = rawToken;
-    } else {
-      warnings.push(`Unrecognized positional token ignored: ${rawToken}`);
-    }
-  }
-
-  if (!urlText) {
-    throw new ApiConsoleError('INVALID_URL', 'cURL input did not contain a URL.');
-  }
-
-  const { urlWithoutQuery, queryParameters } = createQueryParametersFromUrl(urlText);
-  const body = inferBody(dataParts, formParts, headers);
-  const method = explicitMethod || ((dataParts.length || formParts.length) ? 'POST' : 'GET');
-
-  if (body.type === 'json' && !headers.some(header => header.name.toLowerCase() === 'content-type')) {
-    headers.push(createHeader('content-type', 'application/json', headers.length, 'SYSTEM'));
-  }
-
-  const classification = detectCoreClassification(urlWithoutQuery, body);
-  const jsonValidity = body.type === 'json'
-    ? (() => {
-        const result = parseJsonSafely(body.raw);
-        return result.ok ? { valid: true } : { valid: false, error: result.error, line: result.line, column: result.column };
-      })()
-    : { valid: true };
-
-  if (unsupportedOptions.length) {
-    warnings.push(`Unsupported cURL options kept as warnings: ${Array.from(new Set(unsupportedOptions)).join(', ')}`);
-  }
-
-  const normalizedRequest = {
-    method,
-    url: urlWithoutQuery,
-    queryParameters,
-    headers,
-    cookies: dedupeCookies(cookies),
-    body,
-    authentication,
-    tls: {
-      verifyCertificate: tlsVerifyCertificate,
-      importedInsecureFlag: !tlsVerifyCertificate,
-    },
-    executionMode: 'RECOMMENDED',
-    classification,
-  };
-
-  return {
-    id: makeId('curl-preview'),
-    originalCurl,
-    detectedDialect: dialect,
-    normalizedRequest,
-    effectiveMethod: method,
-    url: urlWithoutQuery,
-    headerCount: headers.length,
-    cookieCount: normalizedRequest.cookies.length,
-    bodyType: body.type,
-    jsonValidity,
-    tlsVerification: tlsVerifyCertificate,
-    warnings,
-    unsupportedOptions: Array.from(new Set(unsupportedOptions)),
-    parserVersion: PARSER_VERSION,
-    importedAt: nowIso(),
-  };
-}
+const executionRunner = createExecutionRunner({
+  ApiConsoleError,
+  makeId,
+  nowIso,
+  safeClone,
+  sanitizeText,
+  createHeader,
+  createCookie,
+  hasBody: (...args) => hasBody(...args),
+  LIMITS,
+  validateDestination: (...args) => validateDestination(...args),
+  isCorporateRemappedAddress: (...args) => isCorporateRemappedAddress(...args),
+  roleAllowed,
+  API_CONSOLE_POLICY,
+  getStore: () => store,
+  saveStore,
+  reloadStoreFromDisk: (...args) => reloadStoreFromDisk(...args),
+  audit,
+  logUsageEvent: (...args) => logUsageEvent(...args),
+  findEnvironment: (...args) => findEnvironment(...args),
+  createDefaultScripts,
+  resolveRequest: (...args) => resolveRequest(...args),
+  validateProductionPolicy: (...args) => validateProductionPolicy(...args),
+  createBlockedExecution: (...args) => createBlockedExecution(...args),
+  createExecutionFromError: (...args) => createExecutionFromError(...args),
+  selectRunner: (...args) => selectRunner(...args),
+  runnerHostTag: (...args) => runnerHostTag(...args),
+  zoneWorkerHeartbeatFresh: (...args) => zoneWorkerHeartbeatFresh(...args),
+  sleep: (...args) => sleep(...args),
+  evaluateAssertions: (...args) => evaluateAssertions(...args),
+  runPreRequestScript: (...args) => runPreRequestScript(...args),
+  runPostResponseScript: (...args) => runPostResponseScript(...args),
+  businessResultFromAssertions: (...args) => businessResultFromAssertions(...args),
+  putBlob: (...args) => objectStore.putBlob(...args),
+});
+const {
+  parseSetCookie,
+  performHttpRequest,
+  executeWithRedirects,
+  applyIsGatewayAuth,
+  executeIsTransportWithAccessRecovery,
+  executeRequest,
+  isTlsTransportError,
+  tlsErrorMessage,
+  responsePreviewMode,
+  decompressBody,
+} = executionRunner;
 
 function requestBodyFromDefinition(request) {
   if (request.bodyType === 'none') return { type: 'none', value: null, raw: '' };
@@ -1101,14 +716,6 @@ function normalizedFromDefinition(request) {
   };
 }
 
-function bodyTemplateFromBody(body) {
-  if (!body || body.type === 'none') return '';
-  if (body.raw) return body.raw;
-  if (body.type === 'json') return JSON.stringify(body.value ?? {}, null, 2);
-  if (typeof body.value === 'string') return body.value;
-  return JSON.stringify(body.value ?? '', null, 2);
-}
-
 function protectRequestSecrets(request) {
   const next = safeClone(request);
   next.headers = (next.headers || []).map((header, index) => {
@@ -1148,64 +755,6 @@ function protectRequestSecrets(request) {
   const body = requestBodyFromDefinition(next);
   next.classification = detectCoreClassification(next.urlTemplate, body);
   return next;
-}
-
-function definitionFromNormalized(normalized, data) {
-  const now = nowIso();
-  const requestId = data.id || makeId('api-req');
-  const semanticVersion = data.semanticVersion || normalized.semanticVersion || data.versionLabel || '1.0.0';
-  const bodyTemplate = bodyTemplateFromBody(normalized.body);
-  const request = {
-    id: requestId,
-    collectionId: data.collectionId,
-    applicationId: data.applicationId,
-    apiId: data.apiId || requestId,
-    semanticVersion,
-    sharingStatus: data.sharingStatus || 'DRAFT',
-    sourceType: data.sourceType || 'ORIGINAL',
-    referenceId: data.referenceId,
-    sourceRequestId: data.sourceRequestId,
-    shareRequestId: data.shareRequestId,
-    name: data.name,
-    description: data.description,
-    method: normalized.method,
-    urlTemplate: normalized.url,
-    folderPath: Array.isArray(data.folderPath)
-      ? data.folderPath.map(part => String(part || '').trim()).filter(Boolean)
-      : [],
-    queryParameters: normalized.queryParameters || [],
-    headers: normalized.headers || [],
-    cookies: normalized.cookies || [],
-    bodyType: normalized.body?.type || 'none',
-    bodyTemplate,
-    authentication: normalized.authentication || { type: 'none' },
-    tls: normalized.tls || { verifyCertificate: true },
-    executionMode: normalized.executionMode || 'RECOMMENDED',
-    classification: detectCoreClassification(normalized.url, { ...normalized.body, raw: bodyTemplate }),
-    environmentId: data.environmentId,
-    assertions: normalized.assertions || createDefaultAssertions(),
-    scripts: data.scripts || normalized.scripts || createDefaultScripts(),
-    documentation: {
-      title: data.name,
-      description: data.description || '',
-      authenticationProfileId: data.authenticationDocumentationProfileId,
-      providerApplication: data.applicationId,
-      version: semanticVersion,
-      owner: data.userName || data.userId,
-      supportContact: 'quality-team@example.local',
-      changeHistory: [{ version: semanticVersion, changedAt: now, summary: data.changeLog || 'Initial API Console request definition.' }],
-    },
-    version: 1,
-    status: 'ACTIVE',
-    originalImportedCurl: data.originalImportedCurl ? sanitizeText(data.originalImportedCurl) : undefined,
-    importedCurlId: data.importedCurlId,
-    createdBy: data.userId,
-    createdAt: now,
-    updatedBy: data.userId,
-    updatedAt: now,
-  };
-  request.documentation = refreshDocumentationMetadata(request);
-  return protectRequestSecrets(request);
 }
 
 function buildUrlWithQuery(baseUrl, params) {
@@ -1999,6 +1548,7 @@ async function initializeStore() {
     systemAdministratorCount,
   });
   storeReady = true;
+  startObjectStoreCleanupInterval();
   return store;
 }
 
@@ -2079,6 +1629,65 @@ const tryHandlePhase3 = createPhase3Router({
   generateDocumentationMarkdown,
   buildDocxFromTemplate,
   docxFileName,
+});
+
+const tryHandleSharing = createSharingRouter({
+  ApiConsoleError,
+  makeId,
+  nowIso,
+  safeClone,
+  requireContext,
+  assertCanReviewShares,
+  matchesApplicationScope,
+  paginate,
+  audit,
+  notifyUser,
+  saveStore,
+  getStore: () => store,
+  consumersForVersion,
+  normalizeConsumers: (...args) => normalizeConsumers(...args),
+  deliverItsmWebhook,
+});
+
+const tryHandleRuntimeHttp = createRuntimeHttpRouter({
+  ApiConsoleError,
+  makeId,
+  nowIso,
+  safeClone,
+  requireContext,
+  assertCsrf,
+  requireSession,
+  getStore: () => store,
+  saveStore,
+  audit,
+  assertRuntimeProjectAccess: (...args) => assertRuntimeProjectAccess(...args),
+  ensureDefaultRuntimeProfiles: (...args) => ensureDefaultRuntimeProfiles(...args),
+  resolveListOriginFilter: (...args) => resolveListOriginFilter(...args),
+  matchesOriginId: (...args) => matchesOriginId(...args),
+  runtimeProfileView: (...args) => runtimeProfileView(...args),
+  findRuntimeProfile: (...args) => findRuntimeProfile(...args),
+  runtimeSessionIdentity: (...args) => runtimeSessionIdentity(...args),
+  getRuntimeSession,
+  deleteRuntimeSession,
+  setRuntimeSession,
+  publicRuntimeStatus,
+  startRuntimeLogin,
+  finishRuntimeLogin,
+  normalizeCdeLoginName,
+  promoteRuntimeProfile: (...args) => promoteRuntimeProfile(...args),
+  canManageDevelopmentRuntimeProfiles: (...args) => canManageDevelopmentRuntimeProfiles(...args),
+  assertSystemAdministrator: (...args) => assertSystemAdministrator(...args),
+  runtimeProfileMutationInput: (...args) => runtimeProfileMutationInput(...args),
+  createRuntimeProfilesFromInput: (...args) => createRuntimeProfilesFromInput(...args),
+  normalizeRuntimeProfileInput: (...args) => normalizeRuntimeProfileInput(...args),
+  assertCanManageRuntimeProfile: (...args) => assertCanManageRuntimeProfile(...args),
+  validateRuntimeOrigin,
+  latestDiscovery: (...args) => latestDiscovery(...args),
+  runtimeOpenApiDocument: (...args) => runtimeOpenApiDocument(...args),
+  runtimeDocsHtml: (...args) => runtimeDocsHtml(...args),
+  buildRuntimePostmanCollection: (...args) => buildRuntimePostmanCollection(...args),
+  buildRuntimeCurlExport: (...args) => buildRuntimeCurlExport(...args),
+  executeRuntimeDiscoveredOperation: (...args) => executeRuntimeDiscoveredOperation(...args),
 });
 
 function audit(eventType, actor, details = {}) {
@@ -3395,221 +3004,6 @@ async function validateDestination(urlText) {
 
   const records = await resolveDestinationAddresses(host);
   return { parsed, address: records[0].address, family: records[0].family, addresses: records };
-}
-
-function responsePreviewMode(contentType) {
-  const normalized = String(contentType || '').toLowerCase();
-  if (normalized.includes('json')) return 'JSON';
-  if (normalized.includes('html')) return 'SANDBOXED_HTML';
-  if (normalized.includes('text') || normalized.includes('xml')) return 'TEXT';
-  return 'DOWNLOAD_ONLY';
-}
-
-function normalizeResponseHeaders(headers) {
-  const result = [];
-  let index = 0;
-  for (const [name, raw] of Object.entries(headers || {})) {
-    if (name.toLowerCase() === 'set-cookie') continue;
-    const value = Array.isArray(raw) ? raw.join(', ') : String(raw ?? '');
-    result.push(createHeader(name, value, index, 'SYSTEM'));
-    index += 1;
-  }
-  return result;
-}
-
-function decompressBody(buffer, headers) {
-  const encoding = String(headers['content-encoding'] || '').toLowerCase();
-  if (encoding.includes('gzip')) return zlib.gunzipSync(buffer);
-  if (encoding.includes('br')) return zlib.brotliDecompressSync(buffer);
-  if (encoding.includes('deflate')) return zlib.inflateSync(buffer);
-  return buffer;
-}
-
-function isTlsTransportError(error) {
-  const tlsCodes = new Set([
-    'CERT_CHAIN_TOO_LONG',
-    'CERT_COMMON_NAME_INVALID',
-    'CERT_DATE_INVALID',
-    'CERT_HAS_EXPIRED',
-    'CERT_NOT_YET_VALID',
-    'CERT_REVOKED',
-    'CERT_UNTRUSTED',
-    'DEPTH_ZERO_SELF_SIGNED_CERT',
-    'ERR_TLS_CERT_ALTNAME_INVALID',
-    'HOSTNAME_MISMATCH',
-    'SELF_SIGNED_CERT_IN_CHAIN',
-    'UNABLE_TO_GET_ISSUER_CERT',
-    'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
-    'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
-  ]);
-  return tlsCodes.has(error?.code) || /certificate|cert|tls|hostname\/ip does not match/i.test(error?.message || '');
-}
-
-function tlsErrorMessage(error) {
-  const message = sanitizeText(error?.message || 'TLS certificate validation failed.');
-  if (error?.code === 'ERR_TLS_CERT_ALTNAME_INVALID' || /hostname\/ip does not match/i.test(message)) {
-    return `${message} The target certificate does not match the requested hostname. Use --insecure or disable Verify TLS certificate only when policy allows it.`;
-  }
-  return message;
-}
-
-async function performHttpRequest(transport, validation, redirectHistory, signalState) {
-  const url = validation.parsed;
-  const isHttps = url.protocol === 'https:';
-  const client = isHttps ? https : http;
-  const headers = {};
-  transport.headers.forEach(header => {
-    if (!header.enabled) return;
-    headers[header.name] = header.valueTemplate;
-  });
-  if (transport.cookies.length) {
-    const cookieValue = transport.cookies.map(cookie => `${cookie.name}=${cookie.valueReference}`).join('; ');
-    headers.Cookie = headers.Cookie ? `${headers.Cookie}; ${cookieValue}` : cookieValue;
-  }
-  const bodyBuffer = hasBody(transport.body) ? Buffer.from(transport.body.raw || '', 'utf8') : null;
-  if (bodyBuffer) headers['Content-Length'] = String(bodyBuffer.length);
-
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const req = client.request({
-      protocol: url.protocol,
-      hostname: url.hostname,
-      port: url.port || (isHttps ? 443 : 80),
-      path: `${url.pathname}${url.search}`,
-      method: transport.method,
-      headers,
-      rejectUnauthorized: transport.tls.verifyCertificate,
-      servername: url.hostname,
-      lookup: (_hostname, options, callback) => {
-        const cb = typeof options === 'function' ? options : callback;
-        const lookupOptions = typeof options === 'function' ? {} : (options || {});
-        if (lookupOptions.all) {
-          cb(null, [{ address: validation.address, family: validation.family }]);
-          return;
-        }
-        cb(null, validation.address, validation.family);
-      },
-    }, res => {
-      const chunks = [];
-      let total = 0;
-      res.on('data', chunk => {
-        total += chunk.length;
-        if (total > LIMITS.responseBytes) {
-          req.destroy(new ApiConsoleError('RESPONSE_TOO_LARGE', `Response exceeded ${LIMITS.responseBytes} bytes.`));
-          return;
-        }
-        chunks.push(chunk);
-      });
-      res.on('end', () => {
-        try {
-          const rawBuffer = Buffer.concat(chunks);
-          const decoded = decompressBody(rawBuffer, res.headers);
-          if (decoded.length > LIMITS.responseBytes) {
-            reject(new ApiConsoleError('RESPONSE_TOO_LARGE', `Decoded response exceeded ${LIMITS.responseBytes} bytes.`));
-            return;
-          }
-          const contentType = String(res.headers['content-type'] || '');
-          const bodyPreview = decoded.toString('utf8');
-          resolve({
-            statusCode: res.statusCode,
-            statusText: res.statusMessage,
-            headers: normalizeResponseHeaders(res.headers),
-            cookies: parseSetCookie(res.headers['set-cookie']),
-            bodyPreview: sanitizeText(bodyPreview),
-            bodyReference: decoded.length > 64 * 1024 ? `/object-storage/api-console/${makeId('body')}` : undefined,
-            contentType,
-            responseSize: decoded.length,
-            durationMs: Date.now() - start,
-            resolvedIpAddress: validation.address,
-            redirectHistory,
-            tlsVerified: transport.tls.verifyCertificate,
-            safePreviewMode: responsePreviewMode(contentType),
-            rawLocation: res.headers.location,
-            ...(transport.captureSensitiveJson ? { internalBody: bodyPreview } : {}),
-          });
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-
-    req.on('socket', socket => {
-      socket.setTimeout(LIMITS.readTimeoutMs, () => {
-        req.destroy(new ApiConsoleError('READ_TIMEOUT', 'The target API did not finish reading within the configured timeout.'));
-      });
-    });
-    req.setTimeout(LIMITS.connectTimeoutMs, () => {
-      req.destroy(new ApiConsoleError('CONNECTION_TIMEOUT', 'The target API connection timed out.'));
-    });
-    req.on('error', error => {
-      if (signalState.timedOut) {
-        reject(new ApiConsoleError('READ_TIMEOUT', 'The API Console total execution timeout was reached.'));
-      } else if (error instanceof ApiConsoleError) {
-        reject(error);
-      } else if (isTlsTransportError(error)) {
-        reject(new ApiConsoleError('TLS_ERROR', tlsErrorMessage(error)));
-      } else if (/ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(error.message || '')) {
-        const target = `${validation.address}:${url.port || (isHttps ? 443 : 80)}`;
-        const remapped = isCorporateRemappedAddress(validation.address);
-        reject(new ApiConsoleError(
-          'HTTP_ERROR',
-          remapped
-            ? `${sanitizeText(error.message || 'HTTP request failed.')} — مقصد ${target} شبیه نگاشت DNS سازمانی است؛ اتصال از این شبکه برقرار نشد.`
-            : sanitizeText(error.message || `HTTP request failed (${target}).`),
-        ));
-      } else {
-        reject(new ApiConsoleError('HTTP_ERROR', sanitizeText(error.message || 'HTTP request failed.')));
-      }
-    });
-    if (bodyBuffer) req.write(bodyBuffer);
-    req.end();
-  });
-}
-
-async function executeWithRedirects(transport) {
-  const started = Date.now();
-  const initialOrigin = new URL(transport.url).origin;
-  const redirectHistory = [];
-  let current = safeClone(transport);
-  let validation = await validateDestination(current.url);
-  const signalState = { timedOut: false };
-  const totalTimer = setTimeout(() => {
-    signalState.timedOut = true;
-  }, LIMITS.totalTimeoutMs);
-
-  try {
-    for (let i = 0; i <= LIMITS.maxRedirects; i += 1) {
-      if (Date.now() - started > LIMITS.totalTimeoutMs || signalState.timedOut) {
-        throw new ApiConsoleError('READ_TIMEOUT', 'The API Console total execution timeout was reached.');
-      }
-      const response = await performHttpRequest(current, validation, redirectHistory, signalState);
-      const isRedirect = response.statusCode >= 300 && response.statusCode < 400 && response.rawLocation;
-      if (!isRedirect) {
-        delete response.rawLocation;
-        response.durationMs = Date.now() - started;
-        return response;
-      }
-      if (redirectHistory.length >= LIMITS.maxRedirects) {
-        throw new ApiConsoleError('REDIRECT_BLOCKED', 'Maximum redirect count was exceeded.');
-      }
-      const from = current.url;
-      const to = new URL(response.rawLocation, current.url).toString();
-      if (transport.sameOriginRedirectsOnly && new URL(to).origin !== initialOrigin) {
-        throw new ApiConsoleError('REDIRECT_BLOCKED', 'A cross-origin redirect was rejected.', 502);
-      }
-      const nextValidation = await validateDestination(to);
-      redirectHistory.push({ from, to, statusCode: response.statusCode, allowed: true });
-      current.url = to;
-      if (response.statusCode === 303) {
-        current.method = 'GET';
-        current.body = { type: 'none', value: null, raw: '' };
-      }
-      validation = nextValidation;
-    }
-    throw new ApiConsoleError('REDIRECT_BLOCKED', 'Maximum redirect count was exceeded.');
-  } finally {
-    clearTimeout(totalTimer);
-  }
 }
 
 function validateCoreRequest(requestOrNormalized) {
@@ -5035,325 +4429,6 @@ function docxFileName(request) {
 function createExecutionFromError(request, resolved, environment, context, error, businessJustification, scriptResults = []) {
   const category = error.category || 'INTERNAL_EXECUTION_ERROR';
   return createBlockedExecution(request, resolved.snapshot, environment, context.userId, category, error.message || 'Execution failed.', businessJustification, scriptResults);
-}
-
-function applyIsGatewayAuth(transport, context) {
-  if (!transport || context?.authApproach !== 'IS' || !context.isGatewayCookie) return transport;
-  const gateway = String(context.isGatewayBaseUrl || process.env.API_CONSOLE_IS_GATEWAY_URL || 'http://127.0.0.1:4000')
-    .trim()
-    .replace(/\/+$/, '')
-    .replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
-  const url = String(transport.url || '').replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
-  if (!gateway || !url.startsWith(gateway)) return transport;
-  const headers = Array.isArray(transport.headers) ? [...transport.headers] : [];
-  const hasCookie = headers.some(header =>
-    header && header.enabled !== false && String(header.name || '').toLowerCase() === 'cookie'
-  );
-  if (!hasCookie) {
-    headers.push(createHeader('Cookie', context.isGatewayCookie, headers.length, 'SYSTEM'));
-  }
-  transport.headers = headers;
-  return transport;
-}
-
-function isIsGatewayAccessDeniedResponse(response) {
-  if (!response || Number(response.statusCode) !== 403) return false;
-  const body = String(response.bodyPreview || response.internalBody || response.bodyText || response.body || '');
-  return /دسترسی به این مسیر مجاز نیست|شما دسترسی به این مسیر را ندارید|Forbidden/i.test(body);
-}
-
-function isIsAutoEnsureAccessRulesEnabled() {
-  const raw = String(process.env.API_CONSOLE_IS_AUTO_ENSURE_ACCESS_RULES || 'true').trim().toLowerCase();
-  return !(raw === 'false' || raw === '0' || raw === 'off' || raw === 'no');
-}
-
-async function ensureIsGatewayAccessRule(context, transport) {
-  if (!isIsAutoEnsureAccessRulesEnabled()) return { ok: false, skipped: true };
-  if (!context?.isGatewayCookie) return { ok: false, error: 'missing gateway cookie' };
-  let parsed;
-  try {
-    parsed = new URL(String(transport.url || ''));
-  } catch {
-    return { ok: false, error: 'invalid url' };
-  }
-  const gateway = String(context.isGatewayBaseUrl || process.env.API_CONSOLE_IS_GATEWAY_URL || 'http://127.0.0.1:4000')
-    .trim()
-    .replace(/\/+$/, '')
-    .replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1');
-  if (!gateway || !String(transport.url || '').replace(/^(https?:\/\/)localhost(?=[:/]|$)/i, '$1127.0.0.1').startsWith(gateway)) {
-    return { ok: false, error: 'not gateway url' };
-  }
-  const pathPrefix = parsed.pathname || '/';
-  const method = String(transport.method || 'GET').toUpperCase();
-  const rulesUrl = `${gateway}/api/v1/iam/rules`;
-  try {
-    const response = await fetch(rulesUrl, {
-      method: 'POST',
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/json',
-        cookie: context.isGatewayCookie,
-      },
-      body: JSON.stringify({
-        path_prefix: pathPrefix,
-        method,
-        allowed_roles: [],
-        is_public: true,
-      }),
-    });
-    const text = await response.text();
-    let data = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = { raw: text };
-    }
-    if (response.ok || response.status === 409) {
-      return { ok: true, status: response.status, data };
-    }
-    return { ok: false, status: response.status, data, error: data?.message || response.statusText };
-  } catch (error) {
-    return { ok: false, error: error.message || 'ensure rule failed' };
-  }
-}
-
-async function executeIsTransportWithAccessRecovery(transport, context) {
-  let response = await executeWithRedirects(transport);
-  if (!isIsGatewayAccessDeniedResponse(response)) return response;
-  const ensured = await ensureIsGatewayAccessRule(context, transport);
-  if (!ensured.ok) return response;
-  return executeWithRedirects(transport);
-}
-
-async function executeRequest(requestId, context, options = {}) {
-  if (!roleAllowed(context.role, API_CONSOLE_POLICY.canExecute)) {
-    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'User is not authorized to execute API requests.', 403);
-  }
-  const request = store.requests.find(item => item.id === requestId);
-  if (!request) throw new ApiConsoleError('INVALID_URL', 'Request not found.', 404);
-  if (request.classification.type === 'CORE_COMMAND' && !roleAllowed(context.role, API_CONSOLE_POLICY.canExecuteCommand)) {
-    throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Core Command execution requires elevated permission.', 403);
-  }
-
-  const environment = findEnvironment(options.environmentId || request.environmentId);
-  const executionRequest = safeClone({
-    ...request,
-    scripts: { ...createDefaultScripts(), ...(request.scripts || {}) },
-    executionMode: options.executionMode || request.executionMode,
-  });
-  const preScript = runPreRequestScript(executionRequest, executionRequest.scripts, options.executionVariables);
-  const resolved = resolveRequest(
-    preScript.request,
-    environment,
-    options.executionMode || request.executionMode,
-    preScript.variables
-  );
-  if (preScript.results.some(result => result.result === 'FAILED')) {
-    const execution = createBlockedExecution(request, resolved.snapshot, environment, context.userId, 'CORE_VALIDATION_ERROR', 'Pre-request script failed.', options.businessJustification, preScript.results);
-    store.executions.unshift(execution);
-    audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: 'CORE_VALIDATION_ERROR', reason: 'PRE_REQUEST_SCRIPT' });
-    saveStore(store);
-    return safeClone(execution);
-  }
-  if (resolved.errors.length) {
-    const first = resolved.errors[0];
-    const execution = createBlockedExecution(request, resolved.snapshot, environment, context.userId, first.category, resolved.errors.map(item => item.message).join(' '), options.businessJustification, preScript.results);
-    store.executions.unshift(execution);
-    audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: first.category });
-    saveStore(store);
-    return safeClone(execution);
-  }
-
-  const productionPolicy = validateProductionPolicy(request, environment, context, options);
-  if (!productionPolicy.allowed) {
-    const execution = createBlockedExecution(request, resolved.snapshot, environment, context.userId, productionPolicy.category, productionPolicy.message, options.businessJustification, preScript.results);
-    store.executions.unshift(execution);
-    audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: productionPolicy.category });
-    saveStore(store);
-    return safeClone(execution);
-  }
-
-  const startedAt = nowIso();
-  const preferredRunnerId = options.runnerId || request.runnerId;
-  let runner;
-  try {
-    runner = selectRunner(environment, null, preferredRunnerId, resolved.snapshot?.url || resolved.transport?.url);
-  } catch (error) {
-    const execution = createBlockedExecution(
-      request,
-      resolved.snapshot,
-      environment,
-      context.userId,
-      error.category || 'DESTINATION_NOT_ALLOWED',
-      error.message || 'Runner zone unavailable.',
-      options.businessJustification,
-      preScript.results
-    );
-    execution.runnerHost = runnerHostTag();
-    store.executions.unshift(execution);
-    audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: execution.errorCategory });
-    saveStore(store);
-    return safeClone(execution);
-  }
-
-  if (String(process.env.API_CONSOLE_ZONE_WORKER || '').toLowerCase() === 'true') {
-    if (!zoneWorkerHeartbeatFresh()) {
-      const execution = createBlockedExecution(
-        request,
-        resolved.snapshot,
-        environment,
-        context.userId,
-        'ZONE_WORKER_UNAVAILABLE',
-        'Zone worker is not running. Start with: npm run zone-worker -w @api-console/api',
-        options.businessJustification,
-        preScript.results
-      );
-      execution.runnerId = runner.id;
-      execution.networkZone = runner.networkZone;
-      execution.runnerHost = runnerHostTag();
-      store.executions.unshift(execution);
-      audit('API_REQUEST_EXECUTION_BLOCKED', context, { requestId, category: 'ZONE_WORKER_UNAVAILABLE' });
-      saveStore(store);
-      return safeClone(execution);
-    }
-    const queueJobId = makeId('zq');
-    const job = {
-      id: queueJobId,
-      status: 'PENDING',
-      requestId: request.id,
-      collectionId: request.collectionId,
-      environmentId: environment.id,
-      environmentName: environment.name,
-      runnerId: runner.id,
-      networkZone: runner.networkZone,
-      runnerHost: runnerHostTag(),
-      executedBy: context.userId,
-      startedAt,
-      businessJustification: options.businessJustification,
-      requestSnapshot: resolved.snapshot,
-      transport: resolved.transport,
-      assertions: request.assertions || [],
-      scripts: executionRequest.scripts,
-      preScriptResults: preScript.results,
-      createdAt: nowIso(),
-    };
-    if (!Array.isArray(store.executionQueue)) store.executionQueue = [];
-    store.executionQueue.push(job);
-    saveStore(store);
-    const deadline = Date.now() + Number(process.env.API_CONSOLE_ZONE_WORKER_WAIT_MS || 15000);
-    while (Date.now() < deadline) {
-      await sleep(250);
-      reloadStoreFromDisk();
-      const done = (store.executions || []).find(item => item.queueJobId === queueJobId);
-      if (done) return safeClone(done);
-      const current = (store.executionQueue || []).find(item => item.id === queueJobId);
-      if (current?.status === 'FAILED') {
-        const failed = createBlockedExecution(
-          request,
-          resolved.snapshot,
-          environment,
-          context.userId,
-          current.errorCategory || 'INTERNAL_EXECUTION_ERROR',
-          current.errorMessage || 'Zone worker failed to execute request.',
-          options.businessJustification,
-          preScript.results
-        );
-        failed.queueJobId = queueJobId;
-        failed.runnerId = runner.id;
-        failed.networkZone = runner.networkZone;
-        failed.runnerHost = runnerHostTag();
-        store.executions.unshift(failed);
-        store.executionQueue = (store.executionQueue || []).filter(item => item.id !== queueJobId);
-        saveStore(store);
-        return safeClone(failed);
-      }
-    }
-    const timedOut = createBlockedExecution(
-      request,
-      resolved.snapshot,
-      environment,
-      context.userId,
-      'ZONE_WORKER_TIMEOUT',
-      'Zone worker did not complete the queued execution in time.',
-      options.businessJustification,
-      preScript.results
-    );
-    timedOut.queueJobId = queueJobId;
-    timedOut.runnerId = runner.id;
-    timedOut.networkZone = runner.networkZone;
-    timedOut.runnerHost = runnerHostTag();
-    store.executions.unshift(timedOut);
-    saveStore(store);
-    return safeClone(timedOut);
-  }
-
-  try {
-    const transport = applyIsGatewayAuth(safeClone(resolved.transport), context);
-    const response = (context?.authApproach === 'IS' || context?.identitySource === 'IS')
-      ? await executeIsTransportWithAccessRecovery(transport, context)
-      : await executeWithRedirects(transport);
-    runner = selectRunner(environment, response.resolvedIpAddress, preferredRunnerId, resolved.snapshot?.url || resolved.transport?.url);
-    const assertionResults = evaluateAssertions(request, response);
-    const postScriptResults = runPostResponseScript(executionRequest.scripts, response);
-    const scriptAssertionResults = postScriptResults.map(result => ({
-      assertionId: `script-${result.phase}-${result.line}`,
-      assertionType: 'SCRIPT_TEST',
-      result: result.result,
-      message: `line ${result.line}: ${result.message}`,
-    }));
-    const scriptResults = [...preScript.results, ...postScriptResults];
-    const businessResult = businessResultFromAssertions([...assertionResults, ...scriptAssertionResults]);
-    const execution = {
-      id: makeId('api-exec'),
-      requestId: request.id,
-      collectionId: request.collectionId,
-      environmentId: environment.id,
-      runnerId: runner.id,
-      networkZone: runner.networkZone,
-      runnerHost: runnerHostTag(),
-      executedBy: context.userId,
-      startedAt,
-      completedAt: nowIso(),
-      durationMs: response.durationMs,
-      status: 'COMPLETED',
-      statusCode: response.statusCode,
-      responseSize: response.responseSize,
-      responseContentType: response.contentType,
-      requestSnapshot: resolved.snapshot,
-      response,
-      tlsVerification: resolved.snapshot.tls.verifyCertificate,
-      transportResult: response.statusCode && response.statusCode < 400 ? 'SUCCESS' : 'FAILED',
-      businessResult,
-      assertionResults,
-      scriptResults,
-      correlationId: makeId('api-corr'),
-      errorCategory: response.statusCode && response.statusCode >= 400 ? 'HTTP_ERROR' : undefined,
-      sanitizedError: response.statusCode && response.statusCode >= 400 ? `HTTP ${response.statusCode} ${response.statusText}` : undefined,
-      environmentName: environment.name,
-      evidenceType: 'ACTUAL_EXECUTION',
-      businessJustification: options.businessJustification,
-    };
-    store.executions.unshift(execution);
-    logUsageEvent('API_EXECUTED', context, request, {
-      environmentId: environment.id,
-      correlationId: execution.correlationId,
-      referenceId: request.referenceId,
-    });
-    audit('API_REQUEST_EXECUTED', context, { requestId, statusCode: execution.statusCode, runnerId: runner.id, runnerHost: execution.runnerHost });
-    saveStore(store);
-    return safeClone(execution);
-  } catch (error) {
-    const execution = createExecutionFromError(request, resolved, environment, context, error, options.businessJustification, preScript.results);
-    execution.runnerHost = runnerHostTag();
-    if (runner) {
-      execution.runnerId = runner.id;
-      execution.networkZone = runner.networkZone;
-    }
-    store.executions.unshift(execution);
-    audit('API_REQUEST_EXECUTION_FAILED', context, { requestId, category: execution.errorCategory });
-    saveStore(store);
-    return safeClone(execution);
-  }
 }
 
 function contextFromRequest(req, body) {
@@ -7124,11 +6199,36 @@ async function routeRequest(req, parsedUrl, body) {
 
   if (first === 'policy' && req.method === 'GET') return API_CONSOLE_POLICY;
 
+  if (first === 'object-storage' && second && !third && req.method === 'GET') {
+    requireContext(req, body);
+    const blob = objectStore.getBlob(decodeURIComponent(second));
+    if (!blob) throw new ApiConsoleError('INVALID_URL', 'Object storage blob not found.', 404);
+    return {
+      __rawResponse: {
+        contentType: blob.contentType || 'application/octet-stream',
+        body: blob.body,
+      },
+    };
+  }
+
   const phase2Result = await tryHandlePhase2(req, parsedUrl, body, parts);
   if (phase2Result !== undefined) return phase2Result;
 
   const phase3Result = await tryHandlePhase3(req, parsedUrl, body, parts);
   if (phase3Result !== undefined) return phase3Result;
+
+  const runtimeHttpResult = await tryHandleRuntimeHttp(req, parsedUrl, body, parts);
+  if (runtimeHttpResult !== undefined) return runtimeHttpResult;
+
+  const sharingResult = await tryHandleSharing(req, parsedUrl, body, parts);
+  if (sharingResult !== undefined) return sharingResult;
+
+  if (first === 'is') {
+    const { isEnabled: isIsEnabled } = require('../../../is/is-auth-server.cjs');
+    if (!isIsEnabled()) {
+      throw new ApiConsoleError('IS_DISABLED', 'رویکرد Integrated Systems در نسخهٔ فعلی غیرفعال است.', 403);
+    }
+  }
 
   if (first === 'is' && second === 'systems' && third && fourth === 'apis' && req.method === 'GET') {
     const session = requireSession(req);
@@ -7174,138 +6274,6 @@ async function routeRequest(req, parsedUrl, body) {
     return syncIsSystemDiscovery(decodeURIComponent(third), body?.data || body || {}, context, session);
   }
 
-  if (first === 'runtime-profiles' && !second && req.method === 'GET') {
-    const context = requireContext(req, body);
-    const applicationId = String(parsedUrl.searchParams.get('applicationId') || context.applicationId || '');
-    assertRuntimeProjectAccess(applicationId, context);
-    ensureDefaultRuntimeProfiles(applicationId, context);
-    const originFilter = resolveListOriginFilter(context, parsedUrl);
-    return safeClone(store.runtimeProfiles
-      .filter(profile => profile.applicationId === applicationId && profile.enabled !== false && matchesOriginId(profile, originFilter))
-      .map(runtimeProfileView)
-      .sort((left, right) => left.name.localeCompare(right.name, 'fa')));
-  }
-
-  if (first === 'runtime-profiles' && second && third === 'session') {
-    const context = requireContext(req, body);
-    const profile = findRuntimeProfile(second, context);
-    const { appSession, phone } = runtimeSessionIdentity(req, context);
-    if (!fourth && req.method === 'GET') {
-      const state = await getRuntimeSession(appSession.id, profile.id);
-      if (state && normalizeCdeLoginName(state.loginName) !== phone) {
-        await deleteRuntimeSession(appSession.id, profile.id);
-        return { ...publicRuntimeStatus(null), profileId: profile.id };
-      }
-      return { ...publicRuntimeStatus(state), profileId: profile.id };
-    }
-    if (!fourth && req.method === 'DELETE') {
-      assertCsrf(req);
-      await deleteRuntimeSession(appSession.id, profile.id);
-      audit('RUNTIME_SESSION_DISCONNECTED', context, { profileId: profile.id });
-      saveStore(store);
-      return { ...publicRuntimeStatus(null), profileId: profile.id };
-    }
-    if (fourth === 'start' && req.method === 'POST') {
-      assertCsrf(req);
-      await deleteRuntimeSession(appSession.id, profile.id);
-      const result = await startRuntimeLogin(profile, phone);
-      await setRuntimeSession(appSession.id, profile.id, result.state, result.state.phase === 'PASSWORD_REQUIRED' ? 5 * 60 : undefined);
-      audit('RUNTIME_LOGIN_STARTED', context, { profileId: profile.id, nextStep: result.status.nextStep || result.status.phase });
-      saveStore(store);
-      return { ...result.status, profileId: profile.id };
-    }
-    if (fourth === 'password' && req.method === 'POST') {
-      assertCsrf(req);
-      const password = String(body.password || '');
-      if (!password) throw new ApiConsoleError('RUNTIME_PASSWORD_REQUIRED', 'Runtime password is required.', 422);
-      const state = await getRuntimeSession(appSession.id, profile.id);
-      if (!state) throw new ApiConsoleError('RUNTIME_LOGIN_NOT_STARTED', 'Start Runtime login again.', 409);
-      try {
-        const result = await finishRuntimeLogin(state, profile, password);
-        await setRuntimeSession(appSession.id, profile.id, result.state);
-        audit('RUNTIME_LOGIN_COMPLETED', context, { profileId: profile.id });
-        saveStore(store);
-        return { ...result.status, profileId: profile.id };
-      } catch (error) {
-        await setRuntimeSession(appSession.id, profile.id, state, 5 * 60);
-        if (error.category === 'RUNTIME_LOGICAL_ERROR') {
-          throw new ApiConsoleError('RUNTIME_INVALID_CREDENTIALS', 'Runtime did not accept the supplied credentials.', 401);
-        }
-        throw error;
-      }
-    }
-    throw new ApiConsoleError('INVALID_URL', 'Runtime session endpoint not found.', 404);
-  }
-
-  if (first === 'admin' && second === 'runtime-profiles') {
-    const context = requireContext(req, body);
-    if (third && fourth === 'promote' && req.method === 'POST') {
-      assertCsrf(req);
-      const targetKind = body.targetKind ?? body.data?.targetKind;
-      return safeClone(promoteRuntimeProfile(third, targetKind, context));
-    }
-    if (!canManageDevelopmentRuntimeProfiles(context)) {
-      assertSystemAdministrator(context);
-    }
-    if (!third && req.method === 'POST') {
-      assertCsrf(req);
-      const rawInput = body.data || body || {};
-      const input = runtimeProfileMutationInput(rawInput, context);
-      const batchRequested = Array.isArray(rawInput.origins)
-        || Array.isArray(rawInput.applicationIds)
-        || String(rawInput.applicationId || '') === 'ALL'
-        || (typeof rawInput.origin === 'string' && /[\n,]/.test(rawInput.origin));
-      const result = createRuntimeProfilesFromInput(input, context);
-      if (!batchRequested && result.created.length === 1 && result.skipped.length === 0) {
-        return safeClone(result.created[0]);
-      }
-      return safeClone(result);
-    }
-    const profile = store.runtimeProfiles.find(item => item.id === String(third));
-    if (!profile) throw new ApiConsoleError('RUNTIME_PROFILE_NOT_FOUND', 'Runtime Profile was not found.', 404);
-    assertRuntimeProjectAccess(profile.applicationId, context);
-    if (!fourth && req.method === 'PUT') {
-      assertCsrf(req);
-      assertCanManageRuntimeProfile(context, profile.kind);
-      if (body.rowVersion && body.rowVersion !== profile.rowVersion) throw new ApiConsoleError('RUNTIME_PROFILE_CONFLICT', 'Runtime Profile changed in another session.', 409);
-      const input = runtimeProfileMutationInput(body.data || body, context, profile);
-      const next = normalizeRuntimeProfileInput(input, context, profile);
-      if (store.runtimeProfiles.some(item => item.id !== next.id && item.applicationId === next.applicationId && item.origin === next.origin && item.kind === next.kind && item.enabled !== false)) {
-        throw new ApiConsoleError('RUNTIME_PROFILE_DUPLICATE', 'An active Runtime Profile with this project, origin, and kind already exists.', 409);
-      }
-      store.runtimeProfiles[store.runtimeProfiles.indexOf(profile)] = next;
-      audit('RUNTIME_PROFILE_UPDATED', context, { profileId: next.id, applicationId: next.applicationId, origin: next.origin });
-      saveStore(store);
-      return safeClone(runtimeProfileView(next));
-    }
-    if (!fourth && req.method === 'DELETE') {
-      assertSystemAdministrator(context);
-      assertCsrf(req);
-      profile.enabled = false;
-      profile.disabledAt = nowIso();
-      profile.disabledBy = context.userId;
-      profile.updatedAt = nowIso();
-      profile.rowVersion = makeId('row');
-      await deleteRuntimeSession(requireSession(req).id, profile.id);
-      audit('RUNTIME_PROFILE_DISABLED', context, { profileId: profile.id });
-      saveStore(store);
-      return safeClone(runtimeProfileView(profile));
-    }
-    if (fourth === 'validate' && req.method === 'POST') {
-      assertCsrf(req);
-      assertCanManageRuntimeProfile(context, profile.kind);
-      const validation = await validateRuntimeOrigin(profile.origin);
-      profile.lastValidatedAt = nowIso();
-      profile.lastValidation = { valid: true, addresses: validation.addresses, checkedAt: profile.lastValidatedAt };
-      profile.updatedAt = nowIso();
-      profile.rowVersion = makeId('row');
-      audit('RUNTIME_PROFILE_VALIDATED', context, { profileId: profile.id, hostname: validation.hostname, addresses: validation.addresses });
-      saveStore(store);
-      return safeClone({ profile: runtimeProfileView(profile), validation: profile.lastValidation });
-    }
-    throw new ApiConsoleError('INVALID_URL', 'Runtime Profile administration endpoint not found.', 404);
-  }
-
   if (first === 'projects' && second && third === 'discovery') {
     const projectKey = decodeURIComponent(second);
     const context = requireContext(req, body);
@@ -7324,28 +6292,6 @@ async function routeRequest(req, parsedUrl, body) {
       return safeClone(syncDiscoverySnapshot(snapshot, body.data || body, context));
     }
     throw new ApiConsoleError('INVALID_URL', 'Discovery endpoint not found.', 404);
-  }
-
-  if (first === 'projects' && second && third === 'runtime-profiles' && fourth && fifth) {
-    const projectKey = decodeURIComponent(second);
-    const context = requireContext(req, body);
-    assertRuntimeProjectAccess(projectKey, context);
-    const profile = findRuntimeProfile(fourth, context);
-    if (profile.applicationId !== projectKey) throw new ApiConsoleError('RUNTIME_BINDING_INVALID', 'Runtime Profile does not belong to the requested project.', 422);
-    const snapshot = latestDiscovery(projectKey);
-    if (!snapshot) throw new ApiConsoleError('DISCOVERY_NOT_FOUND', 'Run CDE discovery before generating Runtime outputs.', 404);
-    if (fifth === 'openapi.json' && req.method === 'GET') return runtimeOpenApiDocument(projectKey, profile, snapshot);
-    if (fifth === 'docs' && req.method === 'GET') return { __rawResponse: { contentType: 'text/html; charset=utf-8', body: runtimeDocsHtml(projectKey, profile) } };
-    if (fifth === 'postman' && req.method === 'GET') return buildRuntimePostmanCollection(projectKey, profile, snapshot);
-    if (fifth === 'curl' && req.method === 'GET') {
-      return buildRuntimeCurlExport(projectKey, profile, snapshot, parsedUrl.searchParams.get('operationId'), parsedUrl.searchParams.get('mode') || 'sample');
-    }
-    throw new ApiConsoleError('INVALID_URL', 'Runtime output endpoint not found.', 404);
-  }
-
-  if (first === 'runtime' && second === 'operations' && third && fourth === 'execute' && req.method === 'POST') {
-    const context = requireContext(req, body);
-    return executeRuntimeDiscoveredOperation(req, third, body.data || body, context);
   }
 
   if (first === 'admin' && second === 'users') {
@@ -7493,190 +6439,6 @@ async function routeRequest(req, parsedUrl, body) {
   if (first === 'reports' && second === 'api-usage' && req.method === 'GET') {
     const context = requireContext(req, body);
     return safeClone(filterUsageEvents(context, parsedUrl));
-  }
-
-  if (first === 'share-reviews') {
-    const context = requireContext(req, body);
-    assertCanReviewShares(context);
-    if (!second && req.method === 'GET') {
-      const scope = parsedUrl.searchParams.get('applicationId') || 'ALL';
-      const filters = {
-        page: Number(parsedUrl.searchParams.get('page') || 1),
-        limit: Number(parsedUrl.searchParams.get('limit') || 30),
-        search: parsedUrl.searchParams.get('search') || '',
-        status: parsedUrl.searchParams.get('status') || '',
-        submittedBy: parsedUrl.searchParams.get('submittedBy') || '',
-        version: parsedUrl.searchParams.get('version') || '',
-      };
-      let rows = store.shareRequests.filter(share =>
-        matchesApplicationScope(share.applicationId, scope) &&
-        matchesApplicationScope(share.applicationId, context.scopeApplicationIds || context.applicationId)
-      );
-      if (filters.status) rows = rows.filter(share => share.status === filters.status);
-      if (filters.submittedBy) rows = rows.filter(share => share.submittedBy === filters.submittedBy);
-      if (filters.version) rows = rows.filter(share => share.version === filters.version);
-      if (filters.search.trim()) {
-        const search = filters.search.toLowerCase();
-        rows = rows.filter(share => [share.apiTitle, share.apiId, share.version, share.applicationId, share.submittedByName]
-          .filter(Boolean)
-          .some(value => String(value).toLowerCase().includes(search)));
-      }
-      rows = rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      return safeClone(paginate(rows, filters.page, filters.limit));
-    }
-
-    const share = store.shareRequests.find(item => item.id === second);
-    if (!share) throw new ApiConsoleError('INVALID_URL', 'Share review request not found.', 404);
-    if (!matchesApplicationScope(share.applicationId, context.scopeApplicationIds || context.applicationId)) {
-      throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Share request is outside active application scope.', 403);
-    }
-    const sourceRequest = store.requests.find(request => request.id === share.requestId);
-
-    if (!third && req.method === 'GET') {
-      return safeClone({
-        ...share,
-        request: sourceRequest,
-        consumers: consumersForVersion(share.apiId, share.version),
-      });
-    }
-
-    if (third === 'approve' && req.method === 'POST') {
-      if (share.status !== 'PENDING_REVIEW') {
-        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این درخواست قبلاً بررسی شده است.', 409);
-      }
-      if (body.rowVersion && body.rowVersion !== share.rowVersion) {
-        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این درخواست قبلاً توسط کاربر دیگری تغییر کرده است.', 409);
-      }
-      if (!sourceRequest) throw new ApiConsoleError('INVALID_URL', 'Source request not found.', 404);
-      const consumers = normalizeConsumers(body.consumers || body.data?.consumers || [], sourceRequest, context);
-      if (!consumers.length) {
-        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'انتخاب حداقل یک مصرف‌کننده الزامی است.');
-      }
-      const checklist = {
-        docsComplete: false,
-        noSecrets: false,
-        classificationOk: false,
-        consumersSpecified: true,
-        ...(share.checklist || {}),
-        ...(body.checklist || body.data?.checklist || {}),
-      };
-      share.checklist = checklist;
-      if (!REVIEW_CHECKLIST_KEYS.every(key => checklist[key] === true)) {
-        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'تأیید بدون تکمیل چک‌لیست Review ممکن نیست (docs/secret/classification/consumers).');
-      }
-      const revision = share.revisions.find(item => item.revisionNumber === share.currentRevisionNumber) || share.revisions[share.revisions.length - 1];
-      if (revision) {
-        revision.status = 'APPROVED';
-        revision.reviewedBy = context.userId;
-        revision.reviewedAt = nowIso();
-        revision.reviewAction = 'APPROVED';
-        revision.rowVersion = makeId('row');
-      }
-      store.consumers = store.consumers.filter(consumer => !(consumer.apiId === share.apiId && consumer.version === share.version));
-      store.consumers.unshift(...consumers);
-      share.status = 'APPROVED';
-      share.reviewedBy = context.userId;
-      share.reviewedAt = nowIso();
-      share.rowVersion = makeId('row');
-      share.updatedAt = nowIso();
-      sourceRequest.sharingStatus = 'APPROVED';
-      sourceRequest.approvedAt = nowIso();
-      sourceRequest.approvedBy = context.userId;
-      sourceRequest.shareRequestId = share.id;
-      sourceRequest.updatedAt = nowIso();
-      const correlationId = makeId('api-corr');
-      notifyUser(sourceRequest.createdBy, 'API تأیید شد', `${sourceRequest.name} نسخه ${share.version} در Repository منتشر شد.`, 'API_REQUEST', sourceRequest.id, correlationId);
-      consumers.filter(consumer => consumer.consumerType === 'USER').forEach(consumer => {
-        store.readReceipts.unshift({
-          id: makeId('read'),
-          userId: consumer.userId,
-          apiId: share.apiId,
-          version: share.version,
-          notifiedAt: nowIso(),
-        });
-        notifyUser(consumer.userId, 'نسخه جدید API منتشر شد', `${sourceRequest.name} نسخه ${share.version} برای شما قابل استفاده است.`, 'API_REQUEST', sourceRequest.id, correlationId);
-      });
-      audit('API_SHARE_APPROVED', context, { shareRequestId: share.id, apiId: share.apiId, version: share.version, consumers });
-      saveStore(store);
-      void deliverItsmWebhook(
-        process.env.API_CONSOLE_ITSM_WEBHOOK_URL || '',
-        process.env.API_CONSOLE_ITSM_WEBHOOK_SECRET || '',
-        {
-          event: 'API_SHARE_APPROVED',
-          shareRequestId: share.id,
-          apiId: share.apiId,
-          version: share.version,
-          ticketId: share.ticketId,
-          ticketUrl: share.ticketUrl,
-          applicationId: share.applicationId,
-          reviewedBy: context.userId,
-          at: nowIso(),
-        }
-      ).then(delivery => {
-        if (!Array.isArray(store.itsmWebhookQueue)) store.itsmWebhookQueue = [];
-        store.itsmWebhookQueue.unshift({
-          id: makeId('itsm'),
-          eventType: 'API_SHARE_APPROVED',
-          status: delivery.ok ? 'DELIVERED' : (delivery.skipped ? 'SKIPPED' : 'FAILED'),
-          lastError: delivery.error || null,
-          createdAt: nowIso(),
-        });
-        store.itsmWebhookQueue = store.itsmWebhookQueue.slice(0, 200);
-        saveStore(store);
-      }).catch(() => {});
-      return safeClone({ ...share, consumers });
-    }
-
-    if (third === 'return' && req.method === 'POST') {
-      const reason = String(body.reason || body.data?.reason || '').trim();
-      if (!reason) throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'دلیل بازگردانی الزامی است.');
-      if (share.status !== 'PENDING_REVIEW') {
-        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این درخواست قبلاً بررسی شده است.', 409);
-      }
-      if (body.rowVersion && body.rowVersion !== share.rowVersion) {
-        throw new ApiConsoleError('CORE_VALIDATION_ERROR', 'این درخواست قبلاً توسط کاربر دیگری تغییر کرده است.', 409);
-      }
-      const revision = share.revisions.find(item => item.revisionNumber === share.currentRevisionNumber) || share.revisions[share.revisions.length - 1];
-      if (revision) {
-        revision.status = 'RETURNED';
-        revision.reviewedBy = context.userId;
-        revision.reviewedAt = nowIso();
-        revision.reviewAction = 'RETURNED';
-        revision.returnReason = reason;
-        revision.rowVersion = makeId('row');
-      }
-      share.status = 'RETURNED';
-      share.returnReason = reason;
-      share.reviewedBy = context.userId;
-      share.reviewedAt = nowIso();
-      share.rowVersion = makeId('row');
-      share.updatedAt = nowIso();
-      if (sourceRequest) {
-        sourceRequest.sharingStatus = 'RETURNED';
-        sourceRequest.latestReturnReason = reason;
-        sourceRequest.updatedAt = nowIso();
-      }
-      notifyUser(share.submittedBy, 'درخواست اشتراک API بازگردانده شد', reason, 'API_REQUEST', share.requestId, makeId('api-corr'));
-      audit('API_SHARE_RETURNED', context, { shareRequestId: share.id, apiId: share.apiId, version: share.version, reason });
-      saveStore(store);
-      void deliverItsmWebhook(
-        process.env.API_CONSOLE_ITSM_WEBHOOK_URL || '',
-        process.env.API_CONSOLE_ITSM_WEBHOOK_SECRET || '',
-        {
-          event: 'API_SHARE_RETURNED',
-          shareRequestId: share.id,
-          apiId: share.apiId,
-          version: share.version,
-          ticketId: share.ticketId,
-          ticketUrl: share.ticketUrl,
-          reason,
-          applicationId: share.applicationId,
-          reviewedBy: context.userId,
-          at: nowIso(),
-        }
-      ).catch(() => {});
-      return safeClone(share);
-    }
   }
 
   if (first === 'repository') {
@@ -8758,6 +7520,7 @@ function resolveCorsOrigin(req) {
 
 function createServer() {
   assertProductionSecrets();
+  startObjectStoreCleanupInterval();
   return http.createServer(async (req, res) => {
     res.setHeader('access-control-allow-origin', resolveCorsOrigin(req));
     res.setHeader('access-control-allow-credentials', 'true');
@@ -8780,13 +7543,16 @@ function createServer() {
       attachConsoleContext(req);
 
       if (parsedUrl.pathname === '/api/health' && req.method === 'GET') {
+        const { isEnabled: isIsEnabled } = require('../../../is/is-auth-server.cjs');
         sendJson(res, 200, {
           status: storeReady ? 'ok' : 'starting',
           service: 'api-console',
+          release: 'v1-cde-local',
           storeBackend: STORE_BACKEND,
           storeReady,
+          isEnabled: isIsEnabled(),
           checkedAt: nowIso(),
-          modules: ['api-console', 'cde-bridge', 'is-bridge', 'session'],
+          modules: ['api-console', 'cde-bridge', 'local-auth', 'session'],
         });
         return;
       }

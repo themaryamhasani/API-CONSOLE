@@ -1,8 +1,10 @@
 # Approach: Integrated Systems (IS)
 
-**وضعیت:** پیاده‌سازی‌شده (لاگین + session + کشف Spec-first از `*.service.json` + sync به Request + اجرای Gateway با Cookie).  
+**وضعیت محصول v1:** **غیرفعال / Deferred.** کد پیاده شده است (لاگین + session + کشف Spec-first + sync + Gateway Cookie) ولی تا پس از go-live زیر بار روشن نمی‌شود.  
+**Flag:** `API_CONSOLE_IS_ENABLED=false` (پیش‌فرض؛ opt-in). مسیرهای IS به‌جز `GET /api/auth/is/config` با `403 IS_DISABLED` بسته می‌شوند.  
+**فعال‌سازی بعدی:** [deploy/PRODUCTION.md](../deploy/PRODUCTION.md) § Enabling IS later.  
 **منبع کد مرجع:** `D:\AllApp\IS\integrated-systems`  
-**کد Console:** `apps/api/src/modules/is/is-auth-server.cjs` ، تب «ورود IS» در `CdeLoginPage.tsx`
+**کد Console:** `apps/api/src/modules/is/is-auth-server.cjs`
 
 ## IS چیست؟ (شناسایی)
 
@@ -146,10 +148,13 @@ sequenceDiagram
 Env:
 
 ```bash
-API_CONSOLE_IS_ENABLED=true
-API_CONSOLE_IS_GATEWAY_URL=http://127.0.0.1:4000
-API_CONSOLE_IS_SPECS_ROOT=D:/AllApp/IS/integrated-systems/specs/medu-apps,D:/AllApp/IS/integrated-systems/specs/edus-apps
-API_CONSOLE_IS_SESSION_COOKIE=_lsr
+# v1: keep false. Enable only after production is stable under load.
+API_CONSOLE_IS_ENABLED=false
+# When enabling post-v1:
+# API_CONSOLE_IS_ENABLED=true
+# API_CONSOLE_IS_GATEWAY_URL=https://gateway.example.edus.ir
+# API_CONSOLE_IS_SPECS_ROOT=/mounted/specs/medu-apps,/mounted/specs/edus-apps
+# API_CONSOLE_IS_SESSION_COOKIE=_lsr
 ```
 
 ## User Stories

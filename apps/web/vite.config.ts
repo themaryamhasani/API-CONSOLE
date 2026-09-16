@@ -50,12 +50,34 @@ export default defineConfig(({ mode }) => {
     plugins: [react(), tailwindcss()],
     envDir: repoRoot,
     server: {
+      // Listen on IPv4+IPv6 so hosts-file names (api.edus.ir → 127.0.0.1) work,
+      // not only the localhost / ::1 binding.
+      host: true,
       port: Number.isFinite(webPort) && webPort > 0 ? webPort : DEFAULT_WEB_PORT,
       // If 5280 is taken by something else, Vite picks the next free port instead of crashing.
       strictPort: false,
+      // Vite 5+ blocks unknown Host headers; allow local *.edus.ir hosts-file aliases.
+      allowedHosts: [
+        "localhost",
+        "127.0.0.1",
+        "api.edus.ir",
+        "api-console.edus.ir",
+        ".edus.ir",
+      ],
       proxy: {
         "^/api(?:/|$)": {
           target: apiProxyTarget,
+          changeOrigin: true,
+        },
+      },
+    },
+    preview: {
+      host: "127.0.0.1",
+      port: Number(env.E2E_WEB_PORT || process.env.E2E_WEB_PORT || 5290),
+      strictPort: true,
+      proxy: {
+        "^/api(?:/|$)": {
+          target: String(env.E2E_API_URL || process.env.E2E_API_URL || "http://127.0.0.1:5291"),
           changeOrigin: true,
         },
       },

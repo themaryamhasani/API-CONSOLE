@@ -91,8 +91,8 @@ flowchart TB
 | --- | --- |
 | CDE + FREE | پیاده‌سازی‌شده (`PERSONAL` یا پروژه) |
 | CDE + CDE | پیاده‌سازی‌شده (Discovery) |
-| LOCAL + FREE | هدف E34 |
-| IS + FREE / IS | هدف E35 |
+| LOCAL + FREE | پیاده‌سازی‌شده (E34) |
+| IS + FREE / IS | پیاده‌سازی‌شده در کد؛ **خاموش تا پس از v1** (`API_CONSOLE_IS_ENABLED=false`) |
 | LOCAL + CDE Discovery | غیرمجاز |
 
 ---
@@ -116,11 +116,18 @@ flowchart TB
 - Phase3: mocks، contract، JIT، branding، ITSM hooks، OpenAPI export
 - `npm run dev:kill-ports`
 
-### 5.2 طراحی‌شده / Backlog
+### 5.2 طراحی‌شده / Backlog (پس از v1)
 
-- **E34** Local Directory login
-- **E35** IS Gateway bridge + systems + import
+- **E35 تکمیل** — روشن‌کردن IS پس از go-live، Import OpenAPI از idp-docs، تست Gateway mock
+- **E22** — شکستن کامل مونولیت UI/API
+- **S01.03** — object-store برای bodyهای خیلی بزرگ
 
+### 5.3 تحویل v1 (الان)
+
+- ورود **CDE + Local**؛ IS خاموش
+- Persistence production: **Postgres + Redis**
+- Packaging: Docker Compose + nginx SPA proxy
+- Runbook: [`deploy/PRODUCTION.md`](./deploy/PRODUCTION.md)
 ---
 
 ## 6. معماری منطقی
@@ -179,7 +186,7 @@ flowchart LR
 | `/`, `/api-console` | Console اصلی | نشست معتبر |
 | `/portal` | Portal احرازشده | نشست |
 | `/portal/shared/:token` | Portal عمومی | توکن |
-| Login gate | CDE (الان) / Local+IS (آینده) | عمومی |
+| Login gate | CDE + Local (v1) / IS پس از فعال‌سازی flag | عمومی |
 
 ---
 
@@ -193,9 +200,9 @@ flowchart LR
 | --- | --- | --- | --- |
 | US-AUTH-01 | P0 | DONE | به‌عنوان کاربر CDE می‌خواهم با موبایل/رمز وارد شوم تا پروژه‌هایم را ببینم. |
 | US-AUTH-02 | P0 | DONE | به‌عنوان ادمین می‌خواهم نقش directory بدهم بدون اینکه auth از مرورگر جعل شود. |
-| US-AUTH-03 | P0 | TODO | به‌عنوان مدیر می‌خواهم کاربر محلی بسازم تا غیر-CDE وارد شوند. |
-| US-AUTH-04 | P0 | TODO | به‌عنوان کاربر محلی می‌خواهم با یوزر/پسورد وارد Console شوم. |
-| US-AUTH-05 | P1 | TODO | به‌عنوان کاربر IS می‌خواهم با نشست Gateway وارد شوم. |
+| US-AUTH-03 | P0 | DONE | به‌عنوان مدیر می‌خواهم کاربر محلی بسازم تا غیر-CDE وارد شوند. |
+| US-AUTH-04 | P0 | DONE | به‌عنوان کاربر محلی می‌خواهم با یوزر/پسورد وارد Console شوم. |
+| US-AUTH-05 | P1 | DEFERRED | به‌عنوان کاربر IS می‌خواهم با نشست Gateway وارد شوم (پس از v1 / زیر بار). |
 
 ### 7.2 درخواست آزاد (Postman-like)
 
@@ -369,24 +376,24 @@ erDiagram
 
 ## 13. معیارهای پذیرش محصول (سطح PRD)
 
-1. سه Approach در UI ورود قابل انتخاب باشند (CDE الان؛ Local و IS طبق flag).
+1. دو Approach در UI ورود قابل انتخاب باشند (CDE + Local در v1؛ IS با flag پس از go-live).
 2. کاربر LOCAL بتواند بدون CDE Request آزاد Send کند.
 3. کاربر CDE بتواند Discovery و FREE را جدا استفاده کند.
-4. کاربر IS بتواند حداقل یک service-key را ببیند و یک GET از طریق Gateway اجرا کند (پس از E35).
-5. Share/Portal/Policy برای همه Approachهای مجاز یکسان بماند مگر استثنای صریح.
+4. کاربر IS بتواند حداقل یک service-key را ببیند و یک GET از طریق Gateway اجرا کند (**پس از فعال‌سازی E35 / post-v1**).
+5. Share/Portal/Policy برای Approachهای فعال یکسان بماند مگر استثنای صریح.
 6. هیچ secret در Export Postman/cURL به‌صورت خام ذخیرهٔ سمت کلاینت نرود.
 7. ماتریس تست ریشه برای session، admin، runtime، phase2/3 سبز باشد.
+8. استقرار production با Postgres+Redis+Compose طبق [`deploy/PRODUCTION.md`](./deploy/PRODUCTION.md) و `isEnabled=false`.
 
 ---
 
 ## 14. نقشه انتشار پیشنهادی
 
-| فاز | محتوا |
-| --- | --- |
-| **اکنون** | تثبیت FREE+CDE، docs، DNS، kill-ports |
-| **PI بعدی** | E34 Local Directory end-to-end |
-| **PI بعد** | E35 IS bridge MVP (session + systems + execute) |
-| **ادامه** | Import OpenAPI IS، همراستایی access rules |
+| فاز | محتوا | وضعیت |
+| --- | --- | --- |
+| **v1 (الان)** | FREE+CDE+Local، Postgres+Redis، Compose/nginx، IS خاموش | **در حال تحویل** |
+| **پس از go-live زیر بار** | فعال‌سازی E35 IS (session + systems + Gateway execute) | برنامه‌ریزی‌شده |
+| **ادامه** | Import OpenAPI IS، E22 modularization، object-store | Backlog |
 
 ---
 

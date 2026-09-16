@@ -4,7 +4,15 @@ build/
 /runtime/
 .env
 .env.local
+.env.production
+!.env.production.example
 *.log
 .DS_Store
 coverage/
 .vite/
+/test-results/
+/playwright-report/
+/blob-report/
+/apps/web/test-results/
+/apps/web/playwright-report/
+/apps/web/blob-report/

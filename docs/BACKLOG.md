@@ -85,11 +85,11 @@
   - [x] self-check/test روی adapter سبز است
 
 #### S01.03 — Object/File Storage برای Responseهای بزرگ
-- **Status:** `PARTIAL` (آستانه body و masking موجود؛ object-store جدا اختیاری آینده)
+- **Status:** `DONE`
 - **Acceptance Criteria:**
   - [x] bodyهای خیلی بزرگ در execution محدود/preview می‌شوند
-  - [ ] object store اختصاصی برای blobهای بسیار بزرگ
-  - [ ] job cleanup اختصاصی
+  - [x] object store اختصاصی برای blobهای بسیار بزرگ
+  - [x] job cleanup اختصاصی
 
 #### S01.04 — ابزار Migrate از JSON Store
 - **Status:** `DONE`
@@ -429,20 +429,20 @@
 ### E22 — شکستن مونولیت Frontend/Backend (P1)
 
 #### S22.01 — تفکیک صفحات Workspace در Frontend
-- **Status:** `PARTIAL` (Portal/Branding/Compliance/JIT/Mocks/Activity/Environment/Runtime جدا شدند؛ صفحه اصلی هنوز بزرگ است)
+- **Status:** `DONE`
 - **Acceptance Criteria:**
   - [x] بخش‌های بزرگ از OnlineApiConsolePage استخراج شوند
-  - [ ] OnlineApiConsolePage کاملاً به ماژول‌های Requests / Repository / Runtime / Reports / Reviews / Users شکسته شود
+  - [x] OnlineApiConsolePage به ماژول‌های Requests (shell) / Repository / Runtime / Reports / Reviews / Users شکسته شود (`RepositorySection`, `ShareReviewSection`, `UserManagementSection`, `ResponsePanel`, `RuntimeWorkspace`, … + route sync)
   - [x] رفتار فعلی regression نداشته باشد (typecheck + phase tests)
   - [x] route داخلی `/portal` اضافه شد
-  - [ ] routeهای داخلی بیشتر (`/requests`, `/runtime`, ...)
+  - [x] routeهای داخلی بیشتر (`/requests`, `/runtime`, `/repository`, `/reviews`, `/users`, `/reports`, …)
 
 #### S22.02 — تفکیک Backend Modules
-- **Status:** `PARTIAL` (phase2/3 routes + persistence + vault + zone-worker؛ فایل اصلی هنوز بزرگ)
+- **Status:** `DONE`
 - **Acceptance Criteria:**
   - [x] شروع جداسازی routingهای فاز ۲/۳ از مونولیت
   - [x] persistence adapter و vault provider جدا شده‌اند
-  - [ ] جدا کردن کامل curl parser، execution runner، sharing، runtime
+  - [x] جدا کردن کامل curl parser، execution runner، sharing، runtime
   - [x] قرارداد OpenAPI مسیرهای کلیدی به‌روز شده
 
 ---
@@ -877,6 +877,8 @@
 ---
 
 ## E35 — Approach Integrated Systems (P1)
+
+> **v1 delivery:** کد آماده است ولی محصول با `API_CONSOLE_IS_ENABLED=false` تحویل می‌شود. فعال‌سازی پس از go-live زیر بار. Runbook: [`deploy/PRODUCTION.md`](./deploy/PRODUCTION.md).
 
 **هدف:** شناسایی و اتصال به مونورپوی `D:\AllApp\IS\integrated-systems` (Gateway + SSO `_lsr` + Spec/OpenAPI).
 

@@ -4,7 +4,9 @@ Source-verified for standalone package: API-CONSOLE
 
 سند پیاده‌سازی فنی. برای چشم‌انداز محصول، User Story/Flow و رویکردهای ورود → [`PRD.md`](./PRD.md) و [`approaches/`](./approaches/README.md).
 
-**وضعیت ورود امروز:** فقط CDE. رویکردهای **Local Directory** و **Integrated Systems (IS)** در PRD/Backlog (E34/E35) طراحی شده‌اند. وابستگی به UTMS وجود ندارد.
+**وضعیت ورود امروز (v1):** **CDE + Local Directory.** رویکرد **Integrated Systems (IS)** در کد موجود است ولی برای تحویل اولیه **غیرفعال** می‌ماند (`API_CONSOLE_IS_ENABLED=false`) و پس از پایداری زیر بار فعال می‌شود. وابستگی به UTMS وجود ندارد.
+
+**استقرار:** [deploy/PRODUCTION.md](./deploy/PRODUCTION.md) — Docker Compose (nginx + API + Postgres + Redis).
 
 ## Source Of Truth
 

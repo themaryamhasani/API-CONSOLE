@@ -16,7 +16,9 @@ API Console can persist the in-memory document store to **PostgreSQL** while kee
 
 Columns are the source of truth (no global `payload_json` blob). Nested documents use `jsonb` plus a narrow `extra` column for forward compatibility.
 
-## Setup
+## Production deploy
+
+For the full cutover (Compose, Redis, nginx, SSO domain, v1 IS-off policy) see **[docs/deploy/PRODUCTION.md](../deploy/PRODUCTION.md)**.
 
 ```bash
 # 1. Ensure PostgreSQL is running and the database exists

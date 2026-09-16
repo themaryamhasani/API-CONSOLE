@@ -19,6 +19,7 @@ import {
 import { cn } from '../../utils/cn';
 import { ROLE_LABELS } from '../../types';
 import { useSessionStore } from '../../stores/sessionStore';
+import { pathForWorkspaceView } from '../../pages/workspaceRouting';
 
 export type WorkspaceNavId =
   | 'requests'
@@ -234,9 +235,9 @@ export function AppShell({
               </p>
               <div className="space-y-0.5">
                 {group.items.map(item => (
-                  <button
+                  <Link
                     key={item.id}
-                    type="button"
+                    to={pathForWorkspaceView(item.id)}
                     className={cn('ac-nav-item', activeView === item.id && !isPortal && 'is-active')}
                     onClick={() => {
                       onNavigate?.(item.id);
@@ -245,7 +246,7 @@ export function AppShell({
                   >
                     {item.icon}
                     {item.label}
-                  </button>
+                  </Link>
                 ))}
               </div>
             </div>

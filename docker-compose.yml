@@ -1,0 +1,118 @@
+# API Console v1 — CDE + Local Directory (IS intentionally off)
+# Usage:
+#   cp .env.production.example .env.production
+#   # edit secrets, PUBLIC_URL, ADMIN_LOGINS
+#   docker compose --env-file .env.production up -d --build
+#   # or: npm run compose:up
+
+name: api-console
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-apiconsole}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:-api_console}
+    volumes:
+      - api_console_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - api_console_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - internal
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      API_CONSOLE_PORT: "5281"
+      API_CONSOLE_BIND_HOST: "0.0.0.0"
+      API_CONSOLE_STORE_BACKEND: POSTGRES
+      DATABASE_URL: postgresql://${POSTGRES_USER:-apiconsole}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-api_console}?schema=public
+      REDIS_URL: redis://redis:6379
+      API_CONSOLE_IS_ENABLED: "false"
+      API_CONSOLE_ALLOW_LEGACY_CONTEXT: ""
+      API_CONSOLE_DATA_DIR: /app/runtime/api-console
+      API_CONSOLE_VAULT_PROVIDER: ${API_CONSOLE_VAULT_PROVIDER:-local}
+      API_CONSOLE_CORS_ORIGIN: ${API_CONSOLE_CORS_ORIGIN:-https://api-console.edus.ir}
+      API_CONSOLE_PUBLIC_URL: ${API_CONSOLE_PUBLIC_URL:-https://api-console.edus.ir}
+      API_CONSOLE_COOKIE_SECURE: "true"
+      API_CONSOLE_CSRF_SECRET: ${API_CONSOLE_CSRF_SECRET:?set API_CONSOLE_CSRF_SECRET}
+      API_CONSOLE_SECRET_KEY: ${API_CONSOLE_SECRET_KEY:?set API_CONSOLE_SECRET_KEY}
+      CDE_SESSION_ENCRYPTION_KEY: ${CDE_SESSION_ENCRYPTION_KEY:?set CDE_SESSION_ENCRYPTION_KEY}
+      RUNTIME_SESSION_ENCRYPTION_KEY: ${RUNTIME_SESSION_ENCRYPTION_KEY:?set RUNTIME_SESSION_ENCRYPTION_KEY}
+      API_CONSOLE_ADMIN_LOGINS: ${API_CONSOLE_ADMIN_LOGINS:-}
+      API_CONSOLE_QA_LEAD_LOGINS: ${API_CONSOLE_QA_LEAD_LOGINS:-}
+      API_CONSOLE_REQUIRED_WORKSPACES: ${API_CONSOLE_REQUIRED_WORKSPACES:-medu-ai}
+      API_CONSOLE_WORKSPACE_ALLOWLIST_MODE: ${API_CONSOLE_WORKSPACE_ALLOWLIST_MODE:-GATE_ONLY}
+      API_CONSOLE_SESSION_TTL_SECONDS: ${API_CONSOLE_SESSION_TTL_SECONDS:-43200}
+      API_CONSOLE_CDE_SSO_MODE: ${API_CONSOLE_CDE_SSO_MODE:-COOKIE_FORWARD}
+      API_CONSOLE_CDE_SSO_COOKIE_NAMES: ${API_CONSOLE_CDE_SSO_COOKIE_NAMES:-*}
+      CDE_CORE_BASE_URL: ${CDE_CORE_BASE_URL:-https://cde.edus.ir}
+      API_CONSOLE_CDE_ORIGINS: ${API_CONSOLE_CDE_ORIGINS:-}
+      CDE_SESSION_TTL_SECONDS: ${CDE_SESSION_TTL_SECONDS:-43200}
+      CDE_SESSION_REDIS_PREFIX: ${CDE_SESSION_REDIS_PREFIX:-api-console:cde-session:}
+      RUNTIME_DEFAULT_ORIGINS: ${RUNTIME_DEFAULT_ORIGINS:-https://soha.m.edus.ir}
+      RUNTIME_ORIGIN_ALLOWLIST: ${RUNTIME_ORIGIN_ALLOWLIST:-*.m.edus.ir,*.medu.ir}
+      RUNTIME_SESSION_TTL_SECONDS: ${RUNTIME_SESSION_TTL_SECONDS:-7200}
+      RUNTIME_SESSION_REDIS_PREFIX: ${RUNTIME_SESSION_REDIS_PREFIX:-api-console:runtime-session:}
+      RUNTIME_MAX_BODY_BYTES: ${RUNTIME_MAX_BODY_BYTES:-33554432}
+      RUNTIME_REQUEST_TIMEOUT_MS: ${RUNTIME_REQUEST_TIMEOUT_MS:-60000}
+      API_CONSOLE_DNS_SERVERS: ${API_CONSOLE_DNS_SERVERS:-8.8.8.8,1.1.1.1}
+      API_CONSOLE_DUAL_APPROVAL: ${API_CONSOLE_DUAL_APPROVAL:-false}
+      API_CONSOLE_SECRET_SCAN_MODE: ${API_CONSOLE_SECRET_SCAN_MODE:-warn}
+      API_CONSOLE_ZONE_WORKER: ${API_CONSOLE_ZONE_WORKER:-false}
+    volumes:
+      - api_console_data:/app/runtime/api-console
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+    expose:
+      - "5281"
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PUBLISH_PORT:-8080}:80"
+    networks:
+      - internal
+
+volumes:
+  api_console_pg:
+  api_console_redis:
+  api_console_data:
+
+networks:
+  internal:
+    driver: bridge

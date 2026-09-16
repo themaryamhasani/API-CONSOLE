@@ -2,7 +2,7 @@
   "name": "api-console",
   "private": true,
   "version": "1.0.0",
-  "description": "Standalone Online API Console with CDE login.",
+  "description": "Standalone Online API Console — v1: CDE + Local Directory (IS deferred).",
   "workspaces": [
     "apps/*"
   ],
@@ -13,6 +13,14 @@
     "dev:kill-ports": "node scripts/kill-dev-ports.cjs",
     "ports:check": "node scripts/check-dev-ports.cjs",
     "backend": "npm run dev:api",
+    "start": "npm run start -w @api-console/api",
+    "start:api": "npm run start -w @api-console/api",
+    "build": "npm run build --workspaces --if-present",
+    "build:web": "npm run build -w @api-console/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test:web": "npm run test -w @api-console/web",
+    "test:e2e": "npm run test:e2e -w @api-console/web",
+    "test:all": "npm run test:all -w @api-console/api && npm run test:web",
     "backend:self-check": "npm run self-check -w @api-console/api",
     "backend:admin-check": "npm run test:admin -w @api-console/api",
     "backend:session-check": "npm run test:session -w @api-console/api",
@@ -22,7 +30,14 @@
     "backend:phase3-check": "npm run test:phase3 -w @api-console/api",
     "backend:vault-check": "npm run test:vault -w @api-console/api",
     "zone-worker": "npm run zone-worker -w @api-console/api",
-    "build": "npm run build --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "prod:check": "node scripts/prod-ready-check.cjs",
+    "prod:env": "node scripts/generate-production-env.cjs",
+    "prod:local": "node scripts/prod-local-up.cjs",
+    "compose:infra": "docker compose -f docker-compose.infra.yml --env-file .env.production up -d",
+    "compose:infra:down": "docker compose -f docker-compose.infra.yml --env-file .env.production down",
+    "compose:up": "node scripts/prod-ready-check.cjs && docker compose --env-file .env.production up -d --build",
+    "compose:down": "docker compose --env-file .env.production down",
+    "compose:logs": "docker compose --env-file .env.production logs -f --tail=200",
+    "compose:config": "docker compose --env-file .env.production config"
   }
 }

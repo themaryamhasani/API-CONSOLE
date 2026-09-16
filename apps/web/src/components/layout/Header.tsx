@@ -153,6 +153,7 @@ export const Header: React.FC<HeaderProps> = ({
             <button
               type="button"
               aria-label="منوی حساب و تنظیمات"
+              data-testid="header-account-menu"
               aria-expanded={menuOpen}
               aria-haspopup="menu"
               onClick={() => setMenuOpen(open => !open)}
@@ -243,6 +244,7 @@ export const Header: React.FC<HeaderProps> = ({
                   <button
                     type="button"
                     role="menuitem"
+                    data-testid="header-logout"
                     className="flex w-full items-center gap-2 px-3 py-2 text-right text-xs text-[var(--theme-danger)] hover:bg-[var(--theme-surface-muted)]"
                     onClick={() => {
                       setMenuOpen(false);

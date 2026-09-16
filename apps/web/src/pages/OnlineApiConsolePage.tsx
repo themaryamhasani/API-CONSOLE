@@ -1,4 +1,5 @@
 ﻿import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
   Bell,
@@ -27,6 +28,7 @@ import {
 import { ROLE_LABELS } from '../types';
 import type { ActiveContext, ApiAuditEvent, Notification, NotificationListResponse, PaginatedResponse, UserRole } from '../types';
 import { AppShell, buildWorkspaceNav, type WorkspaceNavId } from '../components/layout/AppShell';
+import { pathForWorkspaceView, workspaceViewFromPath } from './workspaceRouting';
 import { Header, HeaderIconButton, HeaderMenuItem } from '../components/layout/Header';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -47,6 +49,12 @@ import { OrgPolicySection } from '../components/api-console/OrgPolicySection';
 import { ComplianceReportSection } from '../components/api-console/ComplianceReportSection';
 import { JitAccessSection } from '../components/api-console/JitAccessSection';
 import { MocksSection } from '../components/api-console/MocksSection';
+import { RepositorySection } from '../components/api-console/RepositorySection';
+import { ShareReviewSection } from '../components/api-console/ShareReviewSection';
+import { UserManagementSection } from '../components/api-console/UserManagementSection';
+import { ResponsePanel } from '../components/api-console/ResponsePanel';
+import { ImportCurlModal } from '../components/api-console/ImportCurlModal';
+import { DocumentationModal } from '../components/api-console/DocumentationModal';
 import { useAuthStore, useSessionStore } from '../stores/authStore';
 import { useDataScope } from '../utils/useDataScope';
 import { useApplicationLookup } from '../utils/useApplicationLookup';
@@ -1165,6 +1173,8 @@ const JsonEditor = ({
 };
 
 export const OnlineApiConsolePage: React.FC = () => {
+  const location = useLocation();
+  const navigate = useNavigate();
   const { activeContext, projects, selectProject } = useAuthStore();
   const { appId, initialApplicationIdForCreate } = useDataScope();
   const { getApplicationName } = useApplicationLookup();
@@ -1242,7 +1252,26 @@ export const OnlineApiConsolePage: React.FC = () => {
   });
   const [collectionAdvancedOpen, setCollectionAdvancedOpen] = useState(false);
   const [exportingCollectionId, setExportingCollectionId] = useState<string | null>(null);
-  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('requests');
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>(
+    () => workspaceViewFromPath(typeof window !== 'undefined' ? window.location.pathname : '/') || 'requests',
+  );
+
+  useEffect(() => {
+    const fromPath = workspaceViewFromPath(location.pathname);
+    if (fromPath && fromPath !== workspaceView) {
+      setWorkspaceView(fromPath);
+      setPageMode('list');
+    }
+  }, [location.pathname]);
+
+  const goWorkspace = (id: WorkspaceNavId) => {
+    setPageMode('list');
+    setWorkspaceView(id);
+    const nextPath = pathForWorkspaceView(id);
+    if (location.pathname !== nextPath) {
+      navigate(nextPath);
+    }
+  };
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [requestsMoreOpen, setRequestsMoreOpen] = useState(false);
   const [repositoryRows, setRepositoryRows] = useState<PaginatedResponse<ApiRepositoryItem> | null>(null);
@@ -3109,8 +3138,7 @@ export const OnlineApiConsolePage: React.FC = () => {
     <AppShell
       activeView={workspaceView}
       onNavigate={(id: WorkspaceNavId) => {
-        setPageMode('list');
-        setWorkspaceView(id);
+        goWorkspace(id);
       }}
       navGroups={navGroups}
       mobileOpen={mobileNavOpen}
@@ -6124,105 +6152,6 @@ const EffectiveRequestPanel = ({
   </Card>
 );
 
-const ResponsePanel = ({
-  execution,
-  loading,
-  canDisableTls,
-  onDisableTlsAndRetry,
-}: {
-  execution: ApiRequestExecution | null;
-  loading: boolean;
-  canDisableTls: boolean;
-  onDisableTlsAndRetry: () => void;
-}) => {
-  const body = safeBodyPreview(execution);
-  const isJsonBody = isJsonResponsePreview(execution);
-  const canRetryInsecure = execution?.errorCategory === 'TLS_ERROR' && execution.requestSnapshot.tls.verifyCertificate && canDisableTls;
-  return (
-    <Card>
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-        <h3 className="font-semibold text-gray-900">نمایش Response</h3>
-        {loading ? (
-          <Badge variant="info">Loading</Badge>
-        ) : execution ? (
-          <div className="flex flex-wrap gap-2">
-            <Badge variant={resultBadgeVariant(execution.transportResult)}>{execution.transportResult}</Badge>
-            <Badge variant={resultBadgeVariant(execution.businessResult)}>Business: {execution.businessResult}</Badge>
-          </div>
-        ) : <Badge>Execution ندارد</Badge>}
-      </div>
-      {loading ? (
-        <LoadingState label="در حال بارگذاری response و metadata..." className="py-10" />
-      ) : !execution ? (
-        <p className="text-sm text-gray-500">برای مشاهده response metadata و body، Request را Execute کنید.</p>
-      ) : (
-        <div className="space-y-3">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-4">
-            <InfoTile label="HTTP" value={execution.statusCode ? String(execution.statusCode) : '-'} />
-            <InfoTile label="Duration" value={`${execution.durationMs || 0}ms`} />
-            <InfoTile label="Size" value={`${execution.responseSize || 0} bytes`} />
-            <InfoTile label="Runner" value={execution.runnerId} />
-            <InfoTile label="Resolved IP" value={execution.response?.resolvedIpAddress || '-'} />
-            <InfoTile label="TLS" value={execution.tlsVerification ? 'Verified' : 'Insecure'} />
-            <InfoTile label="Correlation" value={execution.correlationId} />
-            <InfoTile label="Evidence" value={execution.evidenceType} />
-          </div>
-          {execution.sanitizedError && (
-            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-              <div>{execution.errorCategory}: {execution.sanitizedError}</div>
-              {canRetryInsecure && (
-                <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <span className="text-red-700">
-                    برای این target، certificate با hostname match نیست. فقط برای محیط غیر Production می‌توانید TLS verification را آگاهانه خاموش کنید.
-                  </span>
-                  <Button size="sm" variant="danger" icon={<AlertTriangle className="h-4 w-4" />} onClick={onDisableTlsAndRetry}>
-                    خاموش کردن Verify TLS و Retry
-                  </Button>
-                </div>
-              )}
-            </div>
-          )}
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-            <div>
-              <FieldLabel>Response headers</FieldLabel>
-              <CodeBlock value={execution.response?.headers.map(header => `${header.name}: ${header.valueTemplate}`).join('\n') || '-'} />
-            </div>
-            <div>
-              <FieldLabel>Assertions</FieldLabel>
-              <CodeBlock value={execution.assertionResults.map(result => `${result.result}: ${result.message}`).join('\n') || 'ارزیابی نشده'} />
-            </div>
-          </div>
-          {execution.scriptResults?.length ? (
-            <div>
-              <FieldLabel>Script results</FieldLabel>
-              <div className="space-y-2">
-                {execution.scriptResults.map((result, index) => (
-                  <div key={`${result.phase}-${result.line}-${index}`} className="flex flex-wrap items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 p-2 text-sm">
-                    <Badge variant={result.result === 'PASSED' ? 'success' : result.result === 'FAILED' ? 'danger' : 'warning'} size="sm">
-                      {result.result}
-                    </Badge>
-                    <span className="font-mono text-xs text-gray-500" dir="ltr">{result.phase} line {result.line}</span>
-                    <span className="text-gray-700">{result.message}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : null}
-          <div>
-            <FieldLabel>Body ({execution.response?.safePreviewMode || 'TEXT'})</FieldLabel>
-            {execution.response?.safePreviewMode === 'SANDBOXED_HTML' ? (
-              <iframe title="API response sandbox" srcDoc={body} sandbox="" className="theme-light-preview h-64 w-full rounded-lg border border-gray-200 bg-white" />
-            ) : isJsonBody ? (
-              <JsonResponseViewer value={body} />
-            ) : (
-              <CodeBlock value={body} minHeight="min-h-64" />
-            )}
-          </div>
-        </div>
-      )}
-    </Card>
-  );
-};
 
 const InfoTile = ({ label, value }: { label: string; value: string }) => (
   <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
@@ -6625,202 +6554,7 @@ const RepositoryTechnicalSnapshotPanel = ({ item }: { item: ApiRepositoryItem })
   );
 };
 
-const RepositorySection = ({
-  rows,
-  loading,
-  filters,
-  onFilters,
-  onRefresh,
-  onOpen,
-}: {
-  rows: PaginatedResponse<ApiRepositoryItem> | null;
-  loading: boolean;
-  filters: { page: number; limit: number; search: string };
-  onFilters: Dispatch<SetStateAction<{ page: number; limit: number; search: string }>>;
-  onRefresh: () => void;
-  onOpen: (item: ApiRepositoryItem) => void;
-}) => (
-  <div className="space-y-4">
-    <Card padding="sm">
-      <div className="grid grid-cols-1 items-end gap-2 md:grid-cols-[minmax(220px,1fr)_auto]">
-        <Input
-          aria-label="جستجوی Repository"
-          value={filters.search}
-          onChange={(event) => onFilters(prev => ({ ...prev, search: event.target.value }))}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') onRefresh();
-          }}
-          placeholder="جستجو در API ID، نام، Service ID یا operation path"
-          className="py-1.5 text-sm"
-        />
-        <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={onRefresh}>
-          فیلتر
-        </Button>
-      </div>
-    </Card>
-    <Table
-      columns={[
-        {
-          key: 'title',
-          title: 'API',
-          render: (item: ApiRepositoryItem) => (
-            <div>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-medium text-gray-900">{item.title}</span>
-                <Badge variant="default" size="sm">v{item.version}</Badge>
-                <Badge variant={classBadgeVariant(item.classification.type)} size="sm">{CLASSIFICATION_LABELS[item.classification.type]}</Badge>
-                {item.sharingStatus === 'DEPRECATED' && <Badge variant="danger" size="sm">DEPRECATED</Badge>}
-                {item.breakingChange && <Badge variant="warning" size="sm">Breaking</Badge>}
-                {item.isNewForUser && <Badge variant="success" size="sm">جدید</Badge>}
-                {item.hasNewerVersion && <Badge variant="warning" size="sm">نسخه جدید موجود است</Badge>}
-              </div>
-              <p className="mt-1 max-w-[26rem] truncate font-mono text-xs text-gray-500" dir="ltr">{item.method} {item.urlTemplate}</p>
-            </div>
-          ),
-        },
-        { key: 'apiId', title: 'API ID', render: (item: ApiRepositoryItem) => <span className="font-mono text-xs" dir="ltr">{item.apiId}</span> },
-        { key: 'consumers', title: 'Consumer', render: (item: ApiRepositoryItem) => item.consumers.length },
-        { key: 'updatedAt', title: 'آخرین تغییر', render: (item: ApiRepositoryItem) => formatDate(item.updatedAt) },
-        {
-          key: 'actions',
-          title: 'عملیات',
-          render: (item: ApiRepositoryItem) => (
-            <Button size="sm" variant="ghost" icon={<Eye className="h-4 w-4" />} onClick={(event) => {
-              event.stopPropagation();
-              onOpen(item);
-            }}>
-              Preview
-            </Button>
-          ),
-        },
-      ]}
-      data={rows?.data || []}
-      loading={loading}
-      emptyMessage="API قابل استفاده‌ای در Repository وجود ندارد"
-      onRowClick={onOpen}
-      enableClientFilter={false}
-      enableColumnChooser={false}
-      enableExport={false}
-    />
-    {rows && (
-      <Pagination
-        page={rows.page}
-        totalPages={rows.totalPages}
-        total={rows.total}
-        limit={rows.limit}
-        onPageChange={(page) => onFilters(prev => ({ ...prev, page }))}
-        onLimitChange={(limit) => onFilters(prev => ({ ...prev, page: 1, limit }))}
-      />
-    )}
-  </div>
-);
 
-const ShareReviewSection = ({
-  rows,
-  loading,
-  filters,
-  onFilters,
-  onRefresh,
-  onOpen,
-  getApplicationName,
-}: {
-  rows: PaginatedResponse<ApiShareRequest> | null;
-  loading: boolean;
-  filters: { page: number; limit: number; search: string; status: string };
-  onFilters: Dispatch<SetStateAction<{ page: number; limit: number; search: string; status: string }>>;
-  onRefresh: () => void;
-  onOpen: (item: ApiShareRequest) => void;
-  getApplicationName: (applicationId?: string) => string;
-}) => (
-  <div className="space-y-4">
-    <Card padding="sm">
-      <div className="grid grid-cols-1 items-end gap-2 md:grid-cols-[minmax(220px,1fr)_180px_auto]">
-        <Input
-          aria-label="جستجوی درخواست اشتراک"
-          value={filters.search}
-          onChange={(event) => onFilters(prev => ({ ...prev, search: event.target.value }))}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') onRefresh();
-          }}
-          placeholder="جستجو در عنوان API، API ID یا ثبت‌کننده"
-          className="py-1.5 text-sm"
-        />
-        <Select
-          aria-label="وضعیت بررسی"
-          value={filters.status}
-          onChange={(event) => onFilters(prev => ({ ...prev, status: event.target.value, page: 1 }))}
-          className="py-1.5 text-sm"
-          options={[
-            { value: '', label: 'همه وضعیت‌ها' },
-            { value: 'PENDING_REVIEW', label: 'در انتظار بررسی' },
-            { value: 'APPROVED', label: 'تأییدشده' },
-            { value: 'RETURNED', label: 'بازگردانده‌شده' },
-          ]}
-        />
-        <Button size="sm" variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={onRefresh}>
-          فیلتر
-        </Button>
-      </div>
-    </Card>
-    <Table
-      columns={[
-        {
-          key: 'apiTitle',
-          title: 'عنوان API',
-          render: (item: ApiShareRequest) => (
-            <div>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-medium text-gray-900">{item.apiTitle}</span>
-                <Badge variant="default" size="sm">v{item.version}</Badge>
-              </div>
-              <p className="mt-1 font-mono text-xs text-gray-500" dir="ltr">{item.apiId}</p>
-            </div>
-          ),
-        },
-        {
-          key: 'status',
-          title: 'وضعیت',
-          render: (item: ApiShareRequest) => (
-            <Badge variant={sharingBadgeVariant(item.status)} size="sm">{API_SHARING_STATUS_LABELS[item.status]}</Badge>
-          ),
-        },
-        { key: 'applicationId', title: 'سامانه', render: (item: ApiShareRequest) => getApplicationName(item.applicationId) },
-        { key: 'submittedBy', title: 'ثبت‌کننده', render: (item: ApiShareRequest) => item.submittedByName || item.submittedBy },
-        { key: 'revision', title: 'Revision', render: (item: ApiShareRequest) => item.currentRevisionNumber },
-        { key: 'updatedAt', title: 'زمان', render: (item: ApiShareRequest) => formatDate(item.updatedAt) },
-        {
-          key: 'actions',
-          title: 'عملیات',
-          render: (item: ApiShareRequest) => (
-            <Button size="sm" variant="ghost" icon={<Eye className="h-4 w-4" />} onClick={(event) => {
-              event.stopPropagation();
-              onOpen(item);
-            }}>
-              بررسی
-            </Button>
-          ),
-        },
-      ]}
-      data={rows?.data || []}
-      loading={loading}
-      emptyMessage="درخواست اشتراک API برای بررسی وجود ندارد"
-      onRowClick={onOpen}
-      enableClientFilter={false}
-      enableColumnChooser={false}
-      enableExport={false}
-    />
-    {rows && (
-      <Pagination
-        page={rows.page}
-        totalPages={rows.totalPages}
-        total={rows.total}
-        limit={rows.limit}
-        onPageChange={(page) => onFilters(prev => ({ ...prev, page }))}
-        onLimitChange={(limit) => onFilters(prev => ({ ...prev, page: 1, limit }))}
-      />
-    )}
-  </div>
-);
 
 const ASSIGNABLE_DIRECTORY_ROLES: UserRole[] = [
   'SYSTEM_ADMIN',
@@ -6833,266 +6567,6 @@ const ASSIGNABLE_DIRECTORY_ROLES: UserRole[] = [
   'DEVELOPER',
 ];
 
-const UserManagementSection = ({
-  users,
-  loading,
-  search,
-  onSearch,
-  onRefresh,
-  onUsersChange,
-  activeContext,
-  onChangeRole,
-}: {
-  users: ApiConsoleDirectoryUser[];
-  loading: boolean;
-  search: string;
-  onSearch: (value: string) => void;
-  onRefresh: () => void;
-  onUsersChange: (users: ApiConsoleDirectoryUser[]) => void;
-  activeContext: ActiveContext;
-  onChangeRole: (user: ApiConsoleDirectoryUser, role: UserRole, enabled: boolean) => void;
-}) => {
-  const [createOpen, setCreateOpen] = useState(false);
-  const [createSaving, setCreateSaving] = useState(false);
-  const [createForm, setCreateForm] = useState({
-    username: '',
-    password: '',
-    fullName: '',
-    role: 'DEVELOPER' as UserRole,
-  });
-  const [resetTarget, setResetTarget] = useState<ApiConsoleDirectoryUser | null>(null);
-  const [resetPassword, setResetPassword] = useState('');
-  const [actionSaving, setActionSaving] = useState(false);
-
-  const normalizedSearch = search.trim().toLocaleLowerCase('fa-IR');
-  const filteredUsers = normalizedSearch
-    ? users.filter(user => [user.fullName, user.phoneNumber, user.username, ...user.roles.map(roleLabel)]
-        .filter(Boolean)
-        .some(value => String(value).toLocaleLowerCase('fa-IR').includes(normalizedSearch)))
-    : users;
-
-  const upsertUser = (updated: ApiConsoleDirectoryUser) => {
-    onUsersChange(users.some(user => user.id === updated.id)
-      ? users.map(user => user.id === updated.id ? updated : user)
-      : [updated, ...users]);
-  };
-
-  const handleCreateLocal = async () => {
-    setCreateSaving(true);
-    try {
-      const created = await apiConsoleApi.createLocalUser({
-        username: createForm.username.trim(),
-        password: createForm.password,
-        fullName: createForm.fullName.trim() || createForm.username.trim(),
-        role: createForm.role,
-      }, activeContext);
-      upsertUser(created);
-      setCreateOpen(false);
-      setCreateForm({ username: '', password: '', fullName: '', role: 'DEVELOPER' });
-      toast.success(`کاربر محلی «${created.username || created.fullName}» ساخته شد.`);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'ایجاد کاربر محلی ناموفق بود.');
-    } finally {
-      setCreateSaving(false);
-    }
-  };
-
-  const handleToggleActive = async (user: ApiConsoleDirectoryUser) => {
-    if (user.source !== 'LOCAL') return;
-    setActionSaving(true);
-    try {
-      const updated = await apiConsoleApi.patchLocalUser(user.id, { isActive: user.isActive === false }, activeContext);
-      upsertUser(updated);
-      toast.success(updated.isActive !== false ? 'کاربر فعال شد.' : 'کاربر غیرفعال شد.');
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'تغییر وضعیت کاربر ناموفق بود.');
-    } finally {
-      setActionSaving(false);
-    }
-  };
-
-  const handleResetPassword = async () => {
-    if (!resetTarget) return;
-    setActionSaving(true);
-    try {
-      const updated = await apiConsoleApi.resetLocalPassword(resetTarget.id, resetPassword, activeContext);
-      upsertUser(updated);
-      setResetTarget(null);
-      setResetPassword('');
-      toast.success('رمز عبور بازنشانی شد.');
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'بازنشانی رمز ناموفق بود.');
-    } finally {
-      setActionSaving(false);
-    }
-  };
-
-  return (
-    <div className="space-y-4">
-      <Card padding="sm">
-        <div className="space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h2 className="font-semibold text-gray-900">مدیریت کاربران</h2>
-              <p className="mt-1 text-sm text-gray-500">
-                کاربران CDE پس از نخستین ورود همگام می‌شوند. کاربران محلی را می‌توانید از همین‌جا بسازید، غیرفعال کنید یا رمزشان را عوض کنید.
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" onClick={() => setCreateOpen(true)}>ایجاد کاربر محلی</Button>
-              <Button variant="secondary" size="sm" icon={<RefreshCw className="h-4 w-4" />} onClick={onRefresh} loading={loading}>
-                بروزرسانی فهرست
-              </Button>
-            </div>
-          </div>
-          <Input
-            aria-label="جستجوی کاربران"
-            value={search}
-            onChange={(event) => onSearch(event.target.value)}
-            placeholder="جستجو بر اساس نام، نام کاربری، شماره یا نقش"
-            className="py-1.5 text-sm"
-          />
-        </div>
-      </Card>
-
-      <Table
-        columns={[
-          {
-            key: 'fullName',
-            title: 'نام کاربر',
-            render: (user: ApiConsoleDirectoryUser) => (
-              <div>
-                <p className="font-medium text-gray-900">{user.fullName || user.id}</p>
-                <p className="mt-1 font-mono text-xs text-gray-500" dir="ltr">
-                  {user.username ? `@${user.username}` : (user.phoneNumber || '-')}
-                </p>
-                {user.isActive === false && <Badge variant="danger" size="sm">غیرفعال</Badge>}
-              </div>
-            ),
-          },
-          {
-            key: 'source',
-            title: 'منبع هویت',
-            render: (user: ApiConsoleDirectoryUser) => (
-              <Badge variant={user.source === 'LOCAL' ? 'success' : 'info'} size="sm">
-                {user.source === 'LOCAL' ? 'LOCAL' : user.source === 'CDE' ? 'CDE' : user.source}
-              </Badge>
-            ),
-          },
-          {
-            key: 'roles',
-            title: 'نقش‌ها / اسکوپ',
-            render: (user: ApiConsoleDirectoryUser) => (
-              <div className="space-y-1">
-                <div className="flex flex-wrap gap-1">
-                  {user.roles.map(role => (
-                    <Badge key={role} variant={role === 'SYSTEM_ADMIN' ? 'success' : 'secondary'} size="sm">{roleLabel(role)}</Badge>
-                  ))}
-                  {user.isBootstrapAdmin && <Badge variant="warning" size="sm">bootstrap env</Badge>}
-                </div>
-                {(user.roleAssignments || [])
-                  .filter(item => item.role !== 'DEVELOPER')
-                  .map(item => (
-                    <p key={`${item.role}-${item.applicationId}`} className="font-mono text-[10px] text-gray-500" dir="ltr">
-                      {item.role} @ {item.applicationId || 'ALL'}
-                    </p>
-                  ))}
-              </div>
-            ),
-          },
-          {
-            key: 'actions',
-            title: 'عملیات',
-            render: (user: ApiConsoleDirectoryUser) => (
-              <div className="flex min-w-[240px] flex-col gap-2">
-                <Select
-                  aria-label={`نقش جدید برای ${user.fullName}`}
-                  value=""
-                  onChange={(event) => {
-                    const role = event.target.value as UserRole;
-                    if (!role || user.roles.includes(role)) return;
-                    onChangeRole(user, role, true);
-                    event.target.value = '';
-                  }}
-                  options={[
-                    { value: '', label: 'افزودن نقش…' },
-                    ...ASSIGNABLE_DIRECTORY_ROLES
-                      .filter(role => role !== 'DEVELOPER' && !user.roles.includes(role))
-                      .filter(role => !(role === 'SYSTEM_ADMIN' && user.isBootstrapAdmin))
-                      .map(role => ({ value: role, label: roleLabel(role) })),
-                  ]}
-                />
-                <div className="flex flex-wrap gap-1">
-                  {user.roles
-                    .filter(role => role !== 'DEVELOPER')
-                    .map(role => (
-                      <Button
-                        key={role}
-                        size="sm"
-                        variant="danger"
-                        disabled={(role === 'SYSTEM_ADMIN' && user.isBootstrapAdmin) || (role === 'QA_LEAD' && !!user.isBootstrapQaLead)}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onChangeRole(user, role, false);
-                        }}
-                      >
-                        لغو {roleLabel(role)}
-                      </Button>
-                    ))}
-                  {user.source === 'LOCAL' && (
-                    <>
-                      <Button size="sm" variant="secondary" disabled={actionSaving} onClick={() => setResetTarget(user)}>
-                        Reset password
-                      </Button>
-                      <Button size="sm" variant="secondary" disabled={actionSaving} onClick={() => void handleToggleActive(user)}>
-                        {user.isActive === false ? 'فعال‌سازی' : 'غیرفعال‌سازی'}
-                      </Button>
-                    </>
-                  )}
-                </div>
-              </div>
-            ),
-          },
-        ]}
-        data={filteredUsers}
-        loading={loading}
-        emptyMessage="هنوز کاربری ثبت نشده است"
-        enableClientFilter={false}
-        enableColumnChooser={false}
-        enableExport={false}
-      />
-
-      <Modal isOpen={createOpen} onClose={() => setCreateOpen(false)} title="ایجاد کاربر محلی" size="md">
-        <div className="space-y-3">
-          <Input label="نام کاربری" value={createForm.username} onChange={e => setCreateForm(prev => ({ ...prev, username: e.target.value }))} dir="ltr" />
-          <Input label="نام نمایشی" value={createForm.fullName} onChange={e => setCreateForm(prev => ({ ...prev, fullName: e.target.value }))} />
-          <Input label="رمز موقت" type="password" value={createForm.password} onChange={e => setCreateForm(prev => ({ ...prev, password: e.target.value }))} dir="ltr" />
-          <Select
-            label="نقش اولیه"
-            value={createForm.role}
-            onChange={e => setCreateForm(prev => ({ ...prev, role: e.target.value as UserRole }))}
-            options={ASSIGNABLE_DIRECTORY_ROLES.map(role => ({ value: role, label: roleLabel(role) }))}
-          />
-          <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => setCreateOpen(false)} disabled={createSaving}>انصراف</Button>
-            <Button onClick={() => void handleCreateLocal()} loading={createSaving}>ایجاد</Button>
-          </div>
-        </div>
-      </Modal>
-
-      <Modal isOpen={Boolean(resetTarget)} onClose={() => { setResetTarget(null); setResetPassword(''); }} title="بازنشانی رمز" size="md">
-        <div className="space-y-3">
-          <p className="text-sm text-gray-600">کاربر: <span dir="ltr">{resetTarget?.username}</span></p>
-          <Input label="رمز جدید" type="password" value={resetPassword} onChange={e => setResetPassword(e.target.value)} dir="ltr" />
-          <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => { setResetTarget(null); setResetPassword(''); }} disabled={actionSaving}>انصراف</Button>
-            <Button onClick={() => void handleResetPassword()} loading={actionSaving} disabled={resetPassword.length < 8}>ذخیره</Button>
-          </div>
-        </div>
-      </Modal>
-    </div>
-  );
-};
 
 const ImportPostmanCollectionModal = ({
   open,
@@ -7223,159 +6697,6 @@ const ImportPostmanCollectionModal = ({
   </Modal>
 );
 
-const ImportCurlModal = ({
-  open,
-  title = 'Import cURL',
-  primaryActionLabel = 'Import',
-  curlText,
-  requestTitle = '',
-  collections = [],
-  selectedCollectionId = '',
-  preview,
-  previewSubtab,
-  onSubtab,
-  onText,
-  onRequestTitle,
-  onCollectionChange,
-  onParse,
-  onImport,
-  onClose,
-}: {
-  open: boolean;
-  title?: string;
-  primaryActionLabel?: string;
-  curlText: string;
-  requestTitle?: string;
-  collections?: ApiCollection[];
-  selectedCollectionId?: string;
-  preview: ApiCurlImportPreview | null;
-  previewSubtab: 'summary' | 'original' | 'normalized' | 'warnings';
-  onSubtab: (tab: 'summary' | 'original' | 'normalized' | 'warnings') => void;
-  onText: (value: string) => void;
-  onRequestTitle?: (value: string) => void;
-  onCollectionChange?: (value: string) => void;
-  onParse: () => void;
-  onImport: () => void;
-  onClose: () => void;
-}) => (
-  <Modal isOpen={open} onClose={onClose} title={title} size="wide">
-    <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1fr_1.2fr]">
-      <div className="space-y-3">
-        {(onRequestTitle || onCollectionChange) && (
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            {onRequestTitle && (
-              <Input
-                label="عنوان Web Service"
-                value={requestTitle}
-                onChange={(event) => onRequestTitle(event.target.value)}
-                placeholder="مثلاً دریافت لیست کمپ‌های مدرسه"
-              />
-            )}
-            {onCollectionChange && (
-              <Select
-                label="Collection"
-                value={selectedCollectionId}
-                onChange={(event) => onCollectionChange(event.target.value)}
-                options={[
-                  { value: '', label: 'یک Collection انتخاب کنید *' },
-                  ...collections.map(collection => ({ value: collection.id, label: collection.name })),
-                ]}
-              />
-            )}
-          </div>
-        )}
-        <Textarea
-          label="cURL command را وارد کنید"
-          value={curlText}
-          onChange={(event) => onText(event.target.value)}
-          className="min-h-48 text-left font-mono sm:min-h-[420px]"
-          dir="ltr"
-        />
-        <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm text-gray-600">
-          Importer متن cURL را مستقیم tokenize می‌کند و هیچ‌وقت shell، command prompt، PowerShell، eval یا child process اجرا نمی‌کند.
-        </div>
-        <div className="flex justify-end gap-2">
-          <Button variant="secondary" onClick={onClose}>انصراف</Button>
-          <Button icon={<Upload className="h-4 w-4" />} onClick={onParse} disabled={!curlText.trim()}>Parse Preview</Button>
-        </div>
-      </div>
-      <div className="space-y-3">
-        <div className="flex flex-wrap gap-2">
-          {(['summary', 'original', 'normalized', 'warnings'] as const).map(tab => (
-            <button
-              key={tab}
-              onClick={() => onSubtab(tab)}
-              className={`rounded-lg px-3 py-2 text-sm font-medium ${previewSubtab === tab ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600'}`}
-            >
-              {tab}
-            </button>
-          ))}
-        </div>
-        {!preview ? (
-          <div className="flex min-h-48 items-center justify-center rounded-lg border border-dashed border-gray-300 text-sm text-gray-500 sm:min-h-[420px]">
-            برای review کردن normalized request قبل از Import، یک cURL command را Parse کنید.
-          </div>
-        ) : (
-          <div className="space-y-3">
-            {previewSubtab === 'summary' && (
-              <div className="space-y-3">
-                {(preview.secretScan?.findings?.length || 0) > 0 && (
-                  <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                    <p className="font-semibold">هشدار Secret Scan ({preview.secretScan?.mode || 'warn'})</p>
-                    <ul className="mt-2 list-disc pr-5">
-                      {(preview.secretScan?.findings || []).map(finding => (
-                        <li key={finding}>{finding}</li>
-                      ))}
-                    </ul>
-                    <p className="mt-2 text-xs">الگوهای احتمالی Secret در cURL دیده شد؛ قبل از Import بررسی کنید.</p>
-                  </div>
-                )}
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <InfoTile label="Dialect" value={preview.detectedDialect} />
-                <InfoTile label="Method" value={preview.effectiveMethod} />
-                <InfoTile label="URL" value={preview.url} />
-                <InfoTile label="Headers" value={String(preview.headerCount)} />
-                <InfoTile label="Cookies" value={String(preview.cookieCount)} />
-                <InfoTile label="Body type" value={preview.bodyType} />
-                <InfoTile label="JSON validity" value={preview.jsonValidity.valid ? 'valid' : preview.jsonValidity.error || 'invalid'} />
-                <InfoTile label="TLS verify" value={preview.tlsVerification ? 'true' : 'false'} />
-                <InfoTile label="Classification" value={preview.normalizedRequest.classification.type} />
-                <InfoTile label="Service ID" value={preview.normalizedRequest.classification.serviceId || '-'} />
-                <InfoTile label="Operation path" value={preview.normalizedRequest.classification.operationPath || '-'} />
-                <InfoTile label="Parser" value={preview.parserVersion} />
-                </div>
-              </div>
-            )}
-            {previewSubtab === 'original' && <CodeBlock value={preview.originalCurl} minHeight="min-h-48 sm:min-h-[420px]" />}
-            {previewSubtab === 'normalized' && <CodeBlock value={JSON.stringify(preview.normalizedRequest, null, 2)} minHeight="min-h-48 sm:min-h-[420px]" />}
-            {previewSubtab === 'warnings' && (
-              <div className="min-h-48 space-y-2 rounded-lg border border-gray-200 bg-gray-50 p-3 sm:min-h-[420px]">
-                {(preview.secretScan?.findings?.length || 0) > 0 && (
-                  <div className="rounded-lg border border-red-200 bg-red-50 p-2 text-sm text-red-700">
-                    Secret Scan: {(preview.secretScan?.findings || []).join(', ')}
-                  </div>
-                )}
-                {preview.warnings.length || preview.unsupportedOptions.length ? (
-                  [...preview.warnings, ...preview.unsupportedOptions.map(option => `Unsupported option: ${option}`)].map((warning, index) => (
-                    <div key={`${warning}-${index}`} className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-sm text-amber-700">
-                      {warning}
-                    </div>
-                  ))
-                ) : (
-                  <p className="text-sm text-gray-500">Parser warning وجود ندارد.</p>
-                )}
-              </div>
-            )}
-            <div className="flex justify-end gap-2 border-t border-gray-200 pt-3">
-              <Button variant="secondary" onClick={onClose}>انصراف</Button>
-              <Button icon={<CheckCircle className="h-4 w-4" />} onClick={onImport} disabled={!!onCollectionChange && !selectedCollectionId}>{primaryActionLabel}</Button>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  </Modal>
-);
 
 function makeDocumentationParameter(location: ApiDocumentationParameter['location']): ApiDocumentationParameter {
   return {
@@ -7699,48 +7020,3 @@ const DocumentationMetadataEditor = ({ metadata, onChange, onRefresh, refreshing
   );
 };
 
-const DocumentationModal = ({
-  open,
-  markdown,
-  warnings,
-  onClose,
-}: {
-  open: boolean;
-  markdown: string;
-  warnings: string[];
-  onClose: () => void;
-}) => (
-  <Modal isOpen={open} onClose={onClose} title="سند تولیدشده API" size="wide">
-    <div className="space-y-4">
-      {warnings.length > 0 && (
-        <div className="space-y-2">
-          {warnings.map((warning, index) => (
-            <div key={`${warning}-${index}`} className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-sm text-amber-700">
-              {warning}
-            </div>
-          ))}
-        </div>
-      )}
-      <div className="flex justify-end gap-2">
-        <Button variant="secondary" icon={<Copy className="h-4 w-4" />} onClick={() => {
-          navigator.clipboard?.writeText(markdown);
-          toast.success('Documentation کپی شد.');
-        }}>
-          کپی Markdown
-        </Button>
-        <Button variant="secondary" icon={<Download className="h-4 w-4" />} onClick={() => {
-          const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = `api-console-doc-${new Date().toISOString().split('T')[0]}.md`;
-          a.click();
-          URL.revokeObjectURL(url);
-        }}>
-          Markdown
-        </Button>
-      </div>
-      <CodeBlock value={markdown} minHeight="min-h-48 sm:min-h-[560px]" />
-    </div>
-  </Modal>
-);

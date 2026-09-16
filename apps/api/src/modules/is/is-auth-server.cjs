@@ -27,8 +27,8 @@ function isEnabled() {
   const raw = String(process.env.API_CONSOLE_IS_ENABLED || '').trim().toLowerCase();
   if (raw === 'false' || raw === '0' || raw === 'off') return false;
   if (raw === 'true' || raw === '1' || raw === 'on') return true;
-  // Default on in non-production so local stacks work without extra env.
-  return process.env.NODE_ENV !== 'production';
+  // v1 delivery: IS is opt-in only. Enable explicitly after go-live under load.
+  return false;
 }
 
 function gatewayBaseUrl() {
@@ -431,6 +431,11 @@ async function handleIs(req, parsedUrl, body) {
 
   if (pathname === '/api/auth/is/config' && req.method === 'GET') {
     return fetchAuthConfig();
+  }
+
+  // All other IS routes require the feature flag (v1 ships with IS off).
+  if (!isEnabled() && pathname !== '/api/auth/is/config') {
+    throw new IsApiError('IS_DISABLED', 'رویکرد Integrated Systems در نسخهٔ فعلی غیرفعال است.', 403);
   }
 
   if (pathname === '/api/auth/is/login' && req.method === 'POST') {

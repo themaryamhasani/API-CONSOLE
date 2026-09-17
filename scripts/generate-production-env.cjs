@@ -10,9 +10,9 @@ if (fs.existsSync(out)) {
   console.error(".env.production already exists — refuse to overwrite");
   process.exit(1);
 }
-const pg = secret();
 const lines = [
-  "# Generated for local Docker Compose / v1. DO NOT COMMIT.",
+  "# Generated for Docker Compose / v1. DO NOT COMMIT.",
+  "# Set DATABASE_URL to your external Postgres. Redis runs in compose.",
   "# On edus host: set PUBLIC_URL/CORS to https://api-console.edus.ir and COOKIE_SECURE=true",
   "",
   "NODE_ENV=production",
@@ -22,16 +22,13 @@ const lines = [
   "API_CONSOLE_COOKIE_SECURE=false",
   "WEB_PUBLISH_PORT=8080",
   "",
-  "POSTGRES_USER=apiconsole",
-  "POSTGRES_PASSWORD=" + pg,
-  "POSTGRES_DB=api_console",
+  "API_IMAGE=api-console-api:latest",
+  "WEB_IMAGE=api-console-web:latest",
   "",
   "API_CONSOLE_PORT=5281",
   "API_CONSOLE_STORE_BACKEND=POSTGRES",
-  "DATABASE_URL=postgresql://apiconsole:" + pg + "@127.0.0.1:15432/api_console?schema=public",
-  "REDIS_URL=redis://127.0.0.1:16379",
-  "POSTGRES_PUBLISH_PORT=15432",
-  "REDIS_PUBLISH_PORT=16379",
+  "DATABASE_URL=postgresql://USER:PASSWORD@postgres-host:5432/api_console?schema=public",
+  "REDIS_URL=redis://redis:6379",
   "API_CONSOLE_DATA_DIR=/app/runtime/api-console",
   "API_CONSOLE_VAULT_PROVIDER=local",
   "",
@@ -70,3 +67,4 @@ const lines = [
 ];
 fs.writeFileSync(out, lines.join("\n"), "utf8");
 console.log("Wrote", out);
+console.log("Edit DATABASE_URL to point at your external Postgres before compose:up.");

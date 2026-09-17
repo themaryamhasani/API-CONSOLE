@@ -38,7 +38,7 @@ const required = [
   'CDE_SESSION_ENCRYPTION_KEY',
   'RUNTIME_SESSION_ENCRYPTION_KEY',
   'API_CONSOLE_ADMIN_LOGINS',
-  'POSTGRES_PASSWORD',
+  'DATABASE_URL',
 ];
 
 const env = parseEnvFile(envPath);
@@ -80,13 +80,22 @@ const secretKeys = [
   'API_CONSOLE_SECRET_KEY',
   'CDE_SESSION_ENCRYPTION_KEY',
   'RUNTIME_SESSION_ENCRYPTION_KEY',
-  'POSTGRES_PASSWORD',
 ];
 for (const key of secretKeys) {
   const value = String(env[key] || '');
   if (value && value.length < 32 && !value.includes('REPLACE_ME')) {
     issues.push(`${key} should be at least 32 characters`);
   }
+}
+
+const databaseUrl = String(env.DATABASE_URL || '');
+if (databaseUrl && !/^postgres(ql)?:\/\//i.test(databaseUrl)) {
+  issues.push('DATABASE_URL must be a postgresql:// (or postgres://) connection string');
+}
+const hasInfraPostgres = Boolean(String(env.POSTGRES_PASSWORD || '').trim())
+  && !String(env.POSTGRES_PASSWORD).includes('REPLACE_ME');
+if (databaseUrl && /USER:PASSWORD@postgres-host/i.test(databaseUrl) && !hasInfraPostgres) {
+  issues.push('DATABASE_URL still has the example placeholder host/credentials');
 }
 
 const publicUrl = String(env.API_CONSOLE_PUBLIC_URL || '');

@@ -134,8 +134,15 @@ async function main() {
   loadEnvFile(envFile);
   run('node scripts/prod-ready-check.cjs');
 
-  // Host-side connections for infra compose
+  // Host-side connections for infra compose (local Postgres+Redis containers only).
+  // Main docker-compose.yml uses external DATABASE_URL instead.
   const pgPass = process.env.POSTGRES_PASSWORD;
+  if (!pgPass || pgPass.includes('REPLACE_ME')) {
+    throw new Error(
+      'prod:local needs POSTGRES_PASSWORD in .env.production (uncomment the infra section). '
+      + 'For server deploy with external Postgres, use: npm run compose:up',
+    );
+  }
   const pgUser = process.env.POSTGRES_USER || 'apiconsole';
   const pgDb = process.env.POSTGRES_DB || 'api_console';
   const pgPort = process.env.POSTGRES_PUBLISH_PORT || '15432';

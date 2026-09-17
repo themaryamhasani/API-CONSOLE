@@ -1,5 +1,6 @@
-# Infra only — Postgres + Redis (for restricted Docker networks / local v1)
-# API + Web run on the host: npm run prod:local
+# Optional local infra — Postgres + Redis only (NOT used by main docker-compose.yml).
+# Main compose expects external Postgres via DATABASE_URL and runs its own Redis.
+# Use this for host-run API/web: npm run prod:local
 #
 #   docker compose -f docker-compose.infra.yml --env-file .env.production up -d
 

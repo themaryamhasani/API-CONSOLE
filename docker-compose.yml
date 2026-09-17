@@ -1,8 +1,8 @@
-# API Console v1 — Redis in Compose; Postgres is external (DATABASE_URL).
-# Build images, then run:
-#   docker compose --env-file .env.production build
-#   docker compose --env-file .env.production up -d
-# Or: npm run compose:up
+# API Console v1 — RUN only (image tags). Postgres is external (DATABASE_URL).
+# Build images on a build host first (see docker-compose.build.yml / docs/deploy/LAUNCH.md):
+#   npm run compose:build && npm run images:save
+# Then on the run host:
+#   npm run images:load && npm run compose:up
 
 name: api-console
 
@@ -23,9 +23,6 @@ services:
 
   api:
     image: ${API_IMAGE:-api-console-api:latest}
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.api
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -75,12 +72,21 @@ services:
       - internal
     expose:
       - "5281"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:'+(process.env.API_CONSOLE_PORT||5281)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 8
 
   web:
     image: ${WEB_IMAGE:-api-console-web:latest}
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.web
     restart: unless-stopped
     depends_on:
       api:
@@ -89,6 +95,12 @@ services:
       - "${WEB_PUBLISH_PORT:-8080}:80"
     networks:
       - internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
 
 volumes:
   api_console_redis:

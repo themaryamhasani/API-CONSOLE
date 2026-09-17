@@ -20,35 +20,37 @@ npm run dev              # Web — default :5280
 
 ## Production (v1)
 
-See **[docs/deploy/PRODUCTION.md](docs/deploy/PRODUCTION.md)**.
+See **[docs/deploy/LAUNCH.md](docs/deploy/LAUNCH.md)** (split build/run checklist) and **[docs/deploy/PRODUCTION.md](docs/deploy/PRODUCTION.md)**.
 
-Compose runs **api + web + redis**. Postgres is **external** — set `DATABASE_URL` in `.env.production` to your Postgres server.
+Run compose: **api + web + redis** only. Postgres is **external** — set `DATABASE_URL` on the run host.
 
-### Dockerfiles
+### Dockerfiles / compose
 
-| File | Image (default) |
+| File | Role |
 | --- | --- |
-| [`docker/Dockerfile.api`](docker/Dockerfile.api) | `api-console-api:latest` |
-| [`docker/Dockerfile.web`](docker/Dockerfile.web) | `api-console-web:latest` |
+| [`docker/Dockerfile.api`](docker/Dockerfile.api) | image `api-console-api:latest` |
+| [`docker/Dockerfile.web`](docker/Dockerfile.web) | image `api-console-web:latest` |
+| [`docker-compose.build.yml`](docker-compose.build.yml) | **build host** — builds the two images |
+| [`docker-compose.yml`](docker-compose.yml) | **run host** — image-only; no `build:`; no Postgres |
 
-Build from repo root:
+### Deploy (split build / run)
+
+**Build host:**
 
 ```bash
-docker build -f docker/Dockerfile.api -t api-console-api:latest .
-docker build -f docker/Dockerfile.web -t api-console-web:latest .
-# or: npm run compose:build
+npm run compose:build          # docker-compose.build.yml
+npm run images:save            # → api-console-images.tar
+# copy tarball to run host
 ```
 
-### Deploy (server)
+**Run host:**
 
 ```bash
 cp .env.production.example .env.production
-# set DATABASE_URL=postgresql://user:pass@postgres-host:5432/api_console?schema=public
-# fill secrets (CSRF, vault, session keys), PUBLIC_URL, CORS, ADMIN_LOGINS
+# set DATABASE_URL to external Postgres; fill secrets, PUBLIC_URL, CORS, ADMIN_LOGINS
+npm run images:load
 npm run prod:check
-npm run compose:build          # build api + web images
-npm run compose:up:images      # run redis + api + web from those images
-# or one step (build + up): npm run compose:up
+npm run compose:up              # redis + api + web (no --build)
 ```
 
 - App: [http://localhost:8080](http://localhost:8080) (override with `WEB_PUBLISH_PORT`)

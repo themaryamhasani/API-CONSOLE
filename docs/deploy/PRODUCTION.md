@@ -2,22 +2,24 @@
 
 **Release scope:** CDE login + Local Directory. **Integrated Systems (IS) is deferred** until the service is under load. Keep `API_CONSOLE_IS_ENABLED=false`.
 
-Related: [POSTGRES.md](../persistence/POSTGRES.md), [BACKUP_RESTORE.md](../persistence/BACKUP_RESTORE.md), [`.env.production.example`](../../.env.production.example), [root README](../../README.md).
+Related: [LAUNCH.md](./LAUNCH.md) (split build/run checklist), [POSTGRES.md](../persistence/POSTGRES.md), [BACKUP_RESTORE.md](../persistence/BACKUP_RESTORE.md), [`.env.production.example`](../../.env.production.example), [root README](../../README.md).
 
 ---
 
 ## Architecture (compose)
 
 ```text
+Build host → api + web images → save/load (or registry)
+Run host:
 Browser  →  nginx (web:80)  →  static SPA
                  └─ /api/*  →  api:5281  →  external Postgres + Redis (compose)
 ```
 
 | Service | Role |
 | --- | --- |
-| `web` | nginx — SPA + reverse proxy `/api` — image from `docker/Dockerfile.web` |
-| `api` | Node `main.cjs` — Postgres store, Redis sessions — image from `docker/Dockerfile.api` |
-| `redis` | CDE + runtime session encryption store (in compose) |
+| `web` | nginx — SPA + reverse proxy `/api` — pre-built image (`WEB_IMAGE`) |
+| `api` | Node `main.cjs` — Postgres store, Redis sessions — pre-built image (`API_IMAGE`) |
+| `redis` | CDE + runtime session encryption store (in **run** compose) |
 | Postgres | **External** — not in `docker-compose.yml`; set `DATABASE_URL` |
 
 Published port default: `WEB_PUBLISH_PORT=8080` → put TLS terminator / edge reverse proxy in front (`https://api-console.edus.ir`).
@@ -26,26 +28,33 @@ Default image tags: `api-console-api:latest`, `api-console-web:latest` (override
 
 ---
 
-## Dockerfiles
+## Dockerfiles and compose files
+
+| File | Role |
+| --- | --- |
+| [`docker/Dockerfile.api`](../../docker/Dockerfile.api) | Build API image |
+| [`docker/Dockerfile.web`](../../docker/Dockerfile.web) | Build web (nginx) image |
+| [`docker-compose.build.yml`](../../docker-compose.build.yml) | **Build host** — builds/tags both images only |
+| [`docker-compose.yml`](../../docker-compose.yml) | **Run host** — `redis` + `api` + `web`; **no** `build:`; **no** Postgres |
 
 Build from **repo root** (context `.`):
 
-| File | Command |
-| --- | --- |
-| [`docker/Dockerfile.api`](../../docker/Dockerfile.api) | `docker build -f docker/Dockerfile.api -t api-console-api:latest .` |
-| [`docker/Dockerfile.web`](../../docker/Dockerfile.web) | `docker build -f docker/Dockerfile.web -t api-console-web:latest .` |
+```bash
+npm run compose:build
+# or:
+# docker build -f docker/Dockerfile.api -t api-console-api:latest .
+# docker build -f docker/Dockerfile.web -t api-console-web:latest .
+```
 
-Or: `npm run compose:build` (tags both images via compose).
-
-Entrypoint on `api` ([`docker/api-entrypoint.sh`](../../docker/api-entrypoint.sh)) waits for `DATABASE_URL`, runs `db:bootstrap` + `db:migrate`, then starts `node apps/api/src/main.cjs`.
+Entrypoint on `api` ([`docker/api-entrypoint.sh`](../../docker/api-entrypoint.sh)) waits for external `DATABASE_URL`, runs `db:bootstrap` + `db:migrate`, then starts `node apps/api/src/main.cjs`.
 
 ---
 
 ## Checklist before first deploy
 
 1. Host console on **same registrable domain** as CDE (e.g. `api-console.edus.ir` ↔ `cde.edus.ir`) for cookie-forward SSO.
-2. Ensure an external Postgres 16+ database is reachable from the API container network.
-3. Copy env and fill secrets (min 32 chars, no `change-me` / `REPLACE_ME`):
+2. Ensure an external Postgres 16+ database is reachable from the **run host** API container network.
+3. On the run host, copy env and fill secrets (min 32 chars, no `change-me` / `REPLACE_ME`):
 
 ```bash
 cp .env.production.example .env.production
@@ -65,18 +74,29 @@ grep API_CONSOLE_IS_ENABLED .env.production
 
 ---
 
-## Deploy with Docker (server)
+## Deploy with Docker (split build / run)
+
+Prefer the short checklist in **[LAUNCH.md](./LAUNCH.md)**.
+
+**Build host** (repo + Docker; secrets not required to build):
+
+```bash
+npm run compose:build          # docker-compose.build.yml
+npm run images:save            # → api-console-images.tar
+# copy tarball (or push registry tags) to the run host
+```
+
+**Run host** (images + compose + `.env.production`; no image build):
 
 ```bash
 cp .env.production.example .env.production
 # set DATABASE_URL to external Postgres; fill secrets
+npm run images:load            # if using the tarball
 npm run prod:check
-npm run compose:build          # build api + web images
-npm run compose:up:images      # redis + api + web (no --build)
-# or one step: npm run compose:up
+npm run compose:up              # redis + api + web (no --build)
 ```
 
-Compose file: [`docker-compose.yml`](../../docker-compose.yml) — services `redis`, `api`, `web` only.
+Compose file: [`docker-compose.yml`](../../docker-compose.yml) — services `redis`, `api`, `web` only (image tags via `API_IMAGE` / `WEB_IMAGE`).
 
 Health:
 

@@ -1,0 +1,21 @@
+# API Console v1 — BUILD only (no runtime services).
+# Run from repo root on the build host:
+#   docker compose -f docker-compose.build.yml --env-file .env.production build
+#   # or: npm run compose:build
+# Then transfer images to the run host (npm run images:save / images:load).
+# Runtime stack: docker-compose.yml (redis + api + web; external Postgres).
+
+name: api-console-build
+
+services:
+  api:
+    image: ${API_IMAGE:-api-console-api:latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+
+  web:
+    image: ${WEB_IMAGE:-api-console-web:latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web

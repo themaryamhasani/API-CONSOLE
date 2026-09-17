@@ -25,7 +25,7 @@ services:
     image: ${API_IMAGE:-api-console-api:latest}
     build:
       context: .
-      dockerfile: apps/api/Dockerfile
+      dockerfile: docker/Dockerfile.api
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -80,7 +80,7 @@ services:
     image: ${WEB_IMAGE:-api-console-web:latest}
     build:
       context: .
-      dockerfile: apps/web/Dockerfile
+      dockerfile: docker/Dockerfile.web
     restart: unless-stopped
     depends_on:
       api:

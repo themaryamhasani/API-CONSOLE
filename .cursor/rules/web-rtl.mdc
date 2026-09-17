@@ -1,0 +1,33 @@
+---
+description: Web console RTL, CSRF clients, and surgical UI conventions
+globs: apps/web/**/*.{tsx,ts,css,html}
+alwaysApply: false
+---
+
+# Web Console Conventions
+
+## RTL / Persian
+
+- App is Persian-first: `lang="fa"` `dir="rtl"` (see `index.html`).
+- Use Vazirmatn / existing Jalali helpers; do not switch to Latin-only UI chrome.
+- Technical fields (URLs, paths, IDs, code, JSON) should use `dir="ltr"` where the codebase already does.
+
+## Auth clients
+
+- Fetch with `credentials: 'include'`.
+- Mutations send `x-csrf-token` from the session CSRF helper (see `cdeApi.ts`, `apiConsoleApi.ts`).
+- Do **not** send forgeable role/context headers; AuthZ is cookie/session based.
+- Do not re-enable or expand the IS login tab for v1.
+
+## Structure
+
+- Routes/gates: `src/App.tsx`, `sessionStore.ts`.
+- API clients: `src/services/{cdeApi,apiConsoleApi,isApi}.ts`.
+- Feature UI: `src/components/api-console/`, pages under `src/pages/`.
+- `OnlineApiConsolePage.tsx` is a monolith — **surgical edits only**; no opportunistic E22 splits.
+
+## Verify
+
+- `npm run typecheck -w @api-console/web`
+- `npm run test:web`
+- Playwright (`npm run test:e2e -w @api-console/web`) when changing login, gate, or workspace routing.

@@ -1,0 +1,39 @@
+---
+description: Core API Console agent constraints — v1 scope, IS frozen, session trust, deploy gates
+alwaysApply: true
+---
+
+# API Console — Core Constraints
+
+Read `AGENTS.md` for architecture and delegation. These rules always apply.
+
+## v1 scope
+
+- Supported auth: **CDE** + **Local Directory** only.
+- **Integrated Systems (IS) is frozen:** keep `API_CONSOLE_IS_ENABLED=false`. Do not enable the flag, expand IS UI, or remove CI/prod checks that assert IS is off. Inspect/fix clear IS regressions only.
+
+## Auth and trust
+
+- Authorization comes from the **server session cookie**, not browser-supplied role/context headers.
+- Do not reintroduce trusted legacy context headers unless explicitly required and gated.
+- Mutating API calls require CSRF (`x-csrf-token`) outside intentional test/dev exceptions already in the codebase.
+
+## Monolith discipline
+
+- `apps/api/.../http/api-console-server.cjs` and `apps/web/src/pages/OnlineApiConsolePage.tsx` are large. Make **surgical** edits for the task only. No opportunistic E22 module splits.
+
+## Secrets and deploy
+
+- Never read, print, or commit secret values from `.env`, vault files, or keys.
+- Deploy/migrate against non-local or production databases requires **human approval**. Local checks and proposed compose/script edits are OK; executing production cutover is not.
+- Do not invent production secrets; use `.env.example` / `.env.production.example` as documentation only.
+
+## Commits
+
+- Create git commits only when the user explicitly asks.
+- When committing, follow the repo BEM-style message format if the user requests a commit.
+
+## Orchestration
+
+- Multi-file or multi-surface work: follow skill `agent-orchestration` (classify, handoff JSON, parallelize safely, verifier + reviewer gates).
+- Trivial single-file edits stay with the main agent — do not spawn specialists.

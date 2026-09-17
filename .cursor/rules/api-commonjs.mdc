@@ -1,0 +1,40 @@
+---
+description: Conventions for apps/api CommonJS modules and node:test scripts
+globs: apps/api/**/*.{cjs,js,prisma}
+alwaysApply: false
+---
+
+# API CommonJS Conventions
+
+## Style
+
+- Code is **CommonJS** (`.cjs`). Do not convert modules to ESM unless explicitly asked.
+- HTTP uses raw Node `http` (no Express). Follow existing `canHandle*` / `tryHandle*` / `deps` injection patterns.
+- Prefer extending existing modules under `apps/api/src/modules/` rather than inventing new top-level frameworks.
+
+## Layout
+
+| Concern | Location |
+| --- | --- |
+| Main server / routes | `src/modules/api-console/infrastructure/http/` |
+| Persistence adapters | `src/modules/api-console/infrastructure/persistence/` |
+| Vault / prod secrets | `src/modules/api-console/infrastructure/security/` |
+| Session / CSRF | `src/modules/session/` |
+| Local auth | `src/modules/auth/` |
+| CDE / SSO | `src/modules/cde/` |
+| Runtime Core | `src/modules/runtime/` |
+| Workspace gate | `src/modules/access/` |
+| IS (frozen) | `src/modules/is/` — regression fixes only |
+| OpenAPI | `src/openapi/` |
+| Prisma | `prisma/` |
+
+## Tests
+
+- Tests are `node --test` under `apps/api/test/*.cjs`.
+- Prefer the matching script in `apps/api/package.json` (e.g. `test:session`, `test:vault`) over inventing new runners.
+- Keep IS flag tests asserting disabled-by-default behavior.
+
+## Safety
+
+- Destination validation / SSRF policy must not be weakened without explicit human approval.
+- Surgical edits only to `api-console-server.cjs`.

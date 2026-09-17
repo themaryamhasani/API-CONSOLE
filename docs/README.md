@@ -4,7 +4,7 @@
 
 | سند | نقش |
 | --- | --- |
-| [deploy/PRODUCTION.md](./deploy/PRODUCTION.md) | **استقرار production نسخهٔ v1** (Compose، Postgres، Redis، SSO) |
+| [deploy/PRODUCTION.md](./deploy/PRODUCTION.md) | **استقرار production نسخهٔ v1** (Compose: api/web/redis؛ Postgres خارجی؛ SSO) |
 | [PRD.md](./PRD.md) | منبع حقیقت محصول — چشم‌انداز، Personas، User Stories |
 | [approaches/](./approaches/README.md) | رویکردهای ورود: **CDE**، **Local Directory**، **IS (پس از v1)** |
 | [ONLINE_API_CONSOLE.md](./ONLINE_API_CONSOLE.md) | سند پیاده‌سازی فنی |
@@ -27,10 +27,20 @@ npm run dev:kill-ports   # فقط پروسه‌های همین پروژه
 
 ## استقرار production (v1)
 
+Compose فقط **redis + api + web** را بالا می‌آورد. Postgres روی سرور دیگر است (`DATABASE_URL`).
+
+Dockerfileها:
+
+- [`docker/Dockerfile.api`](../docker/Dockerfile.api) → `api-console-api:latest`
+- [`docker/Dockerfile.web`](../docker/Dockerfile.web) → `api-console-web:latest`
+
 ```bash
 cp .env.production.example .env.production
+# DATABASE_URL را به Postgres خارجی تنظیم کنید
 npm run prod:check
-npm run compose:up
+npm run compose:build
+npm run compose:up:images
+# یا یک مرحله: npm run compose:up
 ```
 
 جزئیات: [deploy/PRODUCTION.md](./deploy/PRODUCTION.md).

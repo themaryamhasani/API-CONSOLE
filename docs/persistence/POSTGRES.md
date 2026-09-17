@@ -18,15 +18,18 @@ Columns are the source of truth (no global `payload_json` blob). Nested document
 
 ## Production deploy
 
-For the full cutover (Compose, Redis, nginx, SSO domain, v1 IS-off policy) see **[docs/deploy/PRODUCTION.md](../deploy/PRODUCTION.md)**.
+For the full cutover (Compose api/web/redis, **external** Postgres via `DATABASE_URL`, nginx, SSO domain, v1 IS-off policy) see **[docs/deploy/PRODUCTION.md](../deploy/PRODUCTION.md)**.
 
 ```bash
-# 1. Ensure PostgreSQL is running and the database exists
-# createdb API-CONSOLE   (or use the URL below)
+# 1. Ensure PostgreSQL is reachable (external server or local). Database must exist.
+# createdb api_console
 
-# 2. Configure env
+# 2. Configure env (.env.production for Compose)
 # API_CONSOLE_STORE_BACKEND=POSTGRES
-# DATABASE_URL=postgresql://postgres:1234@localhost:5432/API-CONSOLE?schema=public
+# DATABASE_URL=postgresql://user:pass@postgres-host:5432/api_console?schema=public
+#
+# Main docker-compose.yml does NOT start Postgres — only Redis + api + web.
+# Optional local infra (Postgres+Redis containers): docker-compose.infra.yml / npm run prod:local
 
 # 3. Create schemas/tables (works without Prisma engine binaries)
 npm run db:bootstrap -w @api-console/api
@@ -40,8 +43,8 @@ npm run db:generate -w @api-console/api
 npm run migrate:pg -w @api-console/api
 
 # 6. Start API with POSTGRES backend
-# set API_CONSOLE_STORE_BACKEND=POSTGRES in .env
-npm run backend
+# Compose: npm run compose:up  (entrypoint migrates automatically)
+# Host: set API_CONSOLE_STORE_BACKEND=POSTGRES in .env && npm run backend
 ```
 
 ## SSO deploy note

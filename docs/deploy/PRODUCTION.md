@@ -2,7 +2,7 @@
 
 **Release scope:** CDE login + Local Directory. **Integrated Systems (IS) is deferred** until the service is under load. Keep `API_CONSOLE_IS_ENABLED=false`.
 
-Related: [POSTGRES.md](../persistence/POSTGRES.md), [BACKUP_RESTORE.md](../persistence/BACKUP_RESTORE.md), [`.env.production.example`](../../.env.production.example).
+Related: [POSTGRES.md](../persistence/POSTGRES.md), [BACKUP_RESTORE.md](../persistence/BACKUP_RESTORE.md), [`.env.production.example`](../../.env.production.example), [root README](../../README.md).
 
 ---
 
@@ -10,58 +10,73 @@ Related: [POSTGRES.md](../persistence/POSTGRES.md), [BACKUP_RESTORE.md](../persi
 
 ```text
 Browser  →  nginx (web:80)  →  static SPA
-                 └─ /api/*  →  api:5281  →  Postgres + Redis
+                 └─ /api/*  →  api:5281  →  external Postgres + Redis (compose)
 ```
 
 | Service | Role |
 | --- | --- |
-| `web` | nginx — SPA + reverse proxy `/api` |
-| `api` | Node `main.cjs` — Postgres store, Redis sessions |
-| `postgres` | Prisma multi-schema persistence |
-| `redis` | CDE + runtime session encryption store |
+| `web` | nginx — SPA + reverse proxy `/api` — image from `docker/Dockerfile.web` |
+| `api` | Node `main.cjs` — Postgres store, Redis sessions — image from `docker/Dockerfile.api` |
+| `redis` | CDE + runtime session encryption store (in compose) |
+| Postgres | **External** — not in `docker-compose.yml`; set `DATABASE_URL` |
 
 Published port default: `WEB_PUBLISH_PORT=8080` → put TLS terminator / edge reverse proxy in front (`https://api-console.edus.ir`).
+
+Default image tags: `api-console-api:latest`, `api-console-web:latest` (override with `API_IMAGE` / `WEB_IMAGE`).
+
+---
+
+## Dockerfiles
+
+Build from **repo root** (context `.`):
+
+| File | Command |
+| --- | --- |
+| [`docker/Dockerfile.api`](../../docker/Dockerfile.api) | `docker build -f docker/Dockerfile.api -t api-console-api:latest .` |
+| [`docker/Dockerfile.web`](../../docker/Dockerfile.web) | `docker build -f docker/Dockerfile.web -t api-console-web:latest .` |
+
+Or: `npm run compose:build` (tags both images via compose).
+
+Entrypoint on `api` ([`docker/api-entrypoint.sh`](../../docker/api-entrypoint.sh)) waits for `DATABASE_URL`, runs `db:bootstrap` + `db:migrate`, then starts `node apps/api/src/main.cjs`.
 
 ---
 
 ## Checklist before first deploy
 
 1. Host console on **same registrable domain** as CDE (e.g. `api-console.edus.ir` ↔ `cde.edus.ir`) for cookie-forward SSO.
-2. Copy env and fill secrets (min 32 chars, no `change-me` / `REPLACE_ME`):
+2. Ensure an external Postgres 16+ database is reachable from the API container network.
+3. Copy env and fill secrets (min 32 chars, no `change-me` / `REPLACE_ME`):
 
 ```bash
 cp .env.production.example .env.production
-# edit secrets, ADMIN_LOGINS, PUBLIC_URL, CORS, POSTGRES_PASSWORD
+# set DATABASE_URL=postgresql://user:pass@postgres-host:5432/api_console?schema=public
+# edit secrets, ADMIN_LOGINS, PUBLIC_URL, CORS
 npm run prod:check
 ```
 
-3. Confirm IS stays off:
+4. Confirm IS stays off:
 
 ```bash
 # must print Production readiness OK and "IS off"
 grep API_CONSOLE_IS_ENABLED .env.production
 ```
 
-4. Edge TLS must set `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-For` when proxying to nginx.
+5. Edge TLS must set `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-For` when proxying to nginx.
 
 ---
 
-## Deploy with Docker (restricted networks / Windows host)
-
-If `npm run compose:up` fails building API/web images (blocked `deb.debian.org` / npm inside Docker), use the **infra + host** path:
+## Deploy with Docker (server)
 
 ```bash
-cp .env.production.example .env.production   # or: npm run prod:env
-# fill secrets; keep POSTGRES_PUBLISH_PORT=15432 (avoids local Postgres on 5432)
+cp .env.production.example .env.production
+# set DATABASE_URL to external Postgres; fill secrets
 npm run prod:check
-npm run prod:local
-# → http://localhost:8080
+npm run compose:build          # build api + web images
+npm run compose:up:images      # redis + api + web (no --build)
+# or one step: npm run compose:up
 ```
 
-This starts **Postgres + Redis in Docker**, and runs **API + SPA proxy on the host**.
-
-Full in-container Compose remains for servers with normal outbound network: `npm run compose:up`.
-
+Compose file: [`docker-compose.yml`](../../docker-compose.yml) — services `redis`, `api`, `web` only.
 
 Health:
 
@@ -73,19 +88,28 @@ curl -fsS http://localhost:8080/api/api-console/health/config
 # expect: { "ok": true, "issues": [] }
 ```
 
-Logs:
+Logs / stop:
 
 ```bash
 npm run compose:logs
-```
-
-Stop:
-
-```bash
 npm run compose:down
 ```
 
-Entrypoint on `api` waits for Postgres, runs `db:bootstrap` + `db:migrate`, then starts `node apps/api/src/main.cjs`.
+---
+
+## Local fallback (restricted networks / Windows host)
+
+If image builds fail (blocked `deb.debian.org` / npm inside Docker), use **infra + host**:
+
+```bash
+cp .env.production.example .env.production   # or: npm run prod:env
+# uncomment POSTGRES_* / REDIS_PUBLISH_PORT in .env.production for infra compose
+npm run prod:check
+npm run prod:local
+# → http://localhost:8080
+```
+
+This starts **Postgres + Redis** via [`docker-compose.infra.yml`](../../docker-compose.infra.yml) and runs **API + SPA proxy on the host**. Main production compose does **not** include Postgres.
 
 ---
 
@@ -142,7 +166,7 @@ Workspace gate: `API_CONSOLE_REQUIRED_WORKSPACES` (default `medu-ai`).
 
 ## Backup / restore
 
-- **Postgres:** `pg_dump` / `pg_restore` (seven schemas) — see [POSTGRES.md](../persistence/POSTGRES.md).
+- **Postgres (external):** `pg_dump` / `pg_restore` (seven schemas) — see [POSTGRES.md](../persistence/POSTGRES.md).
 - **Vault files:** volume `api_console_data` (`/app/runtime/api-console`) — secrets + key files.
 - **Redis:** AOF volume `api_console_redis` (sessions; can rebuild by re-login).
 - FILE/SQLITE cold backup notes: [BACKUP_RESTORE.md](../persistence/BACKUP_RESTORE.md).

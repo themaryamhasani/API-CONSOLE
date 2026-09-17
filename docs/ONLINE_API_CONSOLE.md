@@ -6,7 +6,7 @@ Source-verified for standalone package: API-CONSOLE
 
 **وضعیت ورود امروز (v1):** **CDE + Local Directory.** رویکرد **Integrated Systems (IS)** در کد موجود است ولی برای تحویل اولیه **غیرفعال** می‌ماند (`API_CONSOLE_IS_ENABLED=false`) و پس از پایداری زیر بار فعال می‌شود. وابستگی به UTMS وجود ندارد.
 
-**استقرار:** [deploy/PRODUCTION.md](./deploy/PRODUCTION.md) — Docker Compose (nginx + API + Postgres + Redis).
+**استقرار:** [deploy/PRODUCTION.md](./deploy/PRODUCTION.md) — Docker Compose (nginx web + API + Redis؛ Postgres خارجی با `DATABASE_URL`).
 
 ## Source Of Truth
 

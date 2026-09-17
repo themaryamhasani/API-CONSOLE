@@ -11,6 +11,7 @@ Short runbook for file-backed and SQLite store modes (E01 / S01.05).
 | Secret vault | `runtime/api-console/api-console-secrets.json` | Encrypted secrets; back up with the store |
 | Vault key | `runtime/api-console/api-console-secret.key` | Required to decrypt vault |
 | Optional WAL sidecars | `api-console.sqlite-wal`, `api-console.sqlite-shm` | Include if present while DB is hot |
+| Postgres (production) | external DB via `DATABASE_URL` | Prefer `pg_dump` / `pg_restore` — see [POSTGRES.md](./POSTGRES.md) and [PRODUCTION.md](../deploy/PRODUCTION.md) |
 
 Override paths with `API_CONSOLE_DATA_DIR`, `API_CONSOLE_STORE_FILE`, `API_CONSOLE_SQLITE_FILE`, `API_CONSOLE_SECRET_VAULT_FILE`, `API_CONSOLE_SECRET_KEY_FILE`.
 

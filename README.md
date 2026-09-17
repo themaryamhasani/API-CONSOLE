@@ -22,20 +22,53 @@ npm run dev              # Web — default :5280
 
 See **[docs/deploy/PRODUCTION.md](docs/deploy/PRODUCTION.md)**.
 
-**On this Windows machine (Docker image build often blocked):**
+Compose runs **api + web + redis**. Postgres is **external** — set `DATABASE_URL` in `.env.production` to your Postgres server.
+
+### Dockerfiles
+
+| File | Image (default) |
+| --- | --- |
+| [`docker/Dockerfile.api`](docker/Dockerfile.api) | `api-console-api:latest` |
+| [`docker/Dockerfile.web`](docker/Dockerfile.web) | `api-console-web:latest` |
+
+Build from repo root:
 
 ```bash
-npm run prod:env          # once — creates .env.production with secrets
-npm run prod:check
-npm run prod:local        # Postgres+Redis in Docker; API+Web on host → http://localhost:8080
+docker build -f docker/Dockerfile.api -t api-console-api:latest .
+docker build -f docker/Dockerfile.web -t api-console-web:latest .
+# or: npm run compose:build
 ```
 
-**On a server with normal outbound network:**
+### Deploy (server)
 
 ```bash
 cp .env.production.example .env.production
+# set DATABASE_URL=postgresql://user:pass@postgres-host:5432/api_console?schema=public
+# fill secrets (CSRF, vault, session keys), PUBLIC_URL, CORS, ADMIN_LOGINS
 npm run prod:check
-npm run compose:up
+npm run compose:build          # build api + web images
+npm run compose:up:images      # run redis + api + web from those images
+# or one step (build + up): npm run compose:up
+```
+
+- App: [http://localhost:8080](http://localhost:8080) (override with `WEB_PUBLISH_PORT`)
+- Health: `GET /healthz`, `GET /api/health`
+- Optional image tags: `API_IMAGE`, `WEB_IMAGE` in `.env.production`
+
+```bash
+npm run compose:logs
+npm run compose:down
+```
+
+### Local fallback (Windows / blocked Docker builds)
+
+If image builds fail on this machine, use infra Postgres+Redis in Docker and run API+Web on the host:
+
+```bash
+npm run prod:env          # once — creates .env.production with secrets
+# uncomment POSTGRES_* in .env.production for docker-compose.infra.yml
+npm run prod:check
+npm run prod:local         # → http://localhost:8080
 ```
 
 ## Auth (v1)
@@ -72,7 +105,7 @@ See [docs/PRD.md](docs/PRD.md), [docs/approaches/](docs/approaches/README.md), [
 
 ## Data
 
-`API_CONSOLE_STORE_BACKEND=FILE|SQLITE|POSTGRES` (local default `FILE`; **production Compose uses POSTGRES**).
+`API_CONSOLE_STORE_BACKEND=FILE|SQLITE|POSTGRES` (local default `FILE`; **production Compose uses POSTGRES** via external `DATABASE_URL`).
 
 ```bash
 npm run db:generate -w @api-console/api

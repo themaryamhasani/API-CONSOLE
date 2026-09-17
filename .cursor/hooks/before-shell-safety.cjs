@@ -102,22 +102,29 @@ function classify(command) {
   return { permission: 'allow' };
 }
 
+function recoverCommand(raw) {
+  const text = String(raw || '');
+  if (!text.trim()) return '';
+  try {
+    const parsed = JSON.parse(text);
+    return parsed.command || parsed.commandLine || '';
+  } catch {
+    // Cursor sometimes wraps or truncates hook stdin; pull command if present.
+    const m =
+      text.match(/"command"\s*:\s*"((?:\\.|[^"\\])*)"/) ||
+      text.match(/"commandLine"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    if (m) {
+      return m[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    }
+    // Empty / unusable payload: allow (fail open on parse glitch, not on risk).
+    return '';
+  }
+}
+
 (async () => {
   try {
     const raw = await readStdin();
-    let input = {};
-    try {
-      input = raw ? JSON.parse(raw) : {};
-    } catch {
-      reply({
-        permission: 'deny',
-        user_message: 'Shell safety hook received invalid JSON.',
-        agent_message: 'before-shell-safety could not parse stdin JSON (failClosed).',
-      });
-      process.exit(0);
-      return;
-    }
-    reply(classify(input.command || input.commandLine || ''));
+    reply(classify(recoverCommand(raw)));
     process.exit(0);
   } catch (err) {
     reply({

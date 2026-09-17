@@ -4,10 +4,10 @@ Operator checklist for API Console v1. Full production notes: [PRODUCTION.md](./
 
 **Stack on the run host:** `redis` + `api` + `web` via [`docker-compose.yml`](../../docker-compose.yml).  
 **Postgres:** external only — set `DATABASE_URL` (not in compose).  
-**Images:** built on a separate build host via [`docker-compose.build.yml`](../../docker-compose.build.yml).
+**Images:** built on a separate build host with plain **`docker build`** ([`docker/Dockerfile.api`](../../docker/Dockerfile.api), [`docker/Dockerfile.web`](../../docker/Dockerfile.web)).
 
 ```text
-Build host  →  api-console-api + api-console-web images  →  save/load (or registry)
+Build host  →  docker build (api + web images)  →  save/load (or registry)
 Run host    →  docker compose up  →  redis + api + web  →  external Postgres
 ```
 
@@ -15,22 +15,29 @@ Run host    →  docker compose up  →  redis + api + web  →  external Postgr
 
 ## Build host
 
-Needs: Docker, repo checkout (Node not required for Docker-only build).
+Needs: Docker, repo checkout. For a full in-Docker build, the daemon needs outbound HTTPS to `registry.npmjs.org` and `binaries.prisma.sh`.
 
 1. Clone the repo and `cd` to the root.
-2. Optional: copy [`.env.production.example`](../../.env.production.example) → `.env.production` and set only `API_IMAGE` / `WEB_IMAGE` if you override tags. Full secrets are **not** required to build.
-3. Build both images:
+2. Optional: set `API_IMAGE` / `WEB_IMAGE` if you override tags. Full secrets are **not** required to build.
+3. Build both images with **`docker build`** (not compose):
 
 ```bash
-npm run compose:build
+npm run docker:build
 # equivalent:
-# docker compose -f docker-compose.build.yml --env-file .env.production build
+# docker build -f docker/Dockerfile.api -t api-console-api:latest .
+# docker build -f docker/Dockerfile.web -t api-console-web:latest .
 ```
 
-Or without an env file (default tags):
+If Docker cannot reach npm (restricted Windows hosts), the script can still build the **web** image from host `apps/web/dist` (`--target runtime-prebuilt`). The **API** image must be built on a host with registry access.
+
+Single image:
 
 ```bash
-docker compose -f docker-compose.build.yml build
+npm run docker:build:api
+npm run docker:build:web
+# offline web only:
+# npm run build:web
+# docker build -f docker/Dockerfile.web --target runtime-prebuilt -t api-console-web:latest .
 ```
 
 4. Export a tarball:
@@ -70,7 +77,7 @@ npm run images:load
 # equivalent: docker load -i api-console-images.tar
 ```
 
-4. Ready-check and start (**no build**):
+4. Ready-check and start (**no image build on the run host**):
 
 ```bash
 npm run prod:check
@@ -108,7 +115,7 @@ npm run compose:down
 If build and run share one host (images already local):
 
 ```bash
-npm run compose:build
+npm run docker:build
 # configure .env.production with external DATABASE_URL + secrets
 npm run prod:check
 npm run compose:up

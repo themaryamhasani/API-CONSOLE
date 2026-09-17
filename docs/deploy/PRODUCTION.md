@@ -6,10 +6,10 @@ Related: [LAUNCH.md](./LAUNCH.md) (split build/run checklist), [POSTGRES.md](../
 
 ---
 
-## Architecture (compose)
+## Architecture
 
 ```text
-Build host → api + web images → save/load (or registry)
+Build host → docker build (api + web images) → save/load (or registry)
 Run host:
 Browser  →  nginx (web:80)  →  static SPA
                  └─ /api/*  →  api:5281  →  external Postgres + Redis (compose)
@@ -28,19 +28,18 @@ Default image tags: `api-console-api:latest`, `api-console-web:latest` (override
 
 ---
 
-## Dockerfiles and compose files
+## Dockerfiles and run compose
 
 | File | Role |
 | --- | --- |
-| [`docker/Dockerfile.api`](../../docker/Dockerfile.api) | Build API image |
-| [`docker/Dockerfile.web`](../../docker/Dockerfile.web) | Build web (nginx) image |
-| [`docker-compose.build.yml`](../../docker-compose.build.yml) | **Build host** — builds/tags both images only |
+| [`docker/Dockerfile.api`](../../docker/Dockerfile.api) | Build API image (`docker build`) |
+| [`docker/Dockerfile.web`](../../docker/Dockerfile.web) | Build web (nginx) image (`docker build`) |
 | [`docker-compose.yml`](../../docker-compose.yml) | **Run host** — `redis` + `api` + `web`; **no** `build:`; **no** Postgres |
 
-Build from **repo root** (context `.`):
+Build from **repo root** with plain **`docker build`** (not `docker compose build`):
 
 ```bash
-npm run compose:build
+npm run docker:build
 # or:
 # docker build -f docker/Dockerfile.api -t api-console-api:latest .
 # docker build -f docker/Dockerfile.web -t api-console-web:latest .
@@ -81,7 +80,7 @@ Prefer the short checklist in **[LAUNCH.md](./LAUNCH.md)**.
 **Build host** (repo + Docker; secrets not required to build):
 
 ```bash
-npm run compose:build          # docker-compose.build.yml
+npm run docker:build           # plain docker build (Dockerfile.api + Dockerfile.web)
 npm run images:save            # → api-console-images.tar
 # copy tarball (or push registry tags) to the run host
 ```

@@ -30,15 +30,14 @@ Run compose: **api + web + redis** only. Postgres is **external** — set `DATAB
 | --- | --- |
 | [`docker/Dockerfile.api`](docker/Dockerfile.api) | image `api-console-api:latest` |
 | [`docker/Dockerfile.web`](docker/Dockerfile.web) | image `api-console-web:latest` |
-| [`docker-compose.build.yml`](docker-compose.build.yml) | **build host** — builds the two images |
 | [`docker-compose.yml`](docker-compose.yml) | **run host** — image-only; no `build:`; no Postgres |
 
 ### Deploy (split build / run)
 
-**Build host:**
+**Build host** (`docker build`, not compose):
 
 ```bash
-npm run compose:build          # docker-compose.build.yml
+npm run docker:build           # docker build -f docker/Dockerfile.{api,web}
 npm run images:save            # → api-console-images.tar
 # copy tarball to run host
 ```

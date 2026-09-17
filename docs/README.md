@@ -29,21 +29,25 @@ npm run dev:kill-ports   # فقط پروسه‌های همین پروژه
 
 Compose فقط **redis + api + web** را بالا می‌آورد. Postgres روی سرور دیگر است (`DATABASE_URL`).
 
-Dockerfileها:
+Dockerfileها (بیلد با `docker build`، نه compose):
 
 - [`docker/Dockerfile.api`](../docker/Dockerfile.api) → `api-console-api:latest`
 - [`docker/Dockerfile.web`](../docker/Dockerfile.web) → `api-console-web:latest`
 
 ```bash
+# Build host
+npm run docker:build
+npm run images:save
+
+# Run host
 cp .env.production.example .env.production
 # DATABASE_URL را به Postgres خارجی تنظیم کنید
+npm run images:load
 npm run prod:check
-npm run compose:build
-npm run compose:up:images
-# یا یک مرحله: npm run compose:up
+npm run compose:up
 ```
 
-جزئیات: [deploy/PRODUCTION.md](./deploy/PRODUCTION.md).
+جزئیات: [deploy/PRODUCTION.md](./deploy/PRODUCTION.md) و [deploy/LAUNCH.md](./deploy/LAUNCH.md).
 
 ## وضعیت رویکردهای ورود
 

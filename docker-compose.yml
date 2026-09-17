@@ -1,6 +1,8 @@
 # API Console v1 — RUN only (image tags). Postgres is external (DATABASE_URL).
-# Build images on a build host first (see docker-compose.build.yml / docs/deploy/LAUNCH.md):
-#   npm run compose:build && npm run images:save
+# Build images with plain docker build (NOT this file):
+#   npm run docker:build && npm run images:save
+#   # or: docker build -f docker/Dockerfile.api -t api-console-api:latest .
+#   #     docker build -f docker/Dockerfile.web -t api-console-web:latest .
 # Then on the run host:
 #   npm run images:load && npm run compose:up
 

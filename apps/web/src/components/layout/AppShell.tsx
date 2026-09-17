@@ -88,7 +88,12 @@ export function buildWorkspaceNav(opts: {
     {
       title: 'همکاری',
       items: [
-        { id: 'activity' as const, label: 'فعالیت', icon: <Activity className="h-4 w-4" /> },
+        {
+          id: 'activity' as const,
+          label: 'فعالیت',
+          icon: <Activity className="h-4 w-4" />,
+          hidden: !opts.isSystemAdmin,
+        },
         {
           id: 'reviews' as const,
           label: 'بازبینی Share',

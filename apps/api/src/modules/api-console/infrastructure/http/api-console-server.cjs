@@ -244,7 +244,9 @@ const ROLE_LABELS = {
   TECH_LEAD: 'سرپرست فنی',
   PRODUCT_OWNER: 'مالک محصول',
 };
-const SHARE_STATUSES = new Set(['DRAFT', 'PENDING_REVIEW', 'RETURNED', 'APPROVED', 'DEPRECATED']);
+const SHARE_STATUSES = new Set(['DRAFT', 'PENDING_REVIEW', 'RETURNED', 'APPROVED', 'DEPRECATED', 'UNLISTED', 'REMOVED']);
+/** Statuses that appear in Repository / Portal listings. UNLISTED and REMOVED stay out of display. */
+const REPOSITORY_VISIBLE_STATUSES = new Set(['APPROVED', 'DEPRECATED']);
 const USAGE_EVENT_TYPES = new Set(['ADDED_TO_CONSOLE', 'API_OPENED', 'API_EXECUTED', 'REMOVED_FROM_CONSOLE', 'NEW_VERSION_VIEWED']);
 const SEMVER_REGEX = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
@@ -2886,6 +2888,62 @@ function rankDestinationAddress(address, family = 4) {
   return 1;
 }
 
+function configuredDohEndpoints() {
+  return String(process.env.API_CONSOLE_DOH_URLS || 'https://cloudflare-dns.com/dns-query,https://dns.google/resolve')
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+/**
+ * DNS-over-HTTPS fallback when UDP to public resolvers is blocked by corporate firewalls.
+ * Returns A records only (IPv4) — enough to escape IPv6/private sinkholes.
+ */
+async function resolveDestinationAddressesViaDoh(host) {
+  const endpoints = configuredDohEndpoints();
+  const collected = [];
+  for (const endpoint of endpoints) {
+    try {
+      const url = new URL(endpoint);
+      url.searchParams.set('name', host);
+      url.searchParams.set('type', 'A');
+      const payload = await new Promise((resolve, reject) => {
+        const req = https.get(url, {
+          headers: { accept: 'application/dns-json' },
+          timeout: 4500,
+          rejectUnauthorized: true,
+        }, (res) => {
+          const chunks = [];
+          res.on('data', chunk => chunks.push(chunk));
+          res.on('end', () => {
+            if (res.statusCode && res.statusCode >= 400) {
+              reject(new Error(`DoH HTTP ${res.statusCode}`));
+              return;
+            }
+            resolve(Buffer.concat(chunks).toString('utf8'));
+          });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('DoH timeout'));
+        });
+      });
+      const parsed = JSON.parse(payload);
+      const answers = Array.isArray(parsed.Answer) ? parsed.Answer : [];
+      for (const answer of answers) {
+        if (Number(answer.type) === 1 && answer.data && /^[0-9.]+$/.test(String(answer.data))) {
+          collected.push({ address: String(answer.data), family: 4 });
+        }
+      }
+      if (collected.length) break;
+    } catch {
+      // try next DoH endpoint
+    }
+  }
+  return collected;
+}
+
 async function resolveDestinationAddresses(host) {
   if (isLiteralIpHost(host)) {
     const address = host.includes(':') ? normalizedIPv6(host) : host;
@@ -2906,11 +2964,14 @@ async function resolveDestinationAddresses(host) {
     .sort((left, right) => rankDestinationAddress(left.address, left.family) - rankDestinationAddress(right.address, right.family)
       || left.family - right.family);
 
+  const onlyPublic = (rows) => prefer(rows).filter(row => !isCorporateRemappedAddress(row.address));
+  const onlyPublicV4 = (rows) => onlyPublic(rows).filter(row => row.family === 4);
+
   let records = prefer(await safeLookup(() => dns.lookup(host, { all: true, verbatim: false })));
   const onlyRemapped = records.length > 0 && records.every(row => isCorporateRemappedAddress(row.address));
-  const hasPublicV4 = records.some(row => row.family === 4 && !isCorporateRemappedAddress(row.address));
+  const hasPublicV4 = onlyPublicV4(records).length > 0;
 
-  // Corporate DNS often remaps public hostnames to private/IPv6 sinkholes.
+  // Corporate DNS often remaps public hostnames to private/IPv6 sinkholes (e.g. 10.10.34.35).
   // Prefer public IPv4 via public resolvers whenever system DNS looks remapped or IPv6-only.
   if (!records.length || onlyRemapped || !hasPublicV4) {
     const servers = String(process.env.API_CONSOLE_DNS_SERVERS || '8.8.8.8,1.1.1.1')
@@ -2924,24 +2985,36 @@ async function resolveDestinationAddresses(host) {
         safeLookup(async () => (await resolver.resolve4(host)).map(address => ({ address, family: 4 }))),
         safeLookup(async () => (await resolver.resolve6(host)).map(address => ({ address, family: 6 }))),
       ]);
-      const alternate = prefer([...v4, ...v6]);
-      const alternatePublicV4 = alternate.filter(row => row.family === 4 && !isCorporateRemappedAddress(row.address));
+      const alternatePublicV4 = onlyPublicV4([...v4, ...v6]);
       if (alternatePublicV4.length) {
         records = alternatePublicV4;
-      } else if (alternate.length && (prefer(alternate).some(row => !isCorporateRemappedAddress(row.address)) || !records.length)) {
-        records = alternate;
+      } else {
+        const alternatePublic = onlyPublic([...v4, ...v6]);
+        if (alternatePublic.length) records = alternatePublic;
       }
     }
   }
 
-  // Final preference: drop remapped / IPv6-only corporate answers if any public IPv4 remains.
-  const publicV4 = records.filter(row => row.family === 4 && !isCorporateRemappedAddress(row.address));
-  if (publicV4.length) records = publicV4;
-
-  if (!records.length) {
-    throw new ApiConsoleError('DNS_ERROR', `DNS lookup for ${host} returned no usable records.`);
+  // When UDP to 8.8.8.8/1.1.1.1 is blocked, fall back to DNS-over-HTTPS.
+  if (!onlyPublicV4(records).length) {
+    const dohRecords = onlyPublicV4(await resolveDestinationAddressesViaDoh(host));
+    if (dohRecords.length) records = dohRecords;
   }
-  return records;
+
+  // Never connect through corporate remapped private IPs for hostname targets.
+  const publicV4 = onlyPublicV4(records);
+  if (publicV4.length) return publicV4;
+  const publicAny = onlyPublic(records);
+  if (publicAny.length) return publicAny;
+
+  if (records.length && records.every(row => isCorporateRemappedAddress(row.address))) {
+    throw new ApiConsoleError(
+      'DNS_ERROR',
+      `DNS برای ${host} فقط به IP خصوصی/سازمانی (sinkhole) نگاشت شد و هیچ IPv4 عمومی از resolver/DoH به‌دست نیامد. اتصال عمداً برقرار نشد.`,
+    );
+  }
+
+  throw new ApiConsoleError('DNS_ERROR', `DNS lookup for ${host} returned no usable records.`);
 }
 
 async function validateDestination(urlText) {
@@ -6449,7 +6522,7 @@ async function routeRequest(req, parsedUrl, body) {
       let rows = store.requests
         .filter(request =>
           request.sourceType !== 'REFERENCE' &&
-          ['APPROVED', 'DEPRECATED'].includes(request.sharingStatus) &&
+          REPOSITORY_VISIBLE_STATUSES.has(request.sharingStatus) &&
           request.status !== 'ARCHIVED' &&
           matchesApplicationScope(request.applicationId, scope) &&
           canAccessRepositoryRequest(request, context)
@@ -6470,7 +6543,7 @@ async function routeRequest(req, parsedUrl, body) {
         .filter(request =>
           request.apiId === apiId &&
           request.sourceType !== 'REFERENCE' &&
-          ['APPROVED', 'DEPRECATED'].includes(request.sharingStatus) &&
+          REPOSITORY_VISIBLE_STATUSES.has(request.sharingStatus) &&
           request.status !== 'ARCHIVED' &&
           canAccessRepositoryRequest(request, context)
         )
@@ -6485,7 +6558,7 @@ async function routeRequest(req, parsedUrl, body) {
         request.apiId === apiId &&
         semanticVersionOf(request) === version &&
         request.sourceType !== 'REFERENCE' &&
-        ['APPROVED', 'DEPRECATED'].includes(request.sharingStatus) &&
+        REPOSITORY_VISIBLE_STATUSES.has(request.sharingStatus) &&
         request.status !== 'ARCHIVED'
       );
       if (!sourceRequest || !canAccessRepositoryRequest(sourceRequest, context)) {

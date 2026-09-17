@@ -1,14 +1,13 @@
 import type { Dispatch, SetStateAction } from 'react';
-import { Eye, RefreshCw } from 'lucide-react';
+import { Eye, EyeOff, RefreshCw, Trash2 } from 'lucide-react';
 import type { PaginatedResponse } from '../../types';
-import type { ApiRepositoryItem, ApiShareRequest } from '../../types/apiConsole';
-import { API_SHARING_STATUS_LABELS } from '../../types/apiConsole';
+import type { ApiRepositoryItem } from '../../types/apiConsole';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { Card } from '../ui/Card';
-import { Input, Select } from '../ui/Input';
+import { Input } from '../ui/Input';
 import { Table, Pagination } from '../ui/Table';
-import { CLASSIFICATION_LABELS, classBadgeVariant, formatDate, sharingBadgeVariant } from './consoleFormatters';
+import { CLASSIFICATION_LABELS, classBadgeVariant, formatDate } from './consoleFormatters';
 
 export const RepositorySection = ({
   rows,
@@ -17,6 +16,9 @@ export const RepositorySection = ({
   onFilters,
   onRefresh,
   onOpen,
+  canManage = false,
+  onUnlist,
+  onRemove,
 }: {
   rows: PaginatedResponse<ApiRepositoryItem> | null;
   loading: boolean;
@@ -24,6 +26,9 @@ export const RepositorySection = ({
   onFilters: Dispatch<SetStateAction<{ page: number; limit: number; search: string }>>;
   onRefresh: () => void;
   onOpen: (item: ApiRepositoryItem) => void;
+  canManage?: boolean;
+  onUnlist?: (item: ApiRepositoryItem) => void;
+  onRemove?: (item: ApiRepositoryItem) => void;
 }) => (
   <div className="space-y-4">
     <Card padding="sm">
@@ -70,12 +75,40 @@ export const RepositorySection = ({
           key: 'actions',
           title: 'عملیات',
           render: (item: ApiRepositoryItem) => (
-            <Button size="sm" variant="ghost" icon={<Eye className="h-4 w-4" />} onClick={(event) => {
-              event.stopPropagation();
-              onOpen(item);
-            }}>
-              Preview
-            </Button>
+            <div className="flex flex-wrap items-center gap-1">
+              <Button size="sm" variant="ghost" icon={<Eye className="h-4 w-4" />} onClick={(event) => {
+                event.stopPropagation();
+                onOpen(item);
+              }}>
+                Preview
+              </Button>
+              {canManage && onUnlist && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon={<EyeOff className="h-4 w-4" />}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onUnlist(item);
+                  }}
+                >
+                  مخفی
+                </Button>
+              )}
+              {canManage && onRemove && (
+                <Button
+                  size="sm"
+                  variant="danger"
+                  icon={<Trash2 className="h-4 w-4" />}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onRemove(item);
+                  }}
+                >
+                  حذف
+                </Button>
+              )}
+            </div>
           ),
         },
       ]}

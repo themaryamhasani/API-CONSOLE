@@ -1522,10 +1522,16 @@ export const OnlineApiConsolePage: React.FC = () => {
   }, [activeContext, appId, workspaceView, canManageGeneralSettings, auditFilters.page, auditFilters.limit, auditFilters.action, auditFilters.userId]);
 
   useEffect(() => {
-    if (activeContext && workspaceView === 'activity') {
+    if (activeContext && workspaceView === 'activity' && isSystemAdmin) {
       void loadActivity();
     }
-  }, [activeContext, appId, workspaceView, activityFilters.page, activityFilters.limit]);
+  }, [activeContext, appId, workspaceView, isSystemAdmin, activityFilters.page, activityFilters.limit]);
+
+  useEffect(() => {
+    if (activeContext && workspaceView === 'activity' && !isSystemAdmin) {
+      goWorkspace('requests');
+    }
+  }, [activeContext, workspaceView, isSystemAdmin]);
 
   useEffect(() => {
     if (activeContext) {
@@ -1652,7 +1658,7 @@ export const OnlineApiConsolePage: React.FC = () => {
   };
 
   const loadActivity = async () => {
-    if (!activeContext) return;
+    if (!activeContext || !isSystemAdmin) return;
     setActivityLoading(true);
     try {
       const rows = await apiConsoleApi.getActivity({
@@ -2985,6 +2991,41 @@ export const OnlineApiConsolePage: React.FC = () => {
     }
   };
 
+  const handleUnlistRepositoryItem = async (item: ApiRepositoryItem) => {
+    if (!activeContext || !canReviewShares) return;
+    const reason = window.prompt('دلیل مخفی‌سازی از نمایش مخزن (اختیاری):', 'مخفی‌سازی از نمایش مخزن') ?? undefined;
+    if (reason === undefined) return;
+    try {
+      await apiConsoleApi.unlistRepositoryVersion(item.apiId, item.version, { reason: reason.trim() || undefined }, activeContext);
+      toast.success('API از نمایش مخزن مخفی شد.');
+      if (repositoryDetail?.id === item.id) {
+        setRepositoryModalOpen(false);
+        setRepositoryDetail(null);
+      }
+      await loadRepository();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'مخفی‌سازی API ناموفق بود.');
+    }
+  };
+
+  const handleRemoveRepositoryItem = async (item: ApiRepositoryItem) => {
+    if (!activeContext || !canReviewShares) return;
+    if (!window.confirm(`API «${item.title}» v${item.version} از مخزن حذف شود؟`)) return;
+    const reason = window.prompt('دلیل حذف از مخزن (اختیاری):', 'حذف از مخزن') ?? undefined;
+    if (reason === undefined) return;
+    try {
+      await apiConsoleApi.removeRepositoryVersion(item.apiId, item.version, { reason: reason.trim() || undefined }, activeContext);
+      toast.success('API از مخزن حذف شد.');
+      if (repositoryDetail?.id === item.id) {
+        setRepositoryModalOpen(false);
+        setRepositoryDetail(null);
+      }
+      await loadRepository();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'حذف API از مخزن ناموفق بود.');
+    }
+  };
+
   const runSelfCheck = async () => {
     const result = await apiConsoleApi.runParserSelfCheck();
     setSelfCheck(result);
@@ -3462,6 +3503,9 @@ export const OnlineApiConsolePage: React.FC = () => {
                 onFilters={setRepositoryFilters}
                 onRefresh={loadRepository}
                 onOpen={openRepositoryDetail}
+                canManage={canReviewShares}
+                onUnlist={(item) => { void handleUnlistRepositoryItem(item); }}
+                onRemove={(item) => { void handleRemoveRepositoryItem(item); }}
               />
             )}
 
@@ -3489,7 +3533,7 @@ export const OnlineApiConsolePage: React.FC = () => {
               />
             )}
 
-            {workspaceView === 'activity' && (
+            {workspaceView === 'activity' && isSystemAdmin && (
               <ActivityFeedPanel
                 rows={activityRows}
                 loading={activityLoading}
@@ -4757,6 +4801,22 @@ export const OnlineApiConsolePage: React.FC = () => {
                     }}
                   >
                     Deprecate
+                  </Button>
+                )}
+                {canReviewShares && (
+                  <Button
+                    variant="secondary"
+                    onClick={() => { void handleUnlistRepositoryItem(repositoryDetail); }}
+                  >
+                    مخفی از نمایش
+                  </Button>
+                )}
+                {canReviewShares && (
+                  <Button
+                    variant="danger"
+                    onClick={() => { void handleRemoveRepositoryItem(repositoryDetail); }}
+                  >
+                    حذف از مخزن
                   </Button>
                 )}
                 <Button

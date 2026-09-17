@@ -43,10 +43,14 @@ enum Visibility {
 
 enum SharingStatus {
   PRIVATE
+  DRAFT
   PENDING_REVIEW
   APPROVED
   REJECTED
   RETURNED
+  DEPRECATED
+  UNLISTED
+  REMOVED
 
   @@schema("catalog")
 }

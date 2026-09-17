@@ -36,6 +36,101 @@ function asIso(value) {
   return undefined;
 }
 
+const DB_SHARING_STATUSES = new Set([
+  'PRIVATE', 'DRAFT', 'PENDING_REVIEW', 'APPROVED', 'REJECTED', 'RETURNED', 'DEPRECATED', 'UNLISTED', 'REMOVED',
+]);
+
+function normalizeSharingStatusForDb(status) {
+  if (!status) return null;
+  const value = String(status);
+  if (DB_SHARING_STATUSES.has(value)) return value;
+  // Legacy / unknown values stay out of the enum column.
+  return null;
+}
+
+function normalizeSharingStatusFromDb(status) {
+  if (!status) return undefined;
+  if (status === 'PRIVATE') return 'DRAFT';
+  if (status === 'REJECTED') return 'RETURNED';
+  return status;
+}
+
+function asDbText(value) {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function asDbFolderPath(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) return value.map(String).filter(Boolean).join('/') || null;
+  return String(value);
+}
+
+function parseMaybeJson(value) {
+  if (value == null || value === '') return value;
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return value;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeEnvironmentKindForDb(kind) {
+  const value = String(kind || '').toUpperCase();
+  if (value === 'PRE_PRODUCTION' || value === 'PREPROD') return 'PREPROD';
+  if (value === 'DEVELOPMENT') return 'DEVELOPMENT';
+  if (value === 'TEST') return 'TEST';
+  if (value === 'PRODUCTION') return 'PRODUCTION';
+  if (value === 'CUSTOM') return 'CUSTOM';
+  return null;
+}
+
+function normalizeEnvironmentKindFromDb(kind) {
+  if (kind === 'PREPROD') return 'PRE_PRODUCTION';
+  return kind || undefined;
+}
+
+function normalizeVisibilityForDb(visibility) {
+  const value = String(visibility || '').toUpperCase();
+  if (value === 'PRIVATE' || value === 'PROJECT_SHARED') return value;
+  return null;
+}
+
+function normalizeExecutionStatusForDb(status) {
+  const value = String(status || '').toUpperCase();
+  if (value === 'COMPLETED' || value === 'SUCCEEDED' || value === 'SUCCESS') return 'SUCCEEDED';
+  if (value === 'FAILED' || value === 'BLOCKED' || value === 'ERROR') return 'FAILED';
+  if (value === 'CANCELLED' || value === 'CANCELED') return 'CANCELLED';
+  if (value === 'PENDING') return 'PENDING';
+  if (value === 'RUNNING') return 'RUNNING';
+  if (value === 'QUEUED') return 'QUEUED';
+  return null;
+}
+
+function normalizeExecutionStatusFromDb(status) {
+  if (status === 'SUCCEEDED') return 'COMPLETED';
+  return status || undefined;
+}
+
+function normalizeShareRequestStatusForDb(status) {
+  const value = String(status || '').toUpperCase();
+  if (value === 'DRAFT') return 'DRAFT';
+  if (value === 'PENDING_REVIEW' || value === 'SUBMITTED') return 'SUBMITTED';
+  if (value === 'APPROVED') return 'APPROVED';
+  if (value === 'RETURNED') return 'RETURNED';
+  if (value === 'REJECTED') return 'REJECTED';
+  return null;
+}
+
 /** Map Prisma rows back to the in-memory store document shape. */
 function hydrateStoreFromRows(rows) {
   const store = {
@@ -210,8 +305,24 @@ function createPostgresStore(options = {}) {
 
     return hydrateStoreFromRows({
       collections: collections.map(mapRow),
-      requests: requests.map(mapRow),
-      executions: executions.map(mapRow),
+      requests: requests.map(row => {
+        const mapped = mapRow(row);
+        if (!mapped) return mapped;
+        if (mapped.sharingStatus) mapped.sharingStatus = normalizeSharingStatusFromDb(mapped.sharingStatus);
+        mapped.folderPath = mapped.folderPath
+          ? (String(mapped.folderPath).includes('/') ? String(mapped.folderPath).split('/').filter(Boolean) : [String(mapped.folderPath)])
+          : [];
+        mapped.classification = parseMaybeJson(mapped.classification);
+        if (mapped.version != null && mapped.version !== '' && !Number.isNaN(Number(mapped.version))) {
+          mapped.version = Number(mapped.version);
+        }
+        return mapped;
+      }),
+      executions: executions.map(row => {
+        const mapped = mapRow(row);
+        if (mapped?.status) mapped.status = normalizeExecutionStatusFromDb(mapped.status);
+        return mapped;
+      }),
       importedCurls: importedCurls.map(mapRow),
       manualExamples: manualExamples.map(mapRow),
       documentationResults: documentationResults.map(mapRow),
@@ -225,7 +336,11 @@ function createPostgresStore(options = {}) {
       directoryRoleAssignments: directoryRoleAssignments.map(mapRow),
       runtimeProfiles: runtimeProfiles.map(mapRow),
       discoverySnapshots: discoverySnapshots.map(mapRow),
-      environments: environments.map(mapRow),
+      environments: environments.map(row => {
+        const mapped = mapRow(row);
+        if (mapped?.kind) mapped.kind = normalizeEnvironmentKindFromDb(mapped.kind);
+        return mapped;
+      }),
       runners: runners.map(mapRow),
       globalVariables: globalVariables.map(mapRow),
       auditLog: auditLog.map(mapRow),
@@ -357,7 +472,7 @@ function createPostgresStore(options = {}) {
           applicationId: r.applicationId || null,
           apiId: r.apiId || null,
           semanticVersion: r.semanticVersion || null,
-          sharingStatus: r.sharingStatus || null,
+          sharingStatus: normalizeSharingStatusForDb(r.sharingStatus),
           sourceType: r.sourceType || null,
           referenceId: r.referenceId || null,
           sourceRequestId: r.sourceRequestId || null,
@@ -365,7 +480,7 @@ function createPostgresStore(options = {}) {
           name: String(r.name || r.id),
           method: String(r.method || 'GET'),
           urlTemplate: r.urlTemplate || null,
-          folderPath: r.folderPath || null,
+          folderPath: asDbFolderPath(r.folderPath),
           queryParameters: r.queryParameters ?? null,
           headers: r.headers ?? null,
           cookies: r.cookies ?? null,
@@ -374,18 +489,18 @@ function createPostgresStore(options = {}) {
           authentication: r.authentication ?? null,
           tls: r.tls ?? null,
           executionMode: r.executionMode || null,
-          classification: r.classification || null,
+          classification: asDbText(r.classification),
           environmentId: r.environmentId || null,
           runnerId: r.runnerId || null,
           assertions: r.assertions ?? null,
           scripts: r.scripts ?? null,
           documentation: r.documentation ?? null,
-          version: r.version || null,
+          version: r.version == null ? null : String(r.version),
           status: r.status || null,
           runtimeBinding: r.runtimeBinding ?? null,
           isGatewayBinding: r.isGatewayBinding ?? null,
           sourceSync: r.sourceSync ?? null,
-          visibility: r.visibility || null,
+          visibility: normalizeVisibilityForDb(r.visibility),
           coOwnerIds: r.coOwnerIds ?? null,
           ownerId: r.ownerId || null,
           createdAt: asDate(r.createdAt) || new Date(),
@@ -399,7 +514,7 @@ function createPostgresStore(options = {}) {
         id: String(e.id),
         originId: e.originId || null,
         name: String(e.name || e.id),
-        kind: e.kind || null,
+        kind: normalizeEnvironmentKindForDb(e.kind),
         baseUrl: e.baseUrl || null,
         variables: e.variables ?? null,
         defaultHeaders: e.defaultHeaders ?? null,
@@ -576,7 +691,26 @@ function createPostgresStore(options = {}) {
             if (key === 'id') continue;
             let value = item[key];
             if (value === undefined) {
-              data[key] = null;
+              // Prisma Int/required fields cannot be null — use safe defaults.
+              if (key === 'attempts' || key === 'hitCount') data[key] = 0;
+              else data[key] = null;
+              continue;
+            }
+            if (key === 'attempts' || key === 'hitCount') {
+              data[key] = Number(value) || 0;
+              continue;
+            }
+            if (key === 'status' && model === 'execution') {
+              data[key] = normalizeExecutionStatusForDb(value);
+              continue;
+            }
+            if (key === 'status' && model === 'shareRequest') {
+              data[key] = normalizeShareRequestStatusForDb(value);
+              continue;
+            }
+            if (key === 'networkZone') {
+              const zone = String(value || '').toUpperCase();
+              data[key] = ['PUBLIC', 'INTERNAL', 'RESTRICTED', 'TEST'].includes(zone) ? zone : null;
               continue;
             }
             if (typeof value === 'string' && /At$|Date$|createdAt|updatedAt|expiresAt|startedAt|completedAt|importedAt|enteredAt|reviewedAt|notifiedAt|readAt|requestedAt|approvedAt|revokedAt|deliveredAt|eventAt|syncedAt/.test(key)) {

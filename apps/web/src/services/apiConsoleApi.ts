@@ -476,6 +476,44 @@ export const apiConsoleApi = {
     });
   },
 
+  unlistRepositoryVersion(
+    apiId: string,
+    version: string,
+    data: { reason?: string } | undefined,
+    context: ActiveContext
+  ): Promise<ApiRequestDefinition> {
+    return requestJson(`/repository/${encodeURIComponent(apiId)}/versions/${encodeURIComponent(version)}/unlist`, {
+      method: 'POST',
+      context,
+      body: data || {},
+    });
+  },
+
+  removeRepositoryVersion(
+    apiId: string,
+    version: string,
+    data: { reason?: string } | undefined,
+    context: ActiveContext
+  ): Promise<ApiRequestDefinition> {
+    return requestJson(`/repository/${encodeURIComponent(apiId)}/versions/${encodeURIComponent(version)}/remove`, {
+      method: 'POST',
+      context,
+      body: data || {},
+    });
+  },
+
+  restoreRepositoryVersion(
+    apiId: string,
+    version: string,
+    context: ActiveContext
+  ): Promise<ApiRequestDefinition> {
+    return requestJson(`/repository/${encodeURIComponent(apiId)}/versions/${encodeURIComponent(version)}/restore`, {
+      method: 'POST',
+      context,
+      body: {},
+    });
+  },
+
   addShareReviewComment(id: string, text: string, context: ActiveContext): Promise<ApiShareRequest> {
     return requestJson(`/share-reviews/${encodeURIComponent(id)}/comments`, {
       method: 'POST',

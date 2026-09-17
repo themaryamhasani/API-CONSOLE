@@ -138,7 +138,30 @@ function createExecutionRunner(deps) {
     const bodyBuffer = hasBody(transport.body) ? Buffer.from(transport.body.raw || '', 'utf8') : null;
     if (bodyBuffer) headers['Content-Length'] = String(bodyBuffer.length);
 
-    return new Promise((resolve, reject) => {
+    const candidates = (Array.isArray(validation.addresses) && validation.addresses.length
+      ? validation.addresses
+      : [{ address: validation.address, family: validation.family }])
+      .filter(row => row && row.address && !isCorporateRemappedAddress(row.address));
+
+    if (!candidates.length) {
+      throw new ApiConsoleError(
+        'DNS_ERROR',
+        `DNS برای ${url.hostname} فقط به IP خصوصی/سازمانی نگاشت شد؛ اتصال برقرار نشد.`,
+      );
+    }
+
+    let lastError = null;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index];
+      const attemptValidation = {
+        ...validation,
+        address: candidate.address,
+        family: candidate.family,
+      };
+      try {
+        // Prefer first public IPv4; on connect failure try the next resolved public address.
+        // eslint-disable-next-line no-await-in-loop
+        return await new Promise((resolve, reject) => {
       const start = Date.now();
       const req = client.request({
         protocol: url.protocol,
@@ -153,10 +176,10 @@ function createExecutionRunner(deps) {
           const cb = typeof options === 'function' ? options : callback;
           const lookupOptions = typeof options === 'function' ? {} : (options || {});
           if (lookupOptions.all) {
-            cb(null, [{ address: validation.address, family: validation.family }]);
+            cb(null, [{ address: attemptValidation.address, family: attemptValidation.family }]);
             return;
           }
-          cb(null, validation.address, validation.family);
+          cb(null, attemptValidation.address, attemptValidation.family);
         },
       }, res => {
         const chunks = [];
@@ -194,7 +217,7 @@ function createExecutionRunner(deps) {
               contentType,
               responseSize: decoded.length,
               durationMs: Date.now() - start,
-              resolvedIpAddress: validation.address,
+              resolvedIpAddress: attemptValidation.address,
               redirectHistory,
               tlsVerified: transport.tls.verifyCertificate,
               safePreviewMode: responsePreviewMode(contentType),
@@ -223,10 +246,10 @@ function createExecutionRunner(deps) {
         } else if (isTlsTransportError(error)) {
           reject(new ApiConsoleError('TLS_ERROR', tlsErrorMessage(error)));
         } else if (/ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(error.message || '')) {
-          const target = `${validation.address}:${url.port || (isHttps ? 443 : 80)}`;
-          const remapped = isCorporateRemappedAddress(validation.address);
+          const target = `${attemptValidation.address}:${url.port || (isHttps ? 443 : 80)}`;
+          const remapped = isCorporateRemappedAddress(attemptValidation.address);
           reject(new ApiConsoleError(
-            'HTTP_ERROR',
+            remapped ? 'DNS_ERROR' : 'HTTP_ERROR',
             remapped
               ? `${sanitizeText(error.message || 'HTTP request failed.')} — مقصد ${target} شبیه نگاشت DNS سازمانی است؛ اتصال از این شبکه برقرار نشد.`
               : sanitizeText(error.message || `HTTP request failed (${target}).`),
@@ -238,6 +261,15 @@ function createExecutionRunner(deps) {
       if (bodyBuffer) req.write(bodyBuffer);
       req.end();
     });
+      } catch (error) {
+        lastError = error;
+        const retryable = error?.category === 'HTTP_ERROR'
+          || error?.category === 'CONNECTION_TIMEOUT'
+          || /ECONNREFUSED|ENETUNREACH|EHOSTUNREACH/i.test(error?.message || '');
+        if (!retryable || index === candidates.length - 1) throw error;
+      }
+    }
+    throw lastError || new ApiConsoleError('DNS_ERROR', `No usable public address for ${url.hostname}.`);
   }
 
   async function executeWithRedirects(transport) {

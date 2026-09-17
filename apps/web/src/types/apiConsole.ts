@@ -4,7 +4,7 @@ export type ApiBodyType = 'none' | 'json' | 'raw' | 'xml' | 'form-urlencoded' | 
 export type ApiExecutionMode = 'RECOMMENDED' | 'EXACT';
 export type ApiClassificationType = 'GENERIC_HTTP' | 'CORE_QUERY' | 'CORE_COMMAND';
 export type ApiCoreOperationType = 'QUERY' | 'COMMAND';
-export type ApiSharingStatus = 'DRAFT' | 'PENDING_REVIEW' | 'RETURNED' | 'APPROVED' | 'DEPRECATED';
+export type ApiSharingStatus = 'DRAFT' | 'PENDING_REVIEW' | 'RETURNED' | 'APPROVED' | 'DEPRECATED' | 'UNLISTED' | 'REMOVED';
 export type ApiRequestSourceType = 'ORIGINAL' | 'REFERENCE' | 'CDE_DISCOVERY' | 'IS_DISCOVERY';
 /** Reserved applicationId for free-form / personal requests (not bound to a CDE system). */
 export const PERSONAL_APPLICATION_ID = 'PERSONAL';
@@ -29,6 +29,8 @@ export const API_SHARING_STATUS_LABELS: Record<ApiSharingStatus, string> = {
     RETURNED: 'بازگردانده‌شده',
     APPROVED: 'تأییدشده',
     DEPRECATED: 'منسوخ‌شده',
+    UNLISTED: 'مخفی‌شده',
+    REMOVED: 'حذف‌شده از مخزن',
 };
 export interface ApiVariable {
     id: string;

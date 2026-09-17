@@ -252,6 +252,9 @@ function createPhase2Router(deps) {
 
     if (first === 'activity' && req.method === 'GET') {
       const context = requireContext(req, body);
+      if (context.role !== 'SYSTEM_ADMIN') {
+        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Only SYSTEM_ADMIN can view activity feed.', 403);
+      }
       const applicationId = assertApplicationInContext(
         parsedUrl.searchParams.get('applicationId') || context.applicationId,
         context
@@ -447,7 +450,7 @@ function createPhase2Router(deps) {
         request.apiId === apiId &&
         semanticVersionOf(request) === version &&
         request.sourceType !== 'REFERENCE' &&
-        ['APPROVED', 'DEPRECATED'].includes(request.sharingStatus)
+        ['APPROVED', 'DEPRECATED', 'UNLISTED'].includes(request.sharingStatus)
       );
       if (!sourceRequest) throw new ApiConsoleError('INVALID_URL', 'Repository version not found.', 404);
       const isOwner = sourceRequest.createdBy === context.userId;
@@ -471,6 +474,94 @@ function createPhase2Router(deps) {
       });
       notifyUser(sourceRequest.createdBy, 'API منسوخ شد', `${sourceRequest.name} نسخه ${version} منسوخ شد.`, 'API_REQUEST', sourceRequest.id, correlationId);
       audit('API_VERSION_DEPRECATED', context, { applicationId: sourceRequest.applicationId, apiId, version, reason, effectiveAt });
+      saveStore(store());
+      return safeClone(sourceRequest);
+    }
+
+    if (first === 'repository' && second && third === 'versions' && fourth && parts[4] === 'unlist' && req.method === 'POST') {
+      assertCsrf(req);
+      const context = requireContext(req, body);
+      const apiId = decodeURIComponent(second);
+      const version = decodeURIComponent(fourth);
+      const sourceRequest = store().requests.find(request =>
+        request.apiId === apiId &&
+        semanticVersionOf(request) === version &&
+        request.sourceType !== 'REFERENCE' &&
+        ['APPROVED', 'DEPRECATED', 'UNLISTED'].includes(request.sharingStatus)
+      );
+      if (!sourceRequest) throw new ApiConsoleError('INVALID_URL', 'Repository version not found.', 404);
+      const isOwner = sourceRequest.createdBy === context.userId;
+      const canManage = isOwner || context.role === 'SYSTEM_ADMIN' || roleAllowed(context.role, API_CONSOLE_POLICY.canReviewShares);
+      if (!canManage) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Not authorized to hide this version.', 403);
+      const reason = String(body.reason || body.data?.reason || 'مخفی‌سازی از نمایش مخزن').trim();
+      sourceRequest.previousSharingStatus = sourceRequest.sharingStatus === 'UNLISTED'
+        ? (sourceRequest.previousSharingStatus || 'APPROVED')
+        : sourceRequest.sharingStatus;
+      sourceRequest.sharingStatus = 'UNLISTED';
+      sourceRequest.unlistedAt = nowIso();
+      sourceRequest.unlistedBy = context.userId;
+      sourceRequest.unlistReason = sanitizeText(reason);
+      sourceRequest.updatedAt = nowIso();
+      sourceRequest.updatedBy = context.userId;
+      audit('API_VERSION_UNLISTED', context, { applicationId: sourceRequest.applicationId, apiId, version, reason });
+      saveStore(store());
+      return safeClone(sourceRequest);
+    }
+
+    if (first === 'repository' && second && third === 'versions' && fourth && parts[4] === 'remove' && req.method === 'POST') {
+      assertCsrf(req);
+      const context = requireContext(req, body);
+      const apiId = decodeURIComponent(second);
+      const version = decodeURIComponent(fourth);
+      const sourceRequest = store().requests.find(request =>
+        request.apiId === apiId &&
+        semanticVersionOf(request) === version &&
+        request.sourceType !== 'REFERENCE' &&
+        ['APPROVED', 'DEPRECATED', 'UNLISTED', 'REMOVED'].includes(request.sharingStatus)
+      );
+      if (!sourceRequest) throw new ApiConsoleError('INVALID_URL', 'Repository version not found.', 404);
+      const isOwner = sourceRequest.createdBy === context.userId;
+      const canManage = isOwner || context.role === 'SYSTEM_ADMIN' || roleAllowed(context.role, API_CONSOLE_POLICY.canReviewShares);
+      if (!canManage) throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Not authorized to remove this version.', 403);
+      const reason = String(body.reason || body.data?.reason || 'حذف از مخزن').trim();
+      sourceRequest.previousSharingStatus = sourceRequest.sharingStatus === 'REMOVED'
+        ? (sourceRequest.previousSharingStatus || 'APPROVED')
+        : sourceRequest.sharingStatus;
+      sourceRequest.sharingStatus = 'REMOVED';
+      sourceRequest.removedAt = nowIso();
+      sourceRequest.removedBy = context.userId;
+      sourceRequest.removalReason = sanitizeText(reason);
+      sourceRequest.updatedAt = nowIso();
+      sourceRequest.updatedBy = context.userId;
+      audit('API_VERSION_REMOVED', context, { applicationId: sourceRequest.applicationId, apiId, version, reason });
+      saveStore(store());
+      return safeClone(sourceRequest);
+    }
+
+    if (first === 'repository' && second && third === 'versions' && fourth && parts[4] === 'restore' && req.method === 'POST') {
+      assertCsrf(req);
+      const context = requireContext(req, body);
+      const apiId = decodeURIComponent(second);
+      const version = decodeURIComponent(fourth);
+      const sourceRequest = store().requests.find(request =>
+        request.apiId === apiId &&
+        semanticVersionOf(request) === version &&
+        request.sourceType !== 'REFERENCE' &&
+        ['UNLISTED', 'REMOVED'].includes(request.sharingStatus)
+      );
+      if (!sourceRequest) throw new ApiConsoleError('INVALID_URL', 'Hidden/removed repository version not found.', 404);
+      if (context.role !== 'SYSTEM_ADMIN' && !roleAllowed(context.role, API_CONSOLE_POLICY.canReviewShares)) {
+        throw new ApiConsoleError('AUTHENTICATION_ERROR', 'Not authorized to restore this version.', 403);
+      }
+      const restored = ['APPROVED', 'DEPRECATED'].includes(sourceRequest.previousSharingStatus)
+        ? sourceRequest.previousSharingStatus
+        : 'APPROVED';
+      sourceRequest.sharingStatus = restored;
+      sourceRequest.restoredAt = nowIso();
+      sourceRequest.restoredBy = context.userId;
+      sourceRequest.updatedAt = nowIso();
+      sourceRequest.updatedBy = context.userId;
+      audit('API_VERSION_RESTORED', context, { applicationId: sourceRequest.applicationId, apiId, version, restored });
       saveStore(store());
       return safeClone(sourceRequest);
     }

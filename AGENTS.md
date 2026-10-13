@@ -106,3 +106,14 @@ Every specialist returns concise: Summary, Findings, Files, Decisions, Risks, Ve
 - Orchestration across subagents (no dedicated orchestrator subagent)
 - Docs-only or single-file trivial edits
 - Escalating production deploy and secret handling to a human
+
+## Cursor Cloud specific instructions
+
+Local dev uses the file store. Postgres is not required. Copy `.env.example` to `.env` when `.env` is missing (`API_CONSOLE_STORE_BACKEND=FILE`, `API_CONSOLE_IS_ENABLED=false`).
+
+- Node `22.23.3` lives at `/usr/local/lib/nodejs`. Login shells prepend it via `/etc/profile.d/api-console-node.sh`. The image `node` on `PATH` before that (22.14) is older than `jsdom` (`^22.22.2`). Run npm scripts with the 22.23.3 binary.
+- Redis listens on `127.0.0.1:6379`. In development, sessions fall back to memory if Redis is down. Production does not.
+- Web: `http://127.0.0.1:5280` (`npm run dev`). API: `http://127.0.0.1:5281` (`npm run backend`).
+- Boot seeds local user `e2e.user` / `e2e-password-123` (same as `apps/web/e2e`). Sign in on the Local tab. Do not enable Integrated Systems.
+- Leave `API_CONSOLE_SECRET_KEY` empty unless the value is 32 bytes of base64. A plain string makes the local vault throw and fails `npm run test:all -w @api-console/api`.
+- Checks: `npm run typecheck`, `npm run build -w @api-console/api`, `npm run build:web`, `npm run test:all -w @api-console/api`, `npm run test:web`. Playwright (`npm run test:e2e -w @api-console/web`) uses system Chrome (`E2E_BROWSER=chrome`). The activity sidebar link is admin-only, so the developer e2e case that clicks فعالیت does not match the current shell.
